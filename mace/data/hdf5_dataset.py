@@ -8,6 +8,8 @@ from mace.data.atomic_data import AtomicData
 from mace.data.utils import Configuration
 from mace.tools.utils import AtomicNumberTable
 
+from mace.tools.torch_geometric.data import DataSequence
+
 
 class HDF5Dataset(Dataset):
     def __init__(
@@ -95,3 +97,92 @@ def dataset_from_sharded_hdf5(
 def unpack_value(value):
     value = value.decode("utf-8") if isinstance(value, bytes) else value
     return None if str(value) == "None" else value
+
+
+
+class MultiConfigHDF5Dataset(Dataset):
+    def __init__(
+        self, file_path, r_max, z_table,config_seq_length : int, atomic_dataclass=AtomicData, **kwargs
+    ):
+        super(MultiConfigHDF5Dataset, self).__init__()  # pylint: disable=super-with-arguments
+        self.file_path = file_path
+        self._file = None
+        batch_key = list(self.file.keys())[0]
+        self.batch_size = len(self.file[batch_key].keys())
+        self.length = len(self.file.keys()) * self.batch_size
+        self.r_max = r_max
+        self.z_table = z_table
+        self.atomic_dataclass = atomic_dataclass
+        self.config_seq_length = config_seq_length
+
+        try:
+            self.drop_last = bool(self.file.attrs["drop_last"])
+        except KeyError:
+            self.drop_last = False
+        self.kwargs = kwargs
+
+    @property
+    def file(self):
+        if self._file is None:
+            # If a file has not already been opened, open one here
+            self._file = h5py.File(self.file_path, "r")
+        return self._file
+
+    def __getstate__(self):
+        _d = dict(self.__dict__)
+
+        # An opened h5py.File cannot be pickled, so we must exclude it from the state
+        _d["_file"] = None
+        return _d
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index):
+        # compute the index of the batch
+        batch_index = index // self.batch_size
+        config_index = index % self.batch_size
+        grp = self.file["config_batch_" + str(batch_index)]
+        seq_subgrp = grp["sequence_" + str(config_index)]
+
+        
+        
+        atomic_data_seq = []
+
+        for config_index in range(self.config_seq_length):
+            
+            config_grp = seq_subgrp[f"config_{config_index}"]
+            properties = {}
+            property_weights = {}
+            for key in config_grp["properties"]:
+                properties[key] = unpack_value(config_grp["properties"][key][()])
+            for key in config_grp["property_weights"]:
+                property_weights[key] = unpack_value(config_grp["property_weights"][key][()])
+
+            config = Configuration(
+                atomic_numbers=config_grp["atomic_numbers"][()],
+                positions=config_grp["positions"][()],
+                properties=properties,
+                weight=unpack_value(config_grp["weight"][()]),
+                property_weights=property_weights,
+                config_type=unpack_value(config_grp["config_type"][()]),
+                pbc=unpack_value(config_grp["pbc"][()]),
+                cell=unpack_value(config_grp["cell"][()]),
+            )   
+
+            if config.head is None:
+                config.head = self.kwargs.get("head")
+
+
+
+            atomic_data = self.atomic_dataclass.from_config(
+                config,
+                z_table=self.z_table,
+                cutoff=self.r_max,
+                heads=self.kwargs.get("heads", ["Default"]),
+                **self.kwargs,
+            )
+            atomic_data_seq.append(atomic_data)
+
+
+        return DataSequence(seq = atomic_data_seq)

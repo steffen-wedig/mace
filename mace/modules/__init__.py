@@ -31,6 +31,7 @@ from .loss import (
     WeightedEnergyForcesVirialsLoss,
     WeightedForcesLoss,
     WeightedHuberEnergyForcesStressLoss,
+    ForceDifferenceMSELoss
 )
 from .models import (
     MACE,

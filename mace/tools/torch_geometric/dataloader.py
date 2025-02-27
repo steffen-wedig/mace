@@ -1,11 +1,11 @@
 from collections.abc import Mapping, Sequence
-from typing import List, Optional, Union
-
+from typing import List, Optional, Union, Tuple
+from itertools import chain
 import torch.utils.data
 from torch.utils.data.dataloader import default_collate
 
 from .batch import Batch
-from .data import Data
+from .data import Data, DataSequence
 from .dataset import Dataset
 
 
@@ -34,9 +34,11 @@ class Collater:
             return {key: self([data[key] for data in batch]) for key in elem}
         elif isinstance(elem, tuple) and hasattr(elem, "_fields"):
             return type(elem)(*(self(s) for s in zip(*batch)))
+        elif isinstance(elem, DataSequence):
+            return Batch.from_data_list(data_list = list(chain.from_iterable(zip(*batch)))) # unpacks [('A', 'B', 'C'), ('D', 'E', 'F'), ('G', 'H', 'I')] into ['A', 'D', 'G', 'B', 'E', 'H', 'C', 'F', 'I']. Each tuple in the original list contains pairs or triples of structures.
         elif isinstance(elem, Sequence) and not isinstance(elem, str):
             return [self(s) for s in zip(*batch)]
-
+        
         raise TypeError(f"DataLoader found invalid type: {type(elem)}")
 
     def collate(self, batch):  # Deprecated...

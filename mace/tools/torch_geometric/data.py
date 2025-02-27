@@ -439,3 +439,13 @@ class Data(object):
         else:
             info = [size_repr(key, item, indent=2) for key, item in self]
             return "{}(\n{}\n)".format(cls, ",\n".join(info))
+
+
+class DataSequence():
+
+    def __init__(self, seq: tuple[Data, ...]):
+        self.seq = seq
+
+    def __iter__(self):
+        for datapoint in self.seq:
+            yield datapoint

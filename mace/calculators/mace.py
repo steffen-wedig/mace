@@ -410,6 +410,7 @@ class MACECalculator(Calculator):
             num_layers = int(self.models[0].num_interactions)
         batch = self._atoms_to_batch(atoms)
         descriptors = [model(batch.to_dict())["node_feats"] for model in self.models]
+
         if invariants_only:
             irreps_out = self.models[0].products[0].linear.__dict__["irreps_out"]
             l_max = irreps_out.lmax
@@ -424,7 +425,6 @@ class MACECalculator(Calculator):
                 for descriptor in descriptors
             ]
         descriptors = [descriptor.detach().cpu().numpy() for descriptor in descriptors]
-
         if self.num_models == 1:
             return descriptors[0]
         return descriptors

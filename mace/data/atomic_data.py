@@ -5,7 +5,7 @@
 ###########################################################################################
 
 from copy import deepcopy
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple
 
 import torch.utils.data
 
@@ -13,15 +13,16 @@ from mace.tools import (
     AtomicNumberTable,
     atomic_numbers_to_indices,
     to_one_hot,
-    torch_geometric,
     voigt_to_matrix,
 )
+
+from mace.tools.torch_geometric import Data, DataLoader
 
 from .neighborhood import get_neighborhood
 from .utils import Configuration
 
 
-class AtomicData(torch_geometric.data.Data):
+class AtomicData(Data):
     num_graphs: torch.Tensor
     batch: torch.Tensor
     edge_index: torch.Tensor
@@ -140,6 +141,7 @@ class AtomicData(torch_geometric.data.Data):
             torch.tensor(indices, dtype=torch.long).unsqueeze(-1),
             num_classes=len(z_table),
         )
+        one_hot = one_hot.double()
         try:
             head = torch.tensor(heads.index(config.head), dtype=torch.long)
         except ValueError:
@@ -292,7 +294,7 @@ def get_data_loader(
     shuffle=True,
     drop_last=False,
 ) -> torch.utils.data.DataLoader:
-    return torch_geometric.dataloader.DataLoader(
+    return DataLoader(
         dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,

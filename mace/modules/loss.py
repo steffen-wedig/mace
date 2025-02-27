@@ -10,6 +10,19 @@ from mace.tools import TensorDict
 from mace.tools.torch_geometric import Batch
 
 
+def force_difference_mse_error(ref: Batch, pred: TensorDict):
+    
+    center_index = int(pred["forces"].shape[0]/2)
+    print(center_index)
+    force_delta_pred = pred["forces"][:center_index,:]- pred["forces"][center_index:,:]
+
+    force_delta_ref = ref["forces"][:center_index,:]- ref["forces"][center_index:,:]
+
+    return torch.mean(torch.square(force_delta_ref - force_delta_pred))
+
+
+
+
 def mean_squared_error_energy(ref: Batch, pred: TensorDict) -> torch.Tensor:
     # energy: [n_graphs, ]
     return torch.mean(torch.square(ref["energy"] - pred["energy"]))  # []
@@ -380,4 +393,21 @@ class WeightedEnergyForcesDipoleLoss(torch.nn.Module):
         return (
             f"{self.__class__.__name__}(energy_weight={self.energy_weight:.3f}, "
             f"forces_weight={self.forces_weight:.3f}, dipole_weight={self.dipole_weight:.3f})"
+        )
+
+
+class ForceDifferenceMSELoss(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+  
+
+    def forward(self, ref: Batch, pred: TensorDict)-> torch.Tensor:
+        return (
+            force_difference_mse_error(ref,pred)
+        )
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}, "
+            f"forces_weight={self.forces_weight:.3f}"
         )
