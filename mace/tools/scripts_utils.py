@@ -426,7 +426,7 @@ def get_loss_fn(
             dipole_weight=args.dipole_weight,
         )
     elif args.loss == "force_difference":
-        loss_fn = modules.ForceDifferenceMSELoss()
+        loss_fn = modules.ForceDifferenceMSELoss(forces_weight=args.forces_weight)
     else:
         loss_fn = modules.WeightedEnergyForcesLoss(energy_weight=1.0, forces_weight=1.0)
     return loss_fn

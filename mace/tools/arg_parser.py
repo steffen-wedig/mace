@@ -338,6 +338,12 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=None,
         required=False,
     )
+    parser.add_argument(
+        "--multi_config",
+        help="sets whether to use the multiconfig datset",
+        type=bool,
+        default=False,
+    )
 
     # Fine-tuning
     parser.add_argument(
@@ -456,6 +462,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "huber",
             "universal",
             "energy_forces_dipole",
+            "force_difference"
         ],
     )
     parser.add_argument(

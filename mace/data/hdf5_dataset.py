@@ -179,7 +179,7 @@ class MultiConfigHDF5Dataset(Dataset):
                 config,
                 z_table=self.z_table,
                 cutoff=self.r_max,
-                heads=self.kwargs.get("heads", ["Default"]),
+                #heads=self.kwargs.get("heads"),
                 **self.kwargs,
             )
             atomic_data_seq.append(atomic_data)

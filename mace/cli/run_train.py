@@ -447,7 +447,13 @@ def run(args: argparse.Namespace) -> None:
                     )
                     for config in head_config.collections.valid
                 ]
-
+        elif head_config.train_file.endswith(".h5") and args.multi_config:
+            train_sets[head_config.head_name] = data.MultiConfigHDF5Dataset(
+                head_config.train_file, r_max=args.r_max, z_table=z_table, heads=heads, head=head_config.head_name,config_seq_length=2
+            )
+            valid_sets[head_config.head_name] = data.MultiConfigHDF5Dataset(
+                head_config.valid_file, r_max=args.r_max, z_table=z_table, heads=heads, head=head_config.head_name,config_seq_length=2
+            )
         elif head_config.train_file.endswith(".h5"):
             train_sets[head_config.head_name] = data.HDF5Dataset(
                 head_config.train_file, r_max=args.r_max, z_table=z_table, heads=heads, head=head_config.head_name

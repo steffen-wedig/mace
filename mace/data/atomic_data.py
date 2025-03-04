@@ -141,7 +141,7 @@ class AtomicData(Data):
             torch.tensor(indices, dtype=torch.long).unsqueeze(-1),
             num_classes=len(z_table),
         )
-        one_hot = one_hot.double()
+
         try:
             head = torch.tensor(heads.index(config.head), dtype=torch.long)
         except ValueError:
