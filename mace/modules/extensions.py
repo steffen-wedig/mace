@@ -707,6 +707,36 @@ class PolarMACE(ScaleShiftMACE):
         node_inter_es = self.scale_shift(node_inter_es, node_heads)
         inter_e = scatter_sum(node_inter_es, data["batch"], dim=-1, dim_size=num_graphs)
 
+        # Long-range geometry must carry the strain gradient so that the
+        # reciprocal-space contribution enters the autograd stress. The strain
+        # tensor (ctx.displacement) reaches positions/shifts/cell, but the
+        # reciprocal cell and volume are otherwise read from the cached,
+        # strain-detached data["rcell"]/data["volume"], so the k-vector and
+        # volumetric derivatives were missing from the long-range virial.
+        # Reconstruct the displaced cell from the displacement and re-derive
+        # rcell/volume from it; use the strained positions for the structure
+        # factor.
+        #
+        # KNOWN TRAP (phase consistency): under an affine strain the phase k.r
+        # is invariant ONLY if BOTH k (via rcell) and the positions r are
+        # strained together. Straining one but not the other introduces a
+        # spurious phase term that makes the shear stress *worse* than the
+        # original bug. So positions_lr and rcell_lr must always be updated as
+        # a pair. The real strain response then comes through k^2 (kernel /
+        # basis) and 1 / volume.
+        if displacement is not None:
+            cell_mat = cell.view(-1, 3, 3)
+            sym_disp = 0.5 * (displacement + displacement.transpose(-1, -2))
+            cell_lr = cell_mat + torch.matmul(cell_mat, sym_disp)
+            rcell_lr = 2 * torch.pi * torch.linalg.inv(cell_lr.mT)
+            volume_lr = torch.linalg.det(cell_lr).abs()
+            positions_lr = data["positions"]
+        else:
+            cell_lr = cell.view(-1, 3, 3)
+            rcell_lr = data["rcell"].view(-1, 3, 3)
+            volume_lr = data["volume"]
+            positions_lr = positions
+
         # Build k-grid
         (
             k_vectors,
@@ -714,7 +744,7 @@ class PolarMACE(ScaleShiftMACE):
             k_vectors_batch,
             k_vectors_0mask,
         ) = compute_k_vectors_flat(
-            self.kspace_cutoff, cell.view(-1, 3, 3), data["rcell"].view(-1, 3, 3)
+            self.kspace_cutoff, cell_lr, rcell_lr.view(-1, 3, 3)
         )
 
         field_feature_cache = self.electric_potential_descriptor.precompute_geometry(
@@ -722,9 +752,9 @@ class PolarMACE(ScaleShiftMACE):
             k_norm2=kv_norms_squared,
             k_vector_batch=k_vectors_batch,
             k0_mask=k_vectors_0mask,
-            node_positions=positions,
+            node_positions=positions_lr,
             batch=data["batch"],
-            volume=data["volume"],
+            volume=volume_lr,
             pbc=data["pbc"].view(-1, 3),
             force_pbc_evaluator=use_pbc_evaluator,
         )
@@ -916,9 +946,9 @@ class PolarMACE(ScaleShiftMACE):
             k_vector_batch=k_vectors_batch,
             k0_mask=k_vectors_0mask,
             source_feats=charge_density_mul_ir,
-            node_positions=positions,
+            node_positions=positions_lr,
             batch=data["batch"],
-            volume=data["volume"],
+            volume=volume_lr,
             pbc=data["pbc"].view(-1, 3),
             force_pbc_evaluator=use_pbc_evaluator,
         )
