@@ -230,15 +230,46 @@ class ResidualLevelLinearReadoutBlock(torch.nn.Module):
 
 
 @compile_mode("script")
+class _DeltaNonLinearReadoutHead(torch.nn.Module):
+    """One correction level's private non-linear readout of the trunk features."""
+
+    def __init__(
+        self,
+        irreps_in: o3.Irreps,
+        hidden_irreps: o3.Irreps,
+        gate: Optional[Callable],
+        cueq_config: Optional[CuEquivarianceConfig] = None,
+    ):
+        super().__init__()
+        self.linear_1 = Linear(
+            irreps_in=irreps_in, irreps_out=hidden_irreps, cueq_config=cueq_config
+        )
+        self.non_linearity = simplify_if_compile(nn.Activation)(
+            irreps_in=hidden_irreps, acts=[gate]
+        )
+        self.projection = Linear(
+            irreps_in=hidden_irreps,
+            irreps_out=o3.Irreps("0e"),
+            cueq_config=cueq_config,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # [n_nodes, 1]
+        return self.projection(self.non_linearity(self.linear_1(x)))
+
+
+@compile_mode("script")
 class ResidualLevelNonLinearReadoutBlock(torch.nn.Module):
     """Final non-linear readout for residual multi-level models.
 
-    One *shared* scalar hidden layer feeds a base projection and one delta
-    projection per non-base level, so the hidden features are fitted from
-    every level's data rather than from a private per-head slice. Returns
-    the same per-level component layout as
-    :class:`ResidualLevelLinearReadoutBlock`; see there for how the
-    components are combined.
+    The base level and every correction level each get their OWN hidden
+    layer, gate and projection, all reading the trunk features directly --
+    the same per-head capacity MACE's stock multihead readout provides,
+    without the head masking. (An earlier variant projected the deltas
+    linearly from the base's shared hidden layer; it saturated well short
+    of the correction's information content, so private non-linear delta
+    readouts are the default structure.) Returns the same per-level
+    component layout as :class:`ResidualLevelLinearReadoutBlock`; see there
+    for how the components are combined.
     """
 
     def __init__(
@@ -264,7 +295,7 @@ class ResidualLevelNonLinearReadoutBlock(torch.nn.Module):
         hidden_irreps = o3.Irreps(MLP_irreps)
         if any(irrep.ir != o3.Irrep(0, 1) for irrep in hidden_irreps):
             raise ValueError(
-                "The shared hidden layer of a residual readout must contain only "
+                "The hidden layer of a residual readout must contain only "
                 f"scalars (0e); a non-scalar hidden layer silently breaks "
                 f"invariance. Got {hidden_irreps}"
             )
@@ -282,22 +313,31 @@ class ResidualLevelNonLinearReadoutBlock(torch.nn.Module):
             irreps_out=o3.Irreps("0e"),
             cueq_config=cueq_config,
         )
-        self.delta_linear = Linear(
-            irreps_in=hidden_irreps,
-            irreps_out=o3.Irreps(f"{num_levels - 1}x0e"),
-            cueq_config=cueq_config,
+        self.delta_readouts = torch.nn.ModuleList(
+            [
+                _DeltaNonLinearReadoutHead(
+                    irreps_in=irreps_in,
+                    hidden_irreps=hidden_irreps,
+                    gate=gate,
+                    cueq_config=cueq_config,
+                )
+                for _ in range(num_levels - 1)
+            ]
         )
         if zero_init_deltas:
-            _zero_module_parameters(self.delta_linear)
+            for delta_readout in self.delta_readouts:
+                _zero_module_parameters(delta_readout.projection)
 
     def forward(
         self,
         x: torch.Tensor,
         heads: Optional[torch.Tensor] = None,  # pylint: disable=unused-argument
     ) -> torch.Tensor:  # [n_nodes, num_levels]
-        hidden = self.non_linearity(self.linear_1(x))
-        base = self.base_linear(hidden)  # [n_nodes, 1]
-        deltas = self.delta_linear(hidden)  # [n_nodes, num_levels - 1]
+        base = self.base_linear(self.non_linearity(self.linear_1(x)))  # [n_nodes, 1]
+        delta_columns: List[torch.Tensor] = []
+        for delta_readout in self.delta_readouts:
+            delta_columns.append(delta_readout(x))
+        deltas = torch.cat(delta_columns, dim=-1)  # [n_nodes, num_levels - 1]
         return _assemble_level_columns(base, deltas, self.base_level)
 
 
