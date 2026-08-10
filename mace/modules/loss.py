@@ -365,6 +365,84 @@ class WeightedEnergyForcesMaskedLoss(torch.nn.Module):
         )
 
 
+class MultiLevelWeightedEnergyForcesLoss(torch.nn.Module):
+    """Energy/forces loss over fused multi-level batches.
+
+    A fused batch carries every level's labels on one configuration
+    (``energy_levels`` [n_graphs, n_levels], ``forces_levels``
+    [n_atoms, n_force_levels, 3], with presence-mask weights) and the model
+    provides ``energy_all_levels`` / ``forces_all_levels`` from a single
+    forward pass. Each term averages only over labelled entries, so neither
+    the level coverage nor the batch composition changes the effective
+    energy:forces balance.
+
+    Falls back to the masked single-level terms on batches without the
+    fused fields -- MACE's per-head validation loaders -- so the same loss
+    object drives training and per-head validation.
+    """
+
+    def __init__(self, energy_weight=1.0, forces_weight=1.0) -> None:
+        super().__init__()
+        self.register_buffer(
+            "energy_weight",
+            torch.tensor(energy_weight, dtype=torch.get_default_dtype()),
+        )
+        self.register_buffer(
+            "forces_weight",
+            torch.tensor(forces_weight, dtype=torch.get_default_dtype()),
+        )
+
+    def forward(
+        self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
+    ) -> torch.Tensor:
+        if "energy_levels" not in ref.keys:
+            loss_energy = masked_weighted_mean_squared_error_energy(ref, pred, ddp)
+            loss_forces = masked_mean_squared_error_forces(ref, pred, ddp)
+            return (
+                self.energy_weight * loss_energy + self.forces_weight * loss_forces
+            )
+
+        if pred.get("energy_all_levels") is None:
+            raise ValueError(
+                "the batch carries fused multi-level labels but the model "
+                "output has no energy_all_levels; train a "
+                "MultiLevelScaleShiftMACE"
+            )
+        if pred.get("forces_all_levels") is None:
+            raise ValueError(
+                "the batch carries fused multi-level labels but the model "
+                "output has no forces_all_levels; configure the model's "
+                "force_carrying_levels"
+            )
+
+        num_atoms = ref.ptr[1:] - ref.ptr[:-1]  # [n_graphs]
+        energy_entry_weight = ref.energy_levels_weight  # [n_graphs, n_levels]
+        raw_energy_loss = energy_entry_weight * torch.square(
+            (ref.energy_levels - pred["energy_all_levels"])
+            / num_atoms.unsqueeze(-1)
+        )
+        loss_energy = reduce_masked_loss(
+            raw_energy_loss, (energy_entry_weight != 0).sum(), ddp
+        )
+
+        forces_entry_weight = torch.repeat_interleave(
+            ref.forces_levels_weight, num_atoms, dim=0
+        ).unsqueeze(-1)  # [n_atoms, n_force_levels, 1]
+        raw_forces_loss = forces_entry_weight * torch.square(
+            ref.forces_levels - pred["forces_all_levels"]
+        )
+        loss_forces = reduce_masked_loss(
+            raw_forces_loss, 3 * (forces_entry_weight != 0).sum(), ddp
+        )
+        return self.energy_weight * loss_energy + self.forces_weight * loss_forces
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}(energy_weight={self.energy_weight:.3f}, "
+            f"forces_weight={self.forces_weight:.3f})"
+        )
+
+
 class WeightedForcesLoss(torch.nn.Module):
     def __init__(self, forces_weight=1.0) -> None:
         super().__init__()
