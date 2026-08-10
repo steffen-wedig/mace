@@ -747,6 +747,43 @@ def run(args) -> None:
 
     # concatenate all the trainsets
     train_set = ConcatDataset([train_sets[head] for head in heads])
+
+    # Fused multi-level training: replace the per-head (duplicated) training
+    # sets with one configuration per structure carrying every level's
+    # labels. The per-head sets above still back the train-metric loaders and
+    # the statistics machinery; validation stays per head.
+    if args.multilevel_train_file is not None:
+        if args.model != "MultiLevelScaleShiftMACE":
+            raise ValueError(
+                "--multilevel_train_file requires --model MultiLevelScaleShiftMACE"
+            )
+        if args.loss != "multilevel_weighted":
+            raise ValueError(
+                "--multilevel_train_file requires --loss multilevel_weighted"
+            )
+        if args.multilevel_force_heads is not None:
+            multilevel_force_heads = [
+                name.strip()
+                for name in args.multilevel_force_heads.split(",")
+                if name.strip()
+            ]
+        else:
+            multilevel_force_heads = [heads[0]]
+        train_set, labelled_counts = data.load_multilevel_dataset(
+            file_path=args.multilevel_train_file,
+            r_max=args.r_max,
+            z_table=z_table,
+            heads=heads,
+            force_carrying_heads=multilevel_force_heads,
+            energy_key=args.energy_key,
+            forces_key=args.forces_key,
+        )
+        logging.info(
+            f"Fused multi-level training set from {args.multilevel_train_file}: "
+            f"{len(train_set)} configurations, labelled per head: {labelled_counts}, "
+            f"force-carrying heads: {multilevel_force_heads}"
+        )
+
     train_sampler, valid_sampler = None, None
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(

@@ -270,6 +270,133 @@ def test_non_scalar_hidden_irreps_are_rejected():
         )
 
 
+def write_multilevel_xyz(path, entries):
+    """entries: list of (positions, base_energy, base_forces, cc_energy_or_None)."""
+    import ase.io
+    from ase import Atoms
+
+    atoms_list = []
+    for positions, base_energy, base_forces, cc_energy in entries:
+        atoms = Atoms("OHH", positions=positions)
+        atoms.info["REF_energy_revpbe"] = base_energy
+        atoms.arrays["REF_forces_revpbe"] = base_forces
+        if cc_energy is not None:
+            atoms.info["REF_energy_delta_cc"] = cc_energy
+        atoms_list.append(atoms)
+    ase.io.write(str(path), atoms_list)
+
+
+def make_fused_batch(tmp_path, entries):
+    from mace.data.multilevel import load_multilevel_dataset
+
+    file_path = tmp_path / "multilevel.xyz"
+    write_multilevel_xyz(file_path, entries)
+    dataset, labelled_counts = load_multilevel_dataset(
+        file_path=str(file_path),
+        r_max=5.0,
+        z_table=TABLE,
+        heads=list(LEVELS),
+        force_carrying_heads=[LEVELS[BASE_LEVEL]],
+        energy_key="REF_energy",
+        forces_key="REF_forces",
+    )
+    data_loader = torch_geometric.dataloader.DataLoader(
+        dataset=dataset, batch_size=len(dataset), shuffle=False, drop_last=False
+    )
+    return next(iter(data_loader)), labelled_counts
+
+
+def test_fused_dataset_masks_missing_levels(tmp_path):
+    batch, labelled_counts = make_fused_batch(
+        tmp_path,
+        [
+            (POSITIONS, -1.5, FORCES, -1.6),
+            (POSITIONS + 0.01, -1.4, FORCES, None),  # no CC label
+        ],
+    )
+    assert labelled_counts == {"revpbe": 2, "delta_cc": 1}
+    assert batch.energy_levels.shape == (2, 2)
+    assert batch.energy_levels_weight.tolist() == [[1.0, 1.0], [1.0, 0.0]]
+    assert batch.forces_levels.shape == (6, 1, 3)
+    assert batch.forces_levels_weight.tolist() == [[1.0], [1.0]]
+
+
+def test_fused_forward_produces_per_level_forces(tmp_path):
+    model = make_model(
+        atomic_inter_scale=(1.3, 0.01), atomic_inter_shift=(-3.0, -0.08)
+    )
+    model.force_carrying_levels = [BASE_LEVEL]
+    model.base_force_column = 0
+    batch, _ = make_fused_batch(
+        tmp_path, [(POSITIONS, -1.5, FORCES, -1.6), (POSITIONS + 0.01, -1.4, FORCES, None)]
+    )
+    training_output = model(batch.to_dict(), training=True, compute_force=True)
+    assert training_output["forces_all_levels"] is not None
+    assert training_output["forces_all_levels"].shape == (6, 1, 3)
+    # The gathered forces are the base column without an extra backward.
+    assert torch.equal(
+        training_output["forces"],
+        training_output["forces_all_levels"][:, 0, :],
+    )
+    # And they match the stock gathered-head force path on the same batch
+    # (fused configs all carry the base head).
+    stock_output = model(batch.to_dict(), training=False, compute_force=True)
+    assert torch.allclose(
+        training_output["forces"], stock_output["forces"], atol=1e-10
+    )
+
+
+def test_multilevel_loss_counts_only_labelled_entries(tmp_path):
+    model = make_model(
+        atomic_inter_scale=(1.3, 0.01), atomic_inter_shift=(-3.0, -0.08)
+    )
+    model.force_carrying_levels = [BASE_LEVEL]
+    model.base_force_column = 0
+    loss_fn = modules.MultiLevelWeightedEnergyForcesLoss(
+        energy_weight=1.0, forces_weight=0.0
+    )
+
+    both_labelled = (POSITIONS, -1.5, FORCES, -1.6)
+    base_only = (POSITIONS + 0.01, -1.4, FORCES, None)
+
+    mixed_batch, _ = make_fused_batch(tmp_path, [both_labelled, base_only])
+    mixed_output = model(mixed_batch.to_dict(), training=True)
+    mixed_loss = loss_fn(mixed_batch, mixed_output)
+
+    # Reference: compute the same masked mean by hand from the outputs.
+    num_atoms = mixed_batch.ptr[1:] - mixed_batch.ptr[:-1]
+    residuals = (
+        mixed_batch.energy_levels - mixed_output["energy_all_levels"]
+    ) / num_atoms.unsqueeze(-1)
+    weights = mixed_batch.energy_levels_weight
+    expected = (weights * residuals**2).sum() / (weights != 0).sum()
+    assert mixed_loss.item() == pytest.approx(expected.item(), rel=1e-12)
+    # Three labelled energies, not four: the denominator is 3.
+    assert (weights != 0).sum().item() == 3
+
+
+def test_multilevel_loss_falls_back_on_per_head_batches():
+    model = make_model(
+        atomic_inter_scale=(1.3, 0.01), atomic_inter_shift=(-3.0, -0.08)
+    )
+    batch = make_batch(
+        [
+            make_configuration(POSITIONS, head="revpbe"),
+            make_configuration(POSITIONS, head="delta_cc", forces_weight=0.0),
+        ]
+    )
+    output = model(batch.to_dict(), training=True)
+    multilevel_loss = modules.MultiLevelWeightedEnergyForcesLoss(
+        energy_weight=3.0, forces_weight=7.0
+    )
+    masked_loss = modules.WeightedEnergyForcesMaskedLoss(
+        energy_weight=3.0, forces_weight=7.0
+    )
+    assert multilevel_loss(batch, output).item() == pytest.approx(
+        masked_loss(batch, output).item(), rel=1e-12
+    )
+
+
 def test_masked_loss_denominator_ignores_unlabelled_entries():
     # Two identical configurations, one of which carries no force label.
     # The masked forces term must equal the plain forces term computed on

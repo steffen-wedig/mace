@@ -357,7 +357,24 @@ def _build_model(
             use_agnostic_product=args.use_agnostic_product,
         )
     if args.model == "MultiLevelScaleShiftMACE":
+        force_carrying_levels = None
+        if getattr(args, "multilevel_train_file", None) is not None:
+            if getattr(args, "multilevel_force_heads", None) is not None:
+                force_head_names = [
+                    name.strip()
+                    for name in args.multilevel_force_heads.split(",")
+                    if name.strip()
+                ]
+            else:
+                force_head_names = [heads[0]]
+            unknown_heads = [name for name in force_head_names if name not in heads]
+            if unknown_heads:
+                raise ValueError(
+                    f"multilevel_force_heads {unknown_heads} are not in heads {heads}"
+                )
+            force_carrying_levels = [heads.index(name) for name in force_head_names]
         return modules.MultiLevelScaleShiftMACE(
+            force_carrying_levels=force_carrying_levels,
             **model_config,
             pair_repulsion=args.pair_repulsion,
             distance_transform=args.distance_transform,

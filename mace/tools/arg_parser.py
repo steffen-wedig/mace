@@ -164,6 +164,23 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=False,
     )
     parser.add_argument(
+        "--multilevel_train_file",
+        help="MultiLevelScaleShiftMACE only: extended-xyz file with per-level "
+        "suffixed keys (<energy_key>_<head>, <forces_key>_<head>) that replaces "
+        "the per-head training sets with ONE fused configuration per structure; "
+        "requires --loss multilevel_weighted",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--multilevel_force_heads",
+        help="comma-separated head names whose forces are trained on fused "
+        "multi-level batches; must include the first (base) head. Defaults to "
+        "the base head only.",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
         "--r_max", help="distance cutoff (in Ang)", type=float, default=5.0
     )
     parser.add_argument(
@@ -801,6 +818,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "ef",
             "weighted",
             "weighted_masked",
+            "multilevel_weighted",
             "forces_only",
             "virials",
             "stress",

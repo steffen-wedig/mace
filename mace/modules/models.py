@@ -655,6 +655,7 @@ class MultiLevelScaleShiftMACE(MACE):
         base_level: int = 0,
         detach_base_for_deltas: bool = False,
         zero_init_delta_readouts: bool = False,
+        force_carrying_levels: Optional[List[int]] = None,
         **kwargs,
     ):
         if kwargs.get("embedding_specs") is not None:
@@ -672,6 +673,31 @@ class MultiLevelScaleShiftMACE(MACE):
         scale = self._as_per_level_list(atomic_inter_scale, num_levels, "scale")
         shift = self._as_per_level_list(atomic_inter_shift, num_levels, "shift")
         self.base_level = base_level
+
+        # Levels whose forces are trained on fused multi-level batches (one
+        # config carrying every level's labels). During a training forward
+        # pass the model then computes one force tensor per listed level
+        # (``forces_all_levels``, columns in this order) instead of the
+        # gathered-head forces. Empty means stock behaviour.
+        if force_carrying_levels is None:
+            force_carrying_levels = []
+        for level in force_carrying_levels:
+            if not 0 <= level < num_levels:
+                raise ValueError(
+                    f"force_carrying_levels entry {level} out of range for "
+                    f"{num_levels} levels"
+                )
+        if force_carrying_levels and base_level not in force_carrying_levels:
+            raise ValueError(
+                "the base level must be force-carrying; got "
+                f"force_carrying_levels={force_carrying_levels}"
+            )
+        self.force_carrying_levels = list(force_carrying_levels)
+        self.base_force_column = (
+            self.force_carrying_levels.index(base_level)
+            if force_carrying_levels
+            else 0
+        )
 
         # Replace the stock per-head readouts (masked, head-selected) with
         # residual per-level readouts at every layer. The input irreps are
@@ -855,19 +881,57 @@ class MultiLevelScaleShiftMACE(MACE):
         energy_all_levels = e0_all_levels + inter_e_all_levels
         node_energy = safe_double(node_e0.clone()) + safe_double(node_inter_es.clone())
 
-        forces, virials, stress, hessian, edge_forces, _ = get_outputs(
-            energy=inter_e,
-            positions=positions,
-            displacement=displacement,
-            vectors=vectors,
-            cell=cell,
-            training=training,
-            compute_force=compute_force,
-            compute_virials=compute_virials,
-            compute_stress=compute_stress,
-            compute_hessian=compute_hessian,
-            compute_edge_forces=compute_edge_forces or compute_atomic_stresses,
+        forces_all_levels: Optional[torch.Tensor] = None
+        compute_level_forces = (
+            training and compute_force and len(self.force_carrying_levels) > 0
         )
+        if compute_level_forces:
+            if (
+                compute_virials
+                or compute_stress
+                or compute_hessian
+                or compute_edge_forces
+                or compute_atomic_stresses
+            ):
+                raise ValueError(
+                    "per-level force training supports only energies and "
+                    "forces; virials/stress/hessian/edge-force outputs are "
+                    "not implemented for fused multi-level batches"
+                )
+            level_forces_list: List[torch.Tensor] = []
+            for level in self.force_carrying_levels:
+                gradient = torch.autograd.grad(
+                    outputs=[inter_e_all_levels[:, level].sum()],
+                    inputs=[positions],
+                    retain_graph=True,
+                    create_graph=True,
+                )[0]
+                level_forces_list.append(-gradient)
+            forces_all_levels = torch.stack(
+                level_forces_list, dim=1
+            )  # [n_atoms, n_force_levels, 3]
+            # Fused batches assign every node the base head, so the gathered
+            # energy IS the base energy and its forces are the base column;
+            # no extra backward pass is spent on them.
+            forces = level_forces_list[self.base_force_column]
+            virials: Optional[torch.Tensor] = None
+            stress: Optional[torch.Tensor] = None
+            hessian: Optional[torch.Tensor] = None
+            edge_forces: Optional[torch.Tensor] = None
+        else:
+            forces, virials, stress, hessian, edge_forces, _ = get_outputs(
+                energy=inter_e,
+                positions=positions,
+                displacement=displacement,
+                vectors=vectors,
+                cell=cell,
+                training=training,
+                compute_force=compute_force,
+                compute_virials=compute_virials,
+                compute_stress=compute_stress,
+                compute_hessian=compute_hessian,
+                compute_edge_forces=compute_edge_forces or compute_atomic_stresses,
+            )
 
         atomic_virials: Optional[torch.Tensor] = None
         atomic_stresses: Optional[torch.Tensor] = None
@@ -883,6 +947,7 @@ class MultiLevelScaleShiftMACE(MACE):
         return {
             "energy": total_energy,
             "energy_all_levels": energy_all_levels,
+            "forces_all_levels": forces_all_levels,
             "node_energy": node_energy,
             "interaction_energy": inter_e,
             "forces": forces,

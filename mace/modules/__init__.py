@@ -41,6 +41,7 @@ from .gate import GatedEquivariantBlock
 from .loss import (
     DipolePolarLoss,
     DipoleSingleLoss,
+    MultiLevelWeightedEnergyForcesLoss,
     UniversalLoss,
     WeightedEnergyForcesDipoleLoss,
     WeightedEnergyForcesL1L2Loss,
@@ -138,6 +139,7 @@ __all__ = [
     "NonLinearLesReadoutBlock",
     "WeightedEnergyForcesLoss",
     "WeightedEnergyForcesMaskedLoss",
+    "MultiLevelWeightedEnergyForcesLoss",
     "WeightedForcesLoss",
     "WeightedEnergyForcesVirialsLoss",
     "WeightedEnergyForcesStressLoss",
