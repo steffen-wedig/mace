@@ -43,6 +43,38 @@ def reduce_loss(raw_loss: torch.Tensor, ddp: Optional[bool] = None) -> torch.Ten
     return raw_loss.mean()
 
 
+def reduce_masked_loss(
+    raw_loss: torch.Tensor,
+    active_entry_count: torch.Tensor,
+    ddp: Optional[bool] = None,
+) -> torch.Tensor:
+    """Reduces an element-wise loss by the number of *active* entries.
+
+    ``reduce_loss`` divides by the total element count, including entries
+    whose per-config weight is zero (e.g. the force entries of an
+    energy-only level in a multi-head batch). That makes the effective
+    weight of a loss term depend on the composition of each individual
+    batch. Here the denominator is the number of entries that actually
+    carry a label, so the term's weight is independent of how many
+    zero-weighted entries the batch happens to contain.
+
+    ``active_entry_count`` must count loss *elements* (e.g. atoms times
+    three for force components), not configurations.
+    """
+    ddp = is_ddp_enabled() if ddp is None else ddp
+    loss_sum = raw_loss.sum()
+    count = active_entry_count.to(raw_loss.dtype)
+    if ddp and dist.is_initialized():
+        # The denominator must be global: each rank sees a different mix of
+        # labelled and unlabelled entries. DDP averages gradients over
+        # ranks, so scale by world_size like reduce_loss does.
+        world_size = dist.get_world_size()
+        count = count.clone()
+        dist.all_reduce(count, op=dist.ReduceOp.SUM)
+        return loss_sum * world_size / torch.clamp(count, min=1.0)
+    return loss_sum / torch.clamp(count, min=1.0)
+
+
 # ------------------------------------------------------------------------------
 # Energy Loss Functions
 # ------------------------------------------------------------------------------
@@ -66,6 +98,18 @@ def weighted_mean_squared_error_energy(
         * torch.square((ref["energy"] - pred["energy"]) / num_atoms)
     )
     return reduce_loss(raw_loss, ddp)
+
+
+def masked_weighted_mean_squared_error_energy(
+    ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
+) -> torch.Tensor:
+    num_atoms = ref.ptr[1:] - ref.ptr[:-1]  # [n_graphs]
+    entry_weight = ref.weight * ref.energy_weight
+    raw_loss = entry_weight * torch.square(
+        (ref["energy"] - pred["energy"]) / num_atoms
+    )
+    active_entry_count = (entry_weight != 0).sum()
+    return reduce_masked_loss(raw_loss, active_entry_count, ddp)
 
 
 def weighted_mean_absolute_error_energy(
@@ -133,6 +177,22 @@ def mean_squared_error_forces(
         * torch.square(ref["forces"] - pred["forces"])
     )
     return reduce_loss(raw_loss, ddp)
+
+
+def masked_mean_squared_error_forces(
+    ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
+) -> torch.Tensor:
+    configs_weight = torch.repeat_interleave(
+        ref.weight, ref.ptr[1:] - ref.ptr[:-1]
+    ).unsqueeze(-1)
+    configs_forces_weight = torch.repeat_interleave(
+        ref.forces_weight, ref.ptr[1:] - ref.ptr[:-1]
+    ).unsqueeze(-1)
+    entry_weight = configs_weight * configs_forces_weight  # [n_atoms, 1]
+    raw_loss = entry_weight * torch.square(ref["forces"] - pred["forces"])
+    # Three force components per atom that carries a force label.
+    active_entry_count = 3 * (entry_weight != 0).sum()
+    return reduce_masked_loss(raw_loss, active_entry_count, ddp)
 
 
 def mean_normed_error_forces(
@@ -260,6 +320,42 @@ class WeightedEnergyForcesLoss(torch.nn.Module):
     ) -> torch.Tensor:
         loss_energy = weighted_mean_squared_error_energy(ref, pred, ddp)
         loss_forces = mean_squared_error_forces(ref, pred, ddp)
+        return self.energy_weight * loss_energy + self.forces_weight * loss_forces
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}(energy_weight={self.energy_weight:.3f}, "
+            f"forces_weight={self.forces_weight:.3f})"
+        )
+
+
+class WeightedEnergyForcesMaskedLoss(torch.nn.Module):
+    """Energy/forces loss whose terms average only over labelled entries.
+
+    The stock ``WeightedEnergyForcesLoss`` divides each term by the total
+    entry count of the batch, so in mixed multi-head batches the effective
+    forces weight wobbles with how many energy-only configurations the
+    batch happens to contain. Here each term divides by the number of
+    entries with a non-zero weight, making the energy:forces balance
+    independent of batch composition.
+    """
+
+    def __init__(self, energy_weight=1.0, forces_weight=1.0) -> None:
+        super().__init__()
+        self.register_buffer(
+            "energy_weight",
+            torch.tensor(energy_weight, dtype=torch.get_default_dtype()),
+        )
+        self.register_buffer(
+            "forces_weight",
+            torch.tensor(forces_weight, dtype=torch.get_default_dtype()),
+        )
+
+    def forward(
+        self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
+    ) -> torch.Tensor:
+        loss_energy = masked_weighted_mean_squared_error_energy(ref, pred, ddp)
+        loss_forces = masked_mean_squared_error_forces(ref, pred, ddp)
         return self.energy_weight * loss_energy + self.forces_weight * loss_forces
 
     def __repr__(self):

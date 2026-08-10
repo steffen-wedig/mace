@@ -14,6 +14,7 @@ from .blocks import (
     LinearReadoutBlock,
     MagneticRealAgnosticResidueSpinOrbitCoupledDensityInteractionBlock,
     MagneticRealAgnosticSpinOrbitCoupledDensityInteractionBlock,
+    MultiLevelScaleShiftBlock,
     NonLinearBiasReadoutBlock,
     NonLinearDipolePolarReadoutBlock,
     NonLinearDipoleReadoutBlock,
@@ -26,6 +27,8 @@ from .blocks import (
     RealAgnosticInteractionBlock,
     RealAgnosticResidualInteractionBlock,
     RealAgnosticResidualNonLinearInteractionBlock,
+    ResidualLevelLinearReadoutBlock,
+    ResidualLevelNonLinearReadoutBlock,
     ScaleShiftBlock,
 )
 from .extensions import (
@@ -43,6 +46,7 @@ from .loss import (
     WeightedEnergyForcesDipoleLoss,
     WeightedEnergyForcesL1L2Loss,
     WeightedEnergyForcesLoss,
+    WeightedEnergyForcesMaskedLoss,
     WeightedEnergyForcesStressLoss,
     WeightedEnergyForcesVirialsLoss,
     WeightedForcesLoss,
@@ -53,6 +57,7 @@ from .models import (
     AtomicDielectricMACE,
     AtomicDipolesMACE,
     EnergyDipolesMACE,
+    MultiLevelScaleShiftMACE,
     ScaleShiftMACE,
 )
 from .radial import BesselBasis, GaussianBasis, PolynomialCutoff, ZBLBasis
@@ -86,6 +91,8 @@ readout_classes: Dict[str, Type[LinearReadoutBlock]] = {
     "NonLinearReadoutBlock": NonLinearReadoutBlock,
     "NonLinearBiasReadoutBlock": NonLinearBiasReadoutBlock,
     "GeneralNonLinearBiasReadoutBlock": GeneralNonLinearBiasReadoutBlock,
+    "ResidualLevelLinearReadoutBlock": ResidualLevelLinearReadoutBlock,
+    "ResidualLevelNonLinearReadoutBlock": ResidualLevelNonLinearReadoutBlock,
 }
 
 scaling_classes: Dict[str, Callable] = {
@@ -120,6 +127,7 @@ __all__ = [
     "GaussianBasis",
     "MACE",
     "ScaleShiftMACE",
+    "MultiLevelScaleShiftMACE",
     "MACELES",
     "AtomicDipolesMACE",
     "AtomicDielectricMACE",
@@ -131,6 +139,7 @@ __all__ = [
     "LinearLesReadoutBlock",
     "NonLinearLesReadoutBlock",
     "WeightedEnergyForcesLoss",
+    "WeightedEnergyForcesMaskedLoss",
     "WeightedForcesLoss",
     "WeightedEnergyForcesVirialsLoss",
     "WeightedEnergyForcesStressLoss",
