@@ -196,7 +196,7 @@ def test_delta_moves_only_its_own_level():
     ].detach()
     # Perturb the final readout's delta projection only.
     with torch.no_grad():
-        for parameter in model.readouts[-1].delta_linear.parameters():
+        for parameter in model.readouts[-1].delta_readouts[0].projection.parameters():
             parameter.add_(0.5)
     after = model(batch.to_dict(), training=False, compute_force=False)[
         "energy_all_levels"
@@ -230,9 +230,20 @@ def test_stop_gradient_blocks_base_readout_path():
     # Backward only from the delta level's energy.
     output["energy_all_levels"][:, 1].sum().backward()
     for readout in model.readouts:
-        for parameter in readout.base_linear.parameters():
+        base_parameters = list(readout.base_linear.parameters())
+        if hasattr(readout, "delta_readouts"):
+            # Final block: the base hidden layer feeds only the base column.
+            base_parameters += list(readout.linear_1.parameters())
+            delta_parameters = [
+                parameter
+                for delta_readout in readout.delta_readouts
+                for parameter in delta_readout.parameters()
+            ]
+        else:
+            delta_parameters = list(readout.delta_linear.parameters())
+        for parameter in base_parameters:
             assert parameter.grad is None or torch.all(parameter.grad == 0)
-        for parameter in readout.delta_linear.parameters():
+        for parameter in delta_parameters:
             assert parameter.grad is not None
             assert not torch.all(parameter.grad == 0)
     # The trunk still receives gradient through the delta projections.
