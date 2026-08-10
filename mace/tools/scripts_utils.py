@@ -778,6 +778,10 @@ def get_loss_fn(
         loss_fn = modules.WeightedEnergyForcesLoss(
             energy_weight=args.energy_weight, forces_weight=args.forces_weight
         )
+    elif args.loss == "weighted_masked":
+        loss_fn = modules.WeightedEnergyForcesMaskedLoss(
+            energy_weight=args.energy_weight, forces_weight=args.forces_weight
+        )
     elif args.loss == "forces_only":
         loss_fn = modules.WeightedForcesLoss(forces_weight=args.forces_weight)
     elif args.loss == "virials":
@@ -900,6 +904,14 @@ def get_swa(
         )
         logging.info(
             f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight}, stress weight : {args.swa_stress_weight}, magforces weight : {args.swa_magforces_weight} and learning rate : {args.swa_lr}"
+        )
+    elif args.loss == "weighted_masked":
+        loss_fn_energy = modules.WeightedEnergyForcesMaskedLoss(
+            energy_weight=args.swa_energy_weight,
+            forces_weight=args.swa_forces_weight,
+        )
+        logging.info(
+            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight} and learning rate : {args.swa_lr}"
         )
     else:
         loss_fn_energy = modules.WeightedEnergyForcesLoss(

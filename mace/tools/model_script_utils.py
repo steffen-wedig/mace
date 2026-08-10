@@ -60,6 +60,23 @@ def configure_model(
                 head_config.std = 1.0
         logging.info("No scaling selected")
 
+    # When every head ships its own statistics in the heads yaml, use them
+    # outright -- do not fall through to computing statistics from the
+    # training data (which would silently degenerate to std 1.0 for a head
+    # without force labels).
+    if head_configs is not None and args.std is None:
+        per_head_std = [getattr(head_config, "std", None) for head_config in head_configs]
+        if all(value is not None for value in per_head_std):
+            args.std = list(per_head_std)
+            logging.info(f"Using per-head std from the heads config: {args.std}")
+    if head_configs is not None and args.mean is None:
+        per_head_mean = [
+            getattr(head_config, "mean", None) for head_config in head_configs
+        ]
+        if all(value is not None for value in per_head_mean):
+            args.mean = list(per_head_mean)
+            logging.info(f"Using per-head mean from the heads config: {args.mean}")
+
     if (
         head_configs is not None
         and args.std is not None
@@ -81,6 +98,25 @@ def configure_model(
         args.mean, args.std = modules.scaling_classes[args.scaling](
             train_loader, atomic_energies
         )
+
+    # Lift a scalar mean to a per-head list, preferring each head's own
+    # yaml-provided mean -- the counterpart of the per-head std handling
+    # above. For MultiLevelScaleShiftMACE the non-base heads' means are the
+    # statistics of their delta targets.
+    if (
+        head_configs is not None
+        and args.mean is not None
+        and not isinstance(args.mean, (list, np.ndarray))
+    ):
+        atomic_inter_shift = []
+        for head_config in head_configs:
+            if getattr(head_config, "mean", None) is not None:
+                atomic_inter_shift.append(head_config.mean)
+            else:
+                atomic_inter_shift.append(
+                    args.mean if isinstance(args.mean, float) else 0.0
+                )
+        args.mean = atomic_inter_shift
     if args.embedding_specs is not None:
         logging.info("Using embedding specifications from command line arguments")
         logging.info(f"Embedding specifications: {args.embedding_specs}")
@@ -319,6 +355,26 @@ def _build_model(
             use_embedding_readout=args.use_embedding_readout,
             use_last_readout_only=args.use_last_readout_only,
             use_agnostic_product=args.use_agnostic_product,
+        )
+    if args.model == "MultiLevelScaleShiftMACE":
+        return modules.MultiLevelScaleShiftMACE(
+            **model_config,
+            pair_repulsion=args.pair_repulsion,
+            distance_transform=args.distance_transform,
+            correlation=args.correlation,
+            gate=modules.gate_dict[args.gate],
+            interaction_cls_first=modules.interaction_classes[args.interaction_first],
+            MLP_irreps=o3.Irreps(args.MLP_irreps),
+            atomic_inter_scale=args.std,
+            atomic_inter_shift=args.mean,
+            radial_MLP=ast.literal_eval(args.radial_MLP),
+            radial_type=args.radial_type,
+            heads=heads,
+            use_last_readout_only=args.use_last_readout_only,
+            use_agnostic_product=args.use_agnostic_product,
+            base_level=0,
+            detach_base_for_deltas=args.detach_base_for_deltas,
+            zero_init_delta_readouts=args.zero_init_delta_readouts,
         )
     if args.model == "PolarMACE" and model_config_foundation is not None:
         return modules.PolarMACE(**model_config_foundation)

@@ -158,6 +158,149 @@ class NonLinearBiasReadoutBlock(torch.nn.Module):
         return self.linear_2(x)  # [n_nodes, len(heads)]
 
 
+def _zero_module_parameters(module: torch.nn.Module) -> None:
+    for parameter in module.parameters():
+        with torch.no_grad():
+            parameter.zero_()
+
+
+def _assemble_level_columns(
+    base: torch.Tensor,  # [n_nodes, 1]
+    deltas: torch.Tensor,  # [n_nodes, num_levels - 1]
+    base_level: int,
+) -> torch.Tensor:  # [n_nodes, num_levels]
+    return torch.cat(
+        [deltas[:, :base_level], base, deltas[:, base_level:]], dim=-1
+    )
+
+
+@compile_mode("script")
+class ResidualLevelLinearReadoutBlock(torch.nn.Module):
+    """Per-layer linear readout for residual multi-level models.
+
+    Returns raw per-level *components* in one call, with no head selection:
+    column ``base_level`` is the base energy contribution and every other
+    column is that level's residual correction (delta). The combination
+    into per-level energies -- including the per-component scale/shift and
+    the optional base detach -- happens once, in
+    :class:`MultiLevelScaleShiftBlock`, after the contributions of all
+    layers are summed. Zero-initialising the delta projections makes every
+    level start exactly at the base prediction, model-wide.
+    """
+
+    def __init__(
+        self,
+        irreps_in: o3.Irreps,
+        num_levels: int,
+        base_level: int = 0,
+        zero_init_deltas: bool = False,
+        cueq_config: Optional[CuEquivarianceConfig] = None,
+        oeq_config: Optional[OEQConfig] = None,  # pylint: disable=unused-argument
+    ):
+        super().__init__()
+        if num_levels < 2:
+            raise ValueError(
+                f"A residual multi-level readout needs at least two levels, got {num_levels}"
+            )
+        if not 0 <= base_level < num_levels:
+            raise ValueError(
+                f"base_level {base_level} out of range for {num_levels} levels"
+            )
+        self.num_levels = num_levels
+        self.base_level = base_level
+        self.base_linear = Linear(
+            irreps_in=irreps_in, irreps_out=o3.Irreps("0e"), cueq_config=cueq_config
+        )
+        self.delta_linear = Linear(
+            irreps_in=irreps_in,
+            irreps_out=o3.Irreps(f"{num_levels - 1}x0e"),
+            cueq_config=cueq_config,
+        )
+        if zero_init_deltas:
+            _zero_module_parameters(self.delta_linear)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        heads: Optional[torch.Tensor] = None,  # pylint: disable=unused-argument
+    ) -> torch.Tensor:  # [n_nodes, num_levels]
+        base = self.base_linear(x)  # [n_nodes, 1]
+        deltas = self.delta_linear(x)  # [n_nodes, num_levels - 1]
+        return _assemble_level_columns(base, deltas, self.base_level)
+
+
+@compile_mode("script")
+class ResidualLevelNonLinearReadoutBlock(torch.nn.Module):
+    """Final non-linear readout for residual multi-level models.
+
+    One *shared* scalar hidden layer feeds a base projection and one delta
+    projection per non-base level, so the hidden features are fitted from
+    every level's data rather than from a private per-head slice. Returns
+    the same per-level component layout as
+    :class:`ResidualLevelLinearReadoutBlock`; see there for how the
+    components are combined.
+    """
+
+    def __init__(
+        self,
+        irreps_in: o3.Irreps,
+        MLP_irreps: o3.Irreps,
+        gate: Optional[Callable],
+        num_levels: int,
+        base_level: int = 0,
+        zero_init_deltas: bool = False,
+        cueq_config: Optional[CuEquivarianceConfig] = None,
+        oeq_config: Optional[OEQConfig] = None,  # pylint: disable=unused-argument
+    ):
+        super().__init__()
+        if num_levels < 2:
+            raise ValueError(
+                f"A residual multi-level readout needs at least two levels, got {num_levels}"
+            )
+        if not 0 <= base_level < num_levels:
+            raise ValueError(
+                f"base_level {base_level} out of range for {num_levels} levels"
+            )
+        hidden_irreps = o3.Irreps(MLP_irreps)
+        if any(irrep.ir != o3.Irrep(0, 1) for irrep in hidden_irreps):
+            raise ValueError(
+                "The shared hidden layer of a residual readout must contain only "
+                f"scalars (0e); a non-scalar hidden layer silently breaks "
+                f"invariance. Got {hidden_irreps}"
+            )
+        self.num_levels = num_levels
+        self.base_level = base_level
+        self.hidden_irreps = hidden_irreps
+        self.linear_1 = Linear(
+            irreps_in=irreps_in, irreps_out=hidden_irreps, cueq_config=cueq_config
+        )
+        self.non_linearity = simplify_if_compile(nn.Activation)(
+            irreps_in=hidden_irreps, acts=[gate]
+        )
+        self.base_linear = Linear(
+            irreps_in=hidden_irreps,
+            irreps_out=o3.Irreps("0e"),
+            cueq_config=cueq_config,
+        )
+        self.delta_linear = Linear(
+            irreps_in=hidden_irreps,
+            irreps_out=o3.Irreps(f"{num_levels - 1}x0e"),
+            cueq_config=cueq_config,
+        )
+        if zero_init_deltas:
+            _zero_module_parameters(self.delta_linear)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        heads: Optional[torch.Tensor] = None,  # pylint: disable=unused-argument
+    ) -> torch.Tensor:  # [n_nodes, num_levels]
+        hidden = self.non_linearity(self.linear_1(x))
+        base = self.base_linear(hidden)  # [n_nodes, 1]
+        deltas = self.delta_linear(hidden)  # [n_nodes, num_levels - 1]
+        return _assemble_level_columns(base, deltas, self.base_level)
+
+
 @compile_mode("script")
 class LinearDipoleReadoutBlock(torch.nn.Module):
     def __init__(
@@ -1861,6 +2004,90 @@ class ScaleShiftBlock(torch.nn.Module):
             else f"{self.shift.item():.4f}"
         )
         return f"{self.__class__.__name__}(scale={formatted_scale}, shift={formatted_shift})"
+
+
+class MultiLevelScaleShiftBlock(torch.nn.Module):
+    """Combines per-level readout components into per-level energies.
+
+    Implements the "scale separately" placement: every level's energy is the
+    base component in the base's units plus its own delta component in the
+    delta's units,
+
+        E_base = scale[base] * c_base + shift[base]
+        E_k    = scale[base] * c_base + shift[base]
+                 + scale[k] * c_k + shift[k]          for k != base
+
+    so ``scale[k]``/``shift[k]`` for a non-base level are the statistics of
+    that level's *correction* (delta), not of its absolute energies. With
+    ``detach_base_for_deltas`` the base component entering the non-base
+    levels is detached, which blocks the gradients of the expensive levels
+    from moving the base fit through the readout path (they still reach the
+    shared trunk through their own delta projections).
+    """
+
+    def __init__(
+        self,
+        scale: List[float],
+        shift: List[float],
+        base_level: int = 0,
+        detach_base_for_deltas: bool = False,
+    ):
+        super().__init__()
+        if len(scale) != len(shift):
+            raise ValueError(
+                f"scale and shift must have one entry per level, got {len(scale)} and {len(shift)}"
+            )
+        num_levels = len(scale)
+        if num_levels < 2:
+            raise ValueError(
+                f"A multi-level scale-shift needs at least two levels, got {num_levels}"
+            )
+        if not 0 <= base_level < num_levels:
+            raise ValueError(
+                f"base_level {base_level} out of range for {num_levels} levels"
+            )
+        self.base_level = base_level
+        self.detach_base_for_deltas = detach_base_for_deltas
+        self.register_buffer(
+            "scale", torch.tensor(scale, dtype=torch.get_default_dtype())
+        )
+        self.register_buffer(
+            "shift", torch.tensor(shift, dtype=torch.get_default_dtype())
+        )
+        is_delta = torch.ones(num_levels, dtype=torch.get_default_dtype())
+        is_delta[base_level] = 0.0
+        self.register_buffer("is_delta", is_delta)
+
+    def forward(self, components: torch.Tensor) -> torch.Tensor:
+        # components: [n_nodes, num_levels]; column base_level is the base,
+        # every other column that level's raw delta.
+        base_column = components[:, self.base_level : self.base_level + 1]
+        base_energy = (
+            self.scale[self.base_level] * base_column + self.shift[self.base_level]
+        )  # [n_nodes, 1]
+        if self.detach_base_for_deltas:
+            base_energy_for_deltas = (
+                self.scale[self.base_level] * base_column.detach()
+                + self.shift[self.base_level]
+            )
+        else:
+            base_energy_for_deltas = base_energy
+        delta_energies = self.scale.view(1, -1) * components + self.shift.view(1, -1)
+        # For the base column: base_energy. For every delta column: the base
+        # energy (possibly detached) plus that level's scaled correction.
+        return (
+            self.is_delta.view(1, -1) * (base_energy_for_deltas + delta_energies)
+            + (1.0 - self.is_delta.view(1, -1)) * base_energy
+        )
+
+    def __repr__(self):
+        formatted_scale = ", ".join([f"{x:.4f}" for x in self.scale])
+        formatted_shift = ", ".join([f"{x:.4f}" for x in self.shift])
+        return (
+            f"{self.__class__.__name__}(scale=[{formatted_scale}], "
+            f"shift=[{formatted_shift}], base_level={self.base_level}, "
+            f"detach_base_for_deltas={self.detach_base_for_deltas})"
+        )
 
 
 # LES-specific readout blocks

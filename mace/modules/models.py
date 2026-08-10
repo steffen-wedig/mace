@@ -24,10 +24,13 @@ from .blocks import (
     LinearDipoleReadoutBlock,
     LinearNodeEmbeddingBlock,
     LinearReadoutBlock,
+    MultiLevelScaleShiftBlock,
     NonLinearDipolePolarReadoutBlock,
     NonLinearDipoleReadoutBlock,
     NonLinearReadoutBlock,
     RadialEmbeddingBlock,
+    ResidualLevelLinearReadoutBlock,
+    ResidualLevelNonLinearReadoutBlock,
     ScaleShiftBlock,
 )
 from .utils import (
@@ -608,6 +611,278 @@ class ScaleShiftMACE(MACE):
             )
         return {
             "energy": total_energy,
+            "node_energy": node_energy,
+            "interaction_energy": inter_e,
+            "forces": forces,
+            "edge_forces": edge_forces,
+            "virials": virials,
+            "stress": stress,
+            "atomic_virials": atomic_virials,
+            "atomic_stresses": atomic_stresses,
+            "hessian": hessian,
+            "displacement": displacement,
+            "node_feats": node_feats_out,
+        }
+
+
+@compile_mode("script")
+class MultiLevelScaleShiftMACE(MACE):
+    """MACE with a shared trunk and residual per-level readouts.
+
+    Every head is a level of theory. The head at ``base_level`` (by
+    convention the first head) is the base level; every other head's energy
+    is the base prediction plus a level-specific correction that is read
+    out from the *same* trunk features at every layer:
+
+        e_base(i)  = sum over layers of base_t(h_i^t)
+        delta_k(i) = sum over layers of delta_{t,k}(h_i^t)
+        E_k        = scale_base * e_base + shift_base
+                     + scale_k * delta_k + shift_k        for k != base
+
+    so ``atomic_inter_scale[k]``/``atomic_inter_shift[k]`` for a non-base
+    head must be the statistics of that head's *correction* (the delta
+    against the base level), while its atomic energies stay the absolute
+    per-level E0s. One forward pass produces every level's energy
+    (``energy_all_levels``); ``energy`` and ``forces`` remain the
+    head-gathered tensors so the stock loss, error tables and calculator
+    keep working. Forces are computed for the gathered head only.
+    """
+
+    def __init__(
+        self,
+        atomic_inter_scale: List[float],
+        atomic_inter_shift: List[float],
+        base_level: int = 0,
+        detach_base_for_deltas: bool = False,
+        zero_init_delta_readouts: bool = False,
+        **kwargs,
+    ):
+        if kwargs.get("embedding_specs") is not None:
+            raise ValueError(
+                "MultiLevelScaleShiftMACE does not support embedding_specs"
+            )
+        super().__init__(**kwargs)
+        heads = kwargs.get("heads")
+        if heads is None or len(heads) < 2:
+            raise ValueError(
+                "MultiLevelScaleShiftMACE needs at least two heads (levels); "
+                f"got {heads}"
+            )
+        num_levels = len(heads)
+        scale = self._as_per_level_list(atomic_inter_scale, num_levels, "scale")
+        shift = self._as_per_level_list(atomic_inter_shift, num_levels, "shift")
+        self.base_level = base_level
+
+        # Replace the stock per-head readouts (masked, head-selected) with
+        # residual per-level readouts at every layer. The input irreps are
+        # read off the blocks the parent constructor built, so the
+        # hidden-irreps bookkeeping stays in one place.
+        gate = kwargs.get("gate")
+        MLP_irreps = o3.Irreps(kwargs["MLP_irreps"])
+        cueq_config = kwargs.get("cueq_config")
+        residual_readouts = torch.nn.ModuleList()
+        for readout in self.readouts:
+            if isinstance(readout, NonLinearReadoutBlock):
+                residual_readouts.append(
+                    ResidualLevelNonLinearReadoutBlock(
+                        irreps_in=readout.linear_1.irreps_in,
+                        MLP_irreps=MLP_irreps,
+                        gate=gate,
+                        num_levels=num_levels,
+                        base_level=base_level,
+                        zero_init_deltas=zero_init_delta_readouts,
+                        cueq_config=cueq_config,
+                    )
+                )
+            elif isinstance(readout, LinearReadoutBlock):
+                residual_readouts.append(
+                    ResidualLevelLinearReadoutBlock(
+                        irreps_in=readout.linear.irreps_in,
+                        num_levels=num_levels,
+                        base_level=base_level,
+                        zero_init_deltas=zero_init_delta_readouts,
+                        cueq_config=cueq_config,
+                    )
+                )
+            else:
+                raise ValueError(
+                    "MultiLevelScaleShiftMACE only supports Linear and "
+                    f"NonLinear readouts, got {type(readout).__name__}"
+                )
+        self.readouts = residual_readouts
+
+        self.scale_shift = MultiLevelScaleShiftBlock(
+            scale=scale,
+            shift=shift,
+            base_level=base_level,
+            detach_base_for_deltas=detach_base_for_deltas,
+        )
+
+    @staticmethod
+    def _as_per_level_list(value, num_levels: int, name: str) -> List[float]:
+        if isinstance(value, np.ndarray):
+            value = value.tolist()
+        if not isinstance(value, (list, tuple)):
+            raise ValueError(
+                f"MultiLevelScaleShiftMACE needs one {name} per level "
+                f"(base statistics for the base head, delta statistics for "
+                f"every other head); got the scalar {value!r}"
+            )
+        if len(value) != num_levels:
+            raise ValueError(
+                f"Got {len(value)} {name} values for {num_levels} levels"
+            )
+        return [float(entry) for entry in value]
+
+    def forward(
+        self,
+        data: Dict[str, torch.Tensor],
+        training: bool = False,
+        compute_force: bool = True,
+        compute_virials: bool = False,
+        compute_stress: bool = False,
+        compute_displacement: bool = False,
+        compute_hessian: bool = False,
+        compute_edge_forces: bool = False,
+        compute_atomic_stresses: bool = False,
+        lammps_mliap: bool = False,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        # Setup
+        ctx = prepare_graph(
+            data,
+            compute_virials=compute_virials,
+            compute_stress=compute_stress,
+            compute_displacement=compute_displacement,
+            lammps_mliap=lammps_mliap,
+        )
+
+        is_lammps = ctx.is_lammps
+        num_atoms_arange = ctx.num_atoms_arange.to(torch.int64)
+        num_graphs = ctx.num_graphs
+        displacement = ctx.displacement
+        positions = ctx.positions
+        vectors = ctx.vectors
+        lengths = ctx.lengths
+        cell = ctx.cell
+        node_heads = ctx.node_heads.to(torch.int64)
+        interaction_kwargs = ctx.interaction_kwargs
+        lammps_natoms = interaction_kwargs.lammps_natoms
+        lammps_class = interaction_kwargs.lammps_class
+
+        # Atomic energies: keep all levels, gather the per-node head for the
+        # compatibility outputs.
+        node_e0_all = self.atomic_energies_fn(data["node_attrs"]).to(
+            vectors.dtype
+        )  # [n_nodes, n_levels]
+        node_e0 = node_e0_all[num_atoms_arange, node_heads]
+        e0 = scatter_sum(
+            src=node_e0, index=data["batch"], dim=0, dim_size=num_graphs
+        )  # [n_graphs]
+        e0_all_levels = scatter_sum(
+            src=node_e0_all, index=data["batch"], dim=0, dim_size=num_graphs
+        )  # [n_graphs, n_levels]
+
+        # Embeddings
+        node_feats = self.node_embedding(data["node_attrs"])
+        edge_attrs = self.spherical_harmonics(vectors)
+        edge_feats, cutoff = self.radial_embedding(
+            lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
+        )
+
+        if hasattr(self, "pair_repulsion"):
+            pair_node_energy = self.pair_repulsion_fn(
+                lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
+            )
+            if is_lammps:
+                pair_node_energy = pair_node_energy[: lammps_natoms[0]]
+        else:
+            pair_node_energy = torch.zeros_like(node_e0)
+
+        # Interactions
+        node_feats_list: List[torch.Tensor] = []
+        for i, (interaction, product) in enumerate(
+            zip(self.interactions, self.products)
+        ):
+            node_attrs_slice = data["node_attrs"]
+            if is_lammps and i > 0:
+                node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]
+            node_feats, sc = interaction(
+                node_attrs=node_attrs_slice,
+                node_feats=node_feats,
+                edge_attrs=edge_attrs,
+                edge_feats=edge_feats,
+                edge_index=data["edge_index"],
+                cutoff=cutoff,
+                first_layer=(i == 0),
+                lammps_class=lammps_class,
+                lammps_natoms=lammps_natoms,
+            )
+            if is_lammps and i == 0:
+                node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]
+            node_feats = product(
+                node_feats=node_feats, sc=sc, node_attrs=node_attrs_slice
+            )
+            node_feats_list.append(node_feats)
+
+        # Residual readouts: every layer contributes a base column and one
+        # raw delta column per non-base level; no head selection happens
+        # until after the scale-shift combination.
+        node_components_list: List[torch.Tensor] = []
+        for i, readout in enumerate(self.readouts):
+            feat_idx = -1 if len(self.readouts) == 1 else i
+            node_components_list.append(
+                readout(node_feats_list[feat_idx], node_heads)
+            )
+        node_components = torch.sum(
+            torch.stack(node_components_list, dim=0), dim=0
+        )  # [n_nodes, n_levels]
+        if hasattr(self, "pair_repulsion"):
+            pair_components = torch.zeros_like(node_components)
+            pair_components[:, self.base_level] = pair_node_energy
+            node_components = node_components + pair_components
+
+        node_es_all = self.scale_shift(node_components)  # [n_nodes, n_levels]
+        node_inter_es = node_es_all[num_atoms_arange, node_heads]  # [n_nodes]
+        inter_e = scatter_sum(
+            node_inter_es, data["batch"], dim=-1, dim_size=num_graphs
+        )  # [n_graphs]
+        inter_e_all_levels = scatter_sum(
+            node_es_all, data["batch"], dim=0, dim_size=num_graphs
+        )  # [n_graphs, n_levels]
+
+        node_feats_out = torch.cat(node_feats_list, dim=-1)
+        total_energy = e0 + inter_e
+        energy_all_levels = e0_all_levels + inter_e_all_levels
+        node_energy = safe_double(node_e0.clone()) + safe_double(node_inter_es.clone())
+
+        forces, virials, stress, hessian, edge_forces, _ = get_outputs(
+            energy=inter_e,
+            positions=positions,
+            displacement=displacement,
+            vectors=vectors,
+            cell=cell,
+            training=training,
+            compute_force=compute_force,
+            compute_virials=compute_virials,
+            compute_stress=compute_stress,
+            compute_hessian=compute_hessian,
+            compute_edge_forces=compute_edge_forces or compute_atomic_stresses,
+        )
+
+        atomic_virials: Optional[torch.Tensor] = None
+        atomic_stresses: Optional[torch.Tensor] = None
+        if compute_atomic_stresses and edge_forces is not None:
+            atomic_virials, atomic_stresses = get_atomic_virials_stresses(
+                edge_forces=edge_forces,
+                edge_index=data["edge_index"],
+                vectors=vectors,
+                num_atoms=positions.shape[0],
+                batch=data["batch"],
+                cell=cell,
+            )
+        return {
+            "energy": total_energy,
+            "energy_all_levels": energy_all_levels,
             "node_energy": node_energy,
             "interaction_energy": inter_e,
             "forces": forces,

@@ -138,6 +138,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "BOTNet",
             "MACE",
             "ScaleShiftMACE",
+            "MultiLevelScaleShiftMACE",
             "PolarMACE",
             "MACELES",
             "ScaleShiftBOTNet",
@@ -146,6 +147,21 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "EnergyDipolesMACE",
             "MagneticScaleShiftMACE",
         ],
+    )
+    parser.add_argument(
+        "--detach_base_for_deltas",
+        help="MultiLevelScaleShiftMACE only: detach the base component entering the "
+        "non-base levels, so the expensive levels cannot move the base fit through "
+        "the readout path",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--zero_init_delta_readouts",
+        help="MultiLevelScaleShiftMACE only: zero-initialise every delta projection "
+        "so each level starts exactly at the base prediction plus its fitted shift",
+        action="store_true",
+        default=False,
     )
     parser.add_argument(
         "--r_max", help="distance cutoff (in Ang)", type=float, default=5.0
@@ -784,6 +800,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         choices=[
             "ef",
             "weighted",
+            "weighted_masked",
             "forces_only",
             "virials",
             "stress",
