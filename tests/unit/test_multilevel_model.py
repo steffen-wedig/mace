@@ -438,6 +438,123 @@ def test_multilevel_loss_counts_only_labelled_entries(tmp_path):
     assert (weights != 0).sum().item() == 3
 
 
+def make_single_head_base_model(atomic_energies, scale, shift):
+    """A stock single-head ScaleShiftMACE with the same trunk hyperparameters."""
+    return modules.ScaleShiftMACE(
+        r_max=5,
+        num_bessel=8,
+        num_polynomial_cutoff=6,
+        max_ell=2,
+        interaction_cls=modules.interaction_classes[
+            "RealAgnosticResidualInteractionBlock"
+        ],
+        interaction_cls_first=modules.interaction_classes[
+            "RealAgnosticResidualInteractionBlock"
+        ],
+        num_interactions=2,
+        num_elements=len(TABLE),
+        hidden_irreps=o3.Irreps("16x0e + 16x1o"),
+        MLP_irreps=o3.Irreps("8x0e"),
+        gate=torch.nn.functional.silu,
+        atomic_energies=np.asarray(atomic_energies, dtype=float),
+        avg_num_neighbors=8,
+        atomic_numbers=TABLE.zs,
+        correlation=3,
+        heads=[LEVELS[BASE_LEVEL]],
+        atomic_inter_scale=scale,
+        atomic_inter_shift=shift,
+    )
+
+
+def test_warm_start_reproduces_the_base_model_on_the_base_head(tmp_path):
+    from mace.tools.multilevel_init import initialise_from_base_model
+
+    base_e0s = np.array([[-13.7, -2042.8]])
+    base_model = make_single_head_base_model(base_e0s, scale=1.3, shift=-3.0)
+    base_model_path = tmp_path / "base.model"
+    torch.save(base_model, base_model_path)
+
+    model = make_model(
+        atomic_energies=np.vstack([base_e0s, np.array([[0.11, 1.85]])]),
+        atomic_inter_scale=(1.3, 0.01),
+        atomic_inter_shift=(-3.0, -0.08),
+        zero_init_delta_readouts=True,
+    )
+    counts = initialise_from_base_model(model, base_model_path)
+    assert counts["copied"] > 0
+
+    batch = make_batch(
+        [
+            make_configuration(POSITIONS, head=LEVELS[BASE_LEVEL]),
+            make_configuration(POSITIONS + 0.05, head=LEVELS[BASE_LEVEL]),
+        ]
+    )
+    warm_output = model(batch.to_dict(), training=False, compute_force=True)
+    base_output = base_model(batch.to_dict(), training=False, compute_force=True)
+    assert torch.allclose(warm_output["energy"], base_output["energy"], atol=1e-10)
+    assert torch.allclose(warm_output["forces"], base_output["forces"], atol=1e-10)
+    # Zero-initialised deltas: every level starts at base plus its shift/E0,
+    # so the fused per-level energies exist and are finite.
+    fused_output = model(batch.to_dict(), training=True)
+    assert torch.isfinite(fused_output["energy_all_levels"]).all()
+
+
+def test_warm_start_rejects_a_mismatched_trunk(tmp_path):
+    from mace.tools.multilevel_init import WarmStartError, initialise_from_base_model
+
+    base_e0s = np.array([[-13.7, -2042.8]])
+    small_base = make_single_head_base_model(base_e0s, scale=1.3, shift=-3.0)
+    # Shrink the trunk after the fact by rebuilding with fewer interactions.
+    mismatched = make_model(
+        atomic_energies=np.vstack([base_e0s, np.array([[0.11, 1.85]])]),
+        atomic_inter_scale=(1.3, 0.01),
+        atomic_inter_shift=(-3.0, -0.08),
+        num_interactions=1,
+    )
+    base_model_path = tmp_path / "base.model"
+    torch.save(small_base, base_model_path)
+    with pytest.raises(WarmStartError):
+        initialise_from_base_model(mismatched, base_model_path)
+
+
+def test_warm_start_rejects_disagreeing_export_statistics(tmp_path):
+    from mace.tools.multilevel_init import WarmStartError, initialise_from_base_model
+
+    base_e0s = np.array([[-13.7, -2042.8]])
+    base_model = make_single_head_base_model(base_e0s, scale=1.3, shift=-3.0)
+    base_model_path = tmp_path / "base.model"
+    torch.save(base_model, base_model_path)
+    model = make_model(
+        atomic_energies=np.vstack([base_e0s, np.array([[0.11, 1.85]])]),
+        atomic_inter_scale=(1.4, 0.01),  # different base scale
+        atomic_inter_shift=(-3.0, -0.08),
+    )
+    with pytest.raises(WarmStartError, match="scale"):
+        initialise_from_base_model(model, base_model_path)
+
+
+def test_freezing_leaves_only_delta_parameters_trainable():
+    from mace.tools.multilevel_init import freeze_non_delta_parameters
+
+    model = make_model()
+    counts = freeze_non_delta_parameters(model)
+    assert counts["trainable"] > 0 and counts["frozen"] > 0
+    for name, parameter in model.named_parameters():
+        assert parameter.requires_grad == ("delta" in name), name
+
+    # A forward/backward through every level still works: position gradients
+    # flow through frozen parameters even though they receive none, and the
+    # delta paths (the only trainable ones) receive gradients.
+    batch = make_batch([make_configuration(POSITIONS, head=LEVELS[BASE_LEVEL])])
+    output = model(batch.to_dict(), training=True, compute_force=True)
+    output["energy_all_levels"].sum().backward()
+    for name, parameter in model.named_parameters():
+        if "delta" in name and parameter.grad is not None:
+            break
+    else:
+        pytest.fail("no delta parameter received a gradient")
+
+
 def test_per_level_energy_weights_normalise_each_level(tmp_path):
     model = make_model(
         atomic_inter_scale=(1.3, 0.01), atomic_inter_shift=(-3.0, -0.08)
