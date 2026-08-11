@@ -1107,6 +1107,7 @@ def run(args) -> None:
         rank=rank,
         data_aug_magmom=args.data_aug_magmom,
         data_aug_magmom_mode=getattr(args, "data_aug_magmom_mode", "non-soc"),
+        log_gradient_diagnostics=args.log_gradient_diagnostics,
     )
 
     logging.info("")

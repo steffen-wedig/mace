@@ -150,9 +150,18 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--detach_base_for_deltas",
-        help="MultiLevelScaleShiftMACE only: detach the base component entering the "
-        "non-base levels, so the expensive levels cannot move the base fit through "
-        "the readout path",
+        help="MultiLevelScaleShiftMACE only: parameter-detach the base readout for "
+        "the non-base levels -- the expensive levels cannot move the base readout "
+        "parameters (through energy or force losses), while forces and activation "
+        "gradients stay exact",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--log_gradient_diagnostics",
+        help="at every evaluation interval, log each head's loss-gradient norm per "
+        "shared parameter group and the pairwise gradient cosines, computed on one "
+        "fixed validation batch per head",
         action="store_true",
         default=False,
     )
