@@ -832,7 +832,15 @@ def run(args) -> None:
             generator=torch.Generator().manual_seed(args.seed),
         )
 
-    loss_fn = get_loss_fn(args, dipole_only, args.compute_dipole)
+    if (
+        args.multilevel_energy_weights is not None
+        or args.swa_multilevel_energy_weights is not None
+    ) and args.multilevel_train_file is None:
+        raise ValueError(
+            "--multilevel_energy_weights applies to the fused multi-level "
+            "loss; set --multilevel_train_file (and --loss multilevel_weighted)"
+        )
+    loss_fn = get_loss_fn(args, dipole_only, args.compute_dipole, heads=heads)
     args.avg_num_neighbors = get_avg_num_neighbors(head_configs, args, train_loader, device)
 
     # Model
@@ -932,7 +940,7 @@ def run(args) -> None:
     swa: Optional[tools.SWAContainer] = None
     swas = [False]
     if args.swa:
-        swa, swas = get_swa(args, model, optimizer, swas, dipole_only)
+        swa, swas = get_swa(args, model, optimizer, swas, dipole_only, heads=heads)
 
     checkpoint_handler = tools.CheckpointHandler(
         directory=args.checkpoints_dir,

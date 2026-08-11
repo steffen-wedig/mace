@@ -769,10 +769,41 @@ def get_avg_num_neighbors(head_configs, args, train_loader, device):
     return avg_num_neighbors_out
 
 
+def parse_multilevel_energy_weights(
+    specification: Optional[str], heads: List[str]
+) -> Optional[List[float]]:
+    """Parse 'head:weight,head:weight' into a weight list in head order.
+
+    Every head must be given exactly one weight -- a partial specification
+    would silently zero a level's energy term.
+    """
+    if specification is None:
+        return None
+    weights_by_head = {}
+    for item in specification.split(","):
+        head_name, _, weight = item.partition(":")
+        if not weight:
+            raise ValueError(
+                f"malformed multilevel energy weight {item!r}; expected "
+                "'head:weight,head:weight'"
+            )
+        if head_name.strip() in weights_by_head:
+            raise ValueError(f"duplicate multilevel energy weight for {item!r}")
+        weights_by_head[head_name.strip()] = float(weight)
+    if set(weights_by_head) != set(heads):
+        raise ValueError(
+            f"multilevel energy weights name heads {sorted(weights_by_head)} "
+            f"but the run has heads {sorted(heads)}; every head needs exactly "
+            "one weight"
+        )
+    return [weights_by_head[head] for head in heads]
+
+
 def get_loss_fn(
     args: argparse.Namespace,
     dipole_only: bool,
     compute_dipole: bool,
+    heads: Optional[List[str]] = None,
 ) -> torch.nn.Module:
     if args.loss == "weighted":
         loss_fn = modules.WeightedEnergyForcesLoss(
@@ -784,7 +815,11 @@ def get_loss_fn(
         )
     elif args.loss == "multilevel_weighted":
         loss_fn = modules.MultiLevelWeightedEnergyForcesLoss(
-            energy_weight=args.energy_weight, forces_weight=args.forces_weight
+            energy_weight=args.energy_weight,
+            forces_weight=args.forces_weight,
+            energy_weights_per_level=parse_multilevel_energy_weights(
+                args.multilevel_energy_weights, heads or []
+            ),
         )
     elif args.loss == "forces_only":
         loss_fn = modules.WeightedForcesLoss(forces_weight=args.forces_weight)
@@ -850,6 +885,7 @@ def get_swa(
     optimizer: torch.optim.Optimizer,
     swas: List[bool],
     dipole_only: bool = False,
+    heads: Optional[List[str]] = None,
 ):
     assert dipole_only is False, "Stage Two for dipole fitting not implemented"
     swas.append(True)
@@ -918,9 +954,19 @@ def get_swa(
             f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight} and learning rate : {args.swa_lr}"
         )
     elif args.loss == "multilevel_weighted":
+        # Stage-two per-level weights default to the stage-one values, so a
+        # level's schedule is flat unless explicitly switched.
+        stage_two_specification = (
+            args.swa_multilevel_energy_weights
+            if args.swa_multilevel_energy_weights is not None
+            else args.multilevel_energy_weights
+        )
         loss_fn_energy = modules.MultiLevelWeightedEnergyForcesLoss(
             energy_weight=args.swa_energy_weight,
             forces_weight=args.swa_forces_weight,
+            energy_weights_per_level=parse_multilevel_energy_weights(
+                stage_two_specification, heads or []
+            ),
         )
         logging.info(
             f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight} and learning rate : {args.swa_lr}"
