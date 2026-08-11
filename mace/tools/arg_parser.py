@@ -208,6 +208,23 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument(
+        "--multilevel_base_model",
+        help="MultiLevelScaleShiftMACE only: warm-start the trunk and the "
+        "base readout path from this trained single-head model (same trunk "
+        "hyperparameters and export statistics required); the delta paths "
+        "start fresh. Combine with --zero_init_delta_readouts so every level "
+        "starts exactly at the base prediction.",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--multilevel_freeze_base",
+        help="freeze every non-delta parameter (trunk + base readout path); "
+        "only the delta readouts train. Intended with --multilevel_base_model.",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
         "--r_max", help="distance cutoff (in Ang)", type=float, default=5.0
     )
     parser.add_argument(

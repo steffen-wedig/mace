@@ -845,6 +845,19 @@ def run(args) -> None:
 
     # Model
     model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
+    if args.multilevel_base_model is not None:
+        from mace.tools.multilevel_init import initialise_from_base_model
+
+        if args.model != "MultiLevelScaleShiftMACE":
+            raise ValueError(
+                "--multilevel_base_model warm-starts a MultiLevelScaleShiftMACE; "
+                f"got model {args.model!r}"
+            )
+        initialise_from_base_model(model, args.multilevel_base_model)
+    if args.multilevel_freeze_base:
+        from mace.tools.multilevel_init import freeze_non_delta_parameters
+
+        freeze_non_delta_parameters(model)
     model.to(device)
 
     if args.lora:
