@@ -153,6 +153,131 @@ def valid_err_log(
         )
 
 
+def _log_gradient_diagnostics(
+    model: torch.nn.Module,
+    loss_fn: torch.nn.Module,
+    valid_loaders: Dict[str, DataLoader],
+    output_args: Dict[str, bool],
+    device: torch.device,
+    epoch: Optional[int],
+    logger: MetricsLogger,
+) -> None:
+    """Each head's loss gradient on one fixed validation batch per head.
+
+    Reports the gradient norm per shared parameter group (trunk, last
+    interaction, readouts -- split into base and delta paths where the
+    residual readouts distinguish them) and the pairwise geometry between
+    the heads' gradients (cosine and dot product), as one
+    ``mode="gradient_diagnostics"`` record in the metrics file plus a
+    compact log line. Runs on the raw (non-EMA) parameters the optimizer
+    actually updates, with the stage-appropriate loss.
+    """
+    parameters = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    ]
+    num_interactions = (
+        len(model.interactions) if hasattr(model, "interactions") else 0
+    )
+    last_interaction_prefix = f"interactions.{num_interactions - 1}"
+    trunk_prefixes = (
+        "node_embedding",
+        "radial_embedding",
+        "interactions",
+        "products",
+    )
+
+    def parameter_groups(name: str) -> List[str]:
+        groups: List[str] = []
+        if name.startswith(trunk_prefixes):
+            groups.append("trunk")
+            if name.startswith(last_interaction_prefix):
+                groups.append("last_interaction")
+        elif name.startswith("readouts"):
+            groups.append("readouts")
+            groups.append("delta_readout" if "delta" in name else "base_readout")
+        return groups
+
+    was_training = model.training
+    model.train()
+    gradients_by_head: Dict[str, Dict[str, torch.Tensor]] = {}
+    for head_name, data_loader in valid_loaders.items():
+        batch = next(iter(data_loader)).to(device)
+        output = model(
+            batch.to_dict(),
+            training=True,
+            compute_force=output_args["forces"],
+            compute_virials=output_args["virials"],
+            compute_stress=output_args["stress"],
+        )
+        loss = loss_fn(pred=output, ref=batch)
+        gradient_list = torch.autograd.grad(
+            loss,
+            [parameter for _, parameter in parameters],
+            retain_graph=False,
+            allow_unused=True,
+        )
+        grouped: Dict[str, List[torch.Tensor]] = {}
+        for (name, parameter), gradient in zip(parameters, gradient_list):
+            flat = (
+                gradient.detach().flatten()
+                if gradient is not None
+                else torch.zeros(parameter.numel(), device=parameter.device)
+            )
+            for group in parameter_groups(name):
+                grouped.setdefault(group, []).append(flat)
+        gradients_by_head[head_name] = {
+            group: torch.cat(vectors) for group, vectors in grouped.items()
+        }
+    if not was_training:
+        model.eval()
+
+    norms = {
+        head_name: {
+            group: vector.norm().item() for group, vector in groups.items()
+        }
+        for head_name, groups in gradients_by_head.items()
+    }
+    geometry: Dict[str, Dict[str, Dict[str, float]]] = {}
+    head_names = list(gradients_by_head.keys())
+    for first_index, first in enumerate(head_names):
+        for second in head_names[first_index + 1 :]:
+            pair = f"{first}|{second}"
+            for group, first_vector in gradients_by_head[first].items():
+                second_vector = gradients_by_head[second].get(group)
+                if second_vector is None:
+                    continue
+                dot = torch.dot(first_vector, second_vector).item()
+                denominator = (
+                    first_vector.norm().item() * second_vector.norm().item()
+                )
+                geometry.setdefault(group, {})[pair] = {
+                    "cosine": dot / denominator if denominator > 0.0 else 0.0,
+                    "dot_product": dot,
+                }
+
+    logger.log(
+        {
+            "mode": "gradient_diagnostics",
+            "epoch": epoch,
+            "gradient_norms": norms,
+            "gradient_geometry": geometry,
+        }
+    )
+    for head_name, groups in norms.items():
+        formatted = ", ".join(
+            f"{group}={value:.3e}" for group, value in groups.items()
+        )
+        logging.info(f"Epoch {epoch}: gradient norms [{head_name}]: {formatted}")
+    for group, pairs in geometry.items():
+        for pair, values in pairs.items():
+            logging.info(
+                f"Epoch {epoch}: gradient cosine [{group}] {pair}: "
+                f"{values['cosine']:+.3f}"
+            )
+
+
 def train(
     model: torch.nn.Module,
     loss_fn: torch.nn.Module,
@@ -180,6 +305,7 @@ def train(
     train_sampler: Optional[DistributedSampler] = None,
     rank: Optional[int] = 0,
     data_aug_magmom: Optional[bool] = False,
+    log_gradient_diagnostics: bool = False,
 ):
     lowest_loss = np.inf
     valid_loss = np.inf
@@ -311,6 +437,16 @@ def train(
                 )
             if log_wandb:
                 wandb.log(wandb_log_dict)
+            if log_gradient_diagnostics and rank == 0 and not distributed:
+                _log_gradient_diagnostics(
+                    model=model,
+                    loss_fn=loss_fn,
+                    valid_loaders=valid_loaders,
+                    output_args=output_args,
+                    device=device,
+                    epoch=epoch,
+                    logger=logger,
+                )
             if rank == 0:
                 if valid_loss >= lowest_loss:
                     patience_counter += 1

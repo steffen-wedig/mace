@@ -1063,6 +1063,7 @@ def run(args) -> None:
         train_sampler=train_sampler,
         rank=rank,
         data_aug_magmom=args.data_aug_magmom,
+        log_gradient_diagnostics=args.log_gradient_diagnostics,
     )
 
     logging.info("")

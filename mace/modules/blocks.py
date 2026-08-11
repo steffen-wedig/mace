@@ -2058,11 +2058,17 @@ class MultiLevelScaleShiftBlock(torch.nn.Module):
                  + scale[k] * c_k + shift[k]          for k != base
 
     so ``scale[k]``/``shift[k]`` for a non-base level are the statistics of
-    that level's *correction* (delta), not of its absolute energies. With
-    ``detach_base_for_deltas`` the base component entering the non-base
-    levels is detached, which blocks the gradients of the expensive levels
-    from moving the base fit through the readout path (they still reach the
-    shared trunk through their own delta projections).
+    that level's *correction* (delta), not of its absolute energies.
+
+    ``detach_base_for_deltas`` is stored here as the run's configuration but
+    acted on by the MODEL: a naive tensor detach of the base component would
+    sever position gradients along with parameter gradients, silently
+    stripping the base contribution from every expensive level's forces.
+    Instead the model recomputes the base column with *detached parameters*
+    (``torch.func.functional_call``) and passes it in as
+    ``base_component_for_deltas``: the expensive levels then cannot move the
+    base readout parameters -- through energy or force losses -- while all
+    activation and position gradients stay exact.
     """
 
     def __init__(
@@ -2098,23 +2104,31 @@ class MultiLevelScaleShiftBlock(torch.nn.Module):
         is_delta[base_level] = 0.0
         self.register_buffer("is_delta", is_delta)
 
-    def forward(self, components: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        components: torch.Tensor,
+        base_component_for_deltas: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         # components: [n_nodes, num_levels]; column base_level is the base,
-        # every other column that level's raw delta.
+        # every other column that level's raw delta. When
+        # base_component_for_deltas is given (the model's parameter-detached
+        # base column, [n_nodes, 1]), the non-base levels are composed from
+        # it instead of the components' base column; the block itself never
+        # detaches anything.
         base_column = components[:, self.base_level : self.base_level + 1]
         base_energy = (
             self.scale[self.base_level] * base_column + self.shift[self.base_level]
         )  # [n_nodes, 1]
-        if self.detach_base_for_deltas:
+        if base_component_for_deltas is not None:
             base_energy_for_deltas = (
-                self.scale[self.base_level] * base_column.detach()
+                self.scale[self.base_level] * base_component_for_deltas
                 + self.shift[self.base_level]
             )
         else:
             base_energy_for_deltas = base_energy
         delta_energies = self.scale.view(1, -1) * components + self.shift.view(1, -1)
         # For the base column: base_energy. For every delta column: the base
-        # energy (possibly detached) plus that level's scaled correction.
+        # energy plus that level's scaled correction.
         return (
             self.is_delta.view(1, -1) * (base_energy_for_deltas + delta_energies)
             + (1.0 - self.is_delta.view(1, -1)) * base_energy

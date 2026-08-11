@@ -646,6 +646,13 @@ class MultiLevelScaleShiftMACE(MACE):
     (``energy_all_levels``); ``energy`` and ``forces`` remain the
     head-gathered tensors so the stock loss, error tables and calculator
     keep working. Forces are computed for the gathered head only.
+
+    ``detach_base_for_deltas`` is a PARAMETER detach, not a tensor detach:
+    the base column entering the non-base levels is recomputed with the
+    readout parameters detached (``torch.func.functional_call``), so the
+    expensive levels cannot move the base readout parameters -- through
+    energy or force losses -- while every level's forces stay exact. This
+    trades away TorchScript compatibility of the detached path.
     """
 
     def __init__(
@@ -867,7 +874,40 @@ class MultiLevelScaleShiftMACE(MACE):
             pair_components[:, self.base_level] = pair_node_energy
             node_components = node_components + pair_components
 
-        node_es_all = self.scale_shift(node_components)  # [n_nodes, n_levels]
+        # Parameter detach (ablation A): recompute the base column with the
+        # readout parameters detached, so the expensive levels cannot move
+        # the base readout parameters -- through energy or force losses --
+        # while gradients to the trunk features and the positions stay
+        # exact. A tensor detach here would silently strip the base
+        # contribution from the expensive levels' forces.
+        base_component_for_deltas: Optional[torch.Tensor] = None
+        if self.scale_shift.detach_base_for_deltas:
+            detached_base_columns: List[torch.Tensor] = []
+            for i, readout in enumerate(self.readouts):
+                feat_idx = -1 if len(self.readouts) == 1 else i
+                detached_parameters = {
+                    name: parameter.detach()
+                    for name, parameter in readout.named_parameters()
+                }
+                detached_components = torch.func.functional_call(
+                    readout,
+                    detached_parameters,
+                    (node_feats_list[feat_idx], node_heads),
+                )
+                detached_base_columns.append(
+                    detached_components[:, self.base_level : self.base_level + 1]
+                )
+            base_component_for_deltas = torch.sum(
+                torch.stack(detached_base_columns, dim=0), dim=0
+            )  # [n_nodes, 1]
+            if hasattr(self, "pair_repulsion"):
+                base_component_for_deltas = (
+                    base_component_for_deltas + pair_node_energy.unsqueeze(-1)
+                )
+
+        node_es_all = self.scale_shift(
+            node_components, base_component_for_deltas
+        )  # [n_nodes, n_levels]
         node_inter_es = node_es_all[num_atoms_arange, node_heads]  # [n_nodes]
         inter_e = scatter_sum(
             node_inter_es, data["batch"], dim=-1, dim_size=num_graphs

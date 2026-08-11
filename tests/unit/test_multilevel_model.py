@@ -223,7 +223,8 @@ def test_gradient_reaches_every_parameter():
     assert not parameters_without_gradient, parameters_without_gradient
 
 
-def test_stop_gradient_blocks_base_readout_path():
+def test_stop_gradient_blocks_base_readout_parameters():
+    """The parameter detach: delta-level losses cannot move the base readout."""
     model = make_model(detach_base_for_deltas=True)
     batch = make_batch([make_configuration(POSITIONS, head="revpbe")])
     output = model(batch.to_dict(), training=True, compute_force=False)
@@ -246,13 +247,64 @@ def test_stop_gradient_blocks_base_readout_path():
         for parameter in delta_parameters:
             assert parameter.grad is not None
             assert not torch.all(parameter.grad == 0)
-    # The trunk still receives gradient through the delta projections.
+    # The trunk still receives gradient -- through the delta projections AND
+    # (unlike a tensor detach) through the base column's activations.
     trunk_gradients = [
         parameter.grad
         for name, parameter in model.named_parameters()
         if name.startswith("interactions.") and parameter.grad is not None
     ]
     assert any(torch.any(gradient != 0) for gradient in trunk_gradients)
+
+
+def test_stop_gradient_leaves_energies_and_forces_exact():
+    """The detach changes gradients only: outputs match the plain model."""
+    model_plain = make_model(
+        atomic_inter_scale=(1.3, 0.01), atomic_inter_shift=(-3.0, -0.08)
+    )
+    model_detached = make_model(
+        atomic_inter_scale=(1.3, 0.01),
+        atomic_inter_shift=(-3.0, -0.08),
+        detach_base_for_deltas=True,
+    )
+    model_detached.load_state_dict(model_plain.state_dict())
+
+    batch = make_batch([make_configuration(POSITIONS, head="delta_cc")])
+    output_plain = model_plain(batch.to_dict(), training=True, compute_force=True)
+    batch = make_batch([make_configuration(POSITIONS, head="delta_cc")])
+    output_detached = model_detached(
+        batch.to_dict(), training=True, compute_force=True
+    )
+    assert torch.allclose(
+        output_plain["energy_all_levels"], output_detached["energy_all_levels"]
+    )
+    # A tensor detach would strip the base contribution from the delta
+    # level's forces; the parameter detach keeps them exact.
+    assert torch.allclose(output_plain["forces"], output_detached["forces"])
+
+
+def test_stop_gradient_blocks_base_readout_through_force_loss():
+    """Second order: a delta-level FORCE loss cannot move the base readout."""
+    model = make_model(
+        atomic_inter_scale=(1.3, 0.01),
+        atomic_inter_shift=(-3.0, -0.08),
+        detach_base_for_deltas=True,
+    )
+    batch = make_batch([make_configuration(POSITIONS, head="delta_cc")])
+    output = model(batch.to_dict(), training=True, compute_force=True)
+    force_loss = torch.square(output["forces"]).sum()
+    base_parameters = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if name.startswith("readouts") and "delta" not in name
+    ]
+    gradients = torch.autograd.grad(
+        force_loss,
+        [parameter for _, parameter in base_parameters],
+        allow_unused=True,
+    )
+    for (name, _), gradient in zip(base_parameters, gradients):
+        assert gradient is None or torch.all(gradient == 0), name
 
 
 def test_forces_of_gathered_head_are_computed():
