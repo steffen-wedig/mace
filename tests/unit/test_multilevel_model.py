@@ -438,6 +438,114 @@ def test_multilevel_loss_counts_only_labelled_entries(tmp_path):
     assert (weights != 0).sum().item() == 3
 
 
+def test_per_level_energy_weights_normalise_each_level(tmp_path):
+    model = make_model(
+        atomic_inter_scale=(1.3, 0.01), atomic_inter_shift=(-3.0, -0.08)
+    )
+    model.force_carrying_levels = [BASE_LEVEL]
+    model.base_force_column = 0
+    loss_fn = modules.MultiLevelWeightedEnergyForcesLoss(
+        energy_weight=999.0,  # must be ignored on fused batches in this mode
+        forces_weight=0.0,
+        energy_weights_per_level=[10.0, 1000.0],
+    )
+
+    batch, _ = make_fused_batch(
+        tmp_path,
+        [(POSITIONS, -1.5, FORCES, -1.6), (POSITIONS + 0.01, -1.4, FORCES, None)],
+    )
+    output = model(batch.to_dict(), training=True)
+    loss = loss_fn(batch, output)
+
+    num_atoms = batch.ptr[1:] - batch.ptr[:-1]
+    residuals = (batch.energy_levels - output["energy_all_levels"]) / num_atoms.unsqueeze(-1)
+    weights = batch.energy_levels_weight
+    squared = weights * residuals**2
+    base_mean = squared[:, 0].sum() / 2  # both structures carry the base label
+    cc_mean = squared[:, 1].sum() / 1  # only the first carries the CC label
+    assert loss.item() == pytest.approx(
+        (10.0 * base_mean + 1000.0 * cc_mean).item(), rel=1e-12
+    )
+
+
+def test_per_level_weights_make_the_sparse_level_coverage_invariant(tmp_path):
+    """The CC term must be a mean over CC labels, however many base labels ride along."""
+    model = make_model(
+        atomic_inter_scale=(1.3, 0.01), atomic_inter_shift=(-3.0, -0.08)
+    )
+    model.force_carrying_levels = [BASE_LEVEL]
+    model.base_force_column = 0
+    cc_only_loss = modules.MultiLevelWeightedEnergyForcesLoss(
+        forces_weight=0.0, energy_weights_per_level=[0.0, 1.0]
+    )
+
+    labelled = (POSITIONS, -1.5, FORCES, -1.6)
+    (tmp_path / "lonely").mkdir()
+    (tmp_path / "crowded").mkdir()
+    lonely_batch, _ = make_fused_batch(tmp_path / "lonely", [labelled])
+    crowded_batch, _ = make_fused_batch(
+        tmp_path / "crowded",
+        [labelled] + [(POSITIONS + 0.01 * i, -1.4, FORCES, None) for i in (1, 2, 3)],
+    )
+    lonely = cc_only_loss(lonely_batch, model(lonely_batch.to_dict(), training=True))
+    crowded = cc_only_loss(crowded_batch, model(crowded_batch.to_dict(), training=True))
+    assert crowded.item() == pytest.approx(lonely.item(), rel=1e-10)
+
+
+def test_per_level_weights_survive_a_batch_without_the_sparse_level(tmp_path):
+    model = make_model(
+        atomic_inter_scale=(1.3, 0.01), atomic_inter_shift=(-3.0, -0.08)
+    )
+    model.force_carrying_levels = [BASE_LEVEL]
+    model.base_force_column = 0
+    loss_fn = modules.MultiLevelWeightedEnergyForcesLoss(
+        forces_weight=0.0, energy_weights_per_level=[10.0, 1000.0]
+    )
+    batch, _ = make_fused_batch(
+        tmp_path, [(POSITIONS, -1.5, FORCES, None), (POSITIONS + 0.01, -1.4, FORCES, None)]
+    )
+    output = model(batch.to_dict(), training=True)
+    loss = loss_fn(batch, output)
+    assert torch.isfinite(loss)
+    num_atoms = batch.ptr[1:] - batch.ptr[:-1]
+    residuals = (batch.energy_levels - output["energy_all_levels"]) / num_atoms.unsqueeze(-1)
+    squared = batch.energy_levels_weight * residuals**2
+    assert loss.item() == pytest.approx((10.0 * squared[:, 0].sum() / 2).item(), rel=1e-12)
+
+
+def test_per_level_weight_count_mismatch_is_rejected(tmp_path):
+    model = make_model(
+        atomic_inter_scale=(1.3, 0.01), atomic_inter_shift=(-3.0, -0.08)
+    )
+    model.force_carrying_levels = [BASE_LEVEL]
+    model.base_force_column = 0
+    loss_fn = modules.MultiLevelWeightedEnergyForcesLoss(
+        forces_weight=0.0, energy_weights_per_level=[1.0, 2.0, 3.0]
+    )
+    batch, _ = make_fused_batch(tmp_path, [(POSITIONS, -1.5, FORCES, -1.6)])
+    output = model(batch.to_dict(), training=True)
+    with pytest.raises(ValueError, match="per-level energy"):
+        loss_fn(batch, output)
+
+
+def test_parse_multilevel_energy_weights():
+    from mace.tools.scripts_utils import parse_multilevel_energy_weights
+
+    heads = ["revpbe", "delta_cc"]
+    assert parse_multilevel_energy_weights(None, heads) is None
+    assert parse_multilevel_energy_weights(
+        "delta_cc:1000, revpbe:10", heads
+    ) == [10.0, 1000.0]
+    with pytest.raises(ValueError, match="every head needs exactly one"):
+        parse_multilevel_energy_weights("revpbe:10", heads)
+    with pytest.raises(ValueError, match="every head needs exactly one"):
+        parse_multilevel_energy_weights("revpbe:10,delta_cc:1,mp2:5", heads)
+    with pytest.raises(ValueError, match="malformed"):
+        parse_multilevel_energy_weights("revpbe=10,delta_cc=1000", heads)
+    with pytest.raises(ValueError, match="duplicate"):
+        parse_multilevel_energy_weights("revpbe:10,revpbe:20", heads)
+
+
 def test_multilevel_loss_falls_back_on_per_head_batches():
     model = make_model(
         atomic_inter_scale=(1.3, 0.01), atomic_inter_shift=(-3.0, -0.08)

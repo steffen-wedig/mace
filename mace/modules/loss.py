@@ -75,6 +75,33 @@ def reduce_masked_loss(
     return loss_sum / torch.clamp(count, min=1.0)
 
 
+def reduce_masked_loss_per_level(
+    raw_loss: torch.Tensor,
+    active_entry_counts: torch.Tensor,
+    ddp: Optional[bool] = None,
+) -> torch.Tensor:
+    """Per-level masked means: one mean per column, over that column's labels.
+
+    ``reduce_masked_loss`` pools every labelled entry into one denominator,
+    so a level's share of the term is proportional to its label count -- a
+    level at 1 % coverage contributes ~1 % of the energy loss. Here each
+    level (column) is averaged over its own labelled count
+    ([n_entries, n_levels] -> [n_levels]), so a level's term keeps the same
+    magnitude at any coverage; coverage only changes the variance of the
+    per-batch estimate. A level with no labelled entry in the batch
+    contributes zero.
+    """
+    ddp = is_ddp_enabled() if ddp is None else ddp
+    level_sums = raw_loss.sum(dim=0)
+    counts = active_entry_counts.to(raw_loss.dtype)
+    if ddp and dist.is_initialized():
+        world_size = dist.get_world_size()
+        counts = counts.clone()
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        return level_sums * world_size / torch.clamp(counts, min=1.0)
+    return level_sums / torch.clamp(counts, min=1.0)
+
+
 # ------------------------------------------------------------------------------
 # Energy Loss Functions
 # ------------------------------------------------------------------------------
@@ -376,12 +403,25 @@ class MultiLevelWeightedEnergyForcesLoss(torch.nn.Module):
     the level coverage nor the batch composition changes the effective
     energy:forces balance.
 
+    ``energy_weights_per_level`` (one weight per level, in head order)
+    switches the energy term from the pooled per-label mean scaled by
+    ``energy_weight`` to a weighted sum of PER-LEVEL means: each level is
+    averaged over its own labelled count, so a sparsely labelled level
+    keeps a coverage-independent share of the loss and each level gets its
+    own weight schedule. The scalar ``energy_weight`` is ignored on fused
+    batches in that mode (it still drives the per-head validation path).
+
     Falls back to the masked single-level terms on batches without the
     fused fields -- MACE's per-head validation loaders -- so the same loss
     object drives training and per-head validation.
     """
 
-    def __init__(self, energy_weight=1.0, forces_weight=1.0) -> None:
+    def __init__(
+        self,
+        energy_weight=1.0,
+        forces_weight=1.0,
+        energy_weights_per_level=None,
+    ) -> None:
         super().__init__()
         self.register_buffer(
             "energy_weight",
@@ -391,6 +431,16 @@ class MultiLevelWeightedEnergyForcesLoss(torch.nn.Module):
             "forces_weight",
             torch.tensor(forces_weight, dtype=torch.get_default_dtype()),
         )
+        if energy_weights_per_level is not None:
+            self.register_buffer(
+                "energy_weights_per_level",
+                torch.tensor(
+                    list(energy_weights_per_level),
+                    dtype=torch.get_default_dtype(),
+                ),
+            )
+        else:
+            self.energy_weights_per_level = None
 
     def forward(
         self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
@@ -421,9 +471,22 @@ class MultiLevelWeightedEnergyForcesLoss(torch.nn.Module):
             (ref.energy_levels - pred["energy_all_levels"])
             / num_atoms.unsqueeze(-1)
         )
-        loss_energy = reduce_masked_loss(
-            raw_energy_loss, (energy_entry_weight != 0).sum(), ddp
-        )
+        if self.energy_weights_per_level is not None:
+            if self.energy_weights_per_level.numel() != raw_energy_loss.shape[1]:
+                raise ValueError(
+                    f"{self.energy_weights_per_level.numel()} per-level energy "
+                    f"weights for {raw_energy_loss.shape[1]} levels"
+                )
+            per_level_means = reduce_masked_loss_per_level(
+                raw_energy_loss, (energy_entry_weight != 0).sum(dim=0), ddp
+            )
+            weighted_energy_loss = (
+                self.energy_weights_per_level * per_level_means
+            ).sum()
+        else:
+            weighted_energy_loss = self.energy_weight * reduce_masked_loss(
+                raw_energy_loss, (energy_entry_weight != 0).sum(), ddp
+            )
 
         forces_entry_weight = torch.repeat_interleave(
             ref.forces_levels_weight, num_atoms, dim=0
@@ -434,9 +497,17 @@ class MultiLevelWeightedEnergyForcesLoss(torch.nn.Module):
         loss_forces = reduce_masked_loss(
             raw_forces_loss, 3 * (forces_entry_weight != 0).sum(), ddp
         )
-        return self.energy_weight * loss_energy + self.forces_weight * loss_forces
+        return weighted_energy_loss + self.forces_weight * loss_forces
 
     def __repr__(self):
+        if self.energy_weights_per_level is not None:
+            per_level = ", ".join(
+                f"{weight:.3f}" for weight in self.energy_weights_per_level
+            )
+            return (
+                f"{self.__class__.__name__}(energy_weights_per_level=[{per_level}], "
+                f"forces_weight={self.forces_weight:.3f})"
+            )
         return (
             f"{self.__class__.__name__}(energy_weight={self.energy_weight:.3f}, "
             f"forces_weight={self.forces_weight:.3f})"

@@ -190,6 +190,24 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument(
+        "--multilevel_energy_weights",
+        help="per-level energy weights for the fused multi-level loss, e.g. "
+        "'revpbe_d3bj:10,ccsd_t:1000'. Switches the energy term to a weighted "
+        "sum of PER-LEVEL means (each level averaged over its own labelled "
+        "count), so a sparsely labelled level keeps a coverage-independent "
+        "share of the loss and its own weight schedule; --energy_weight is "
+        "then ignored on fused batches. Requires --loss multilevel_weighted.",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--swa_multilevel_energy_weights",
+        help="per-level energy weights during Stage Two, same format as "
+        "--multilevel_energy_weights; defaults to the stage-one values.",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
         "--r_max", help="distance cutoff (in Ang)", type=float, default=5.0
     )
     parser.add_argument(
