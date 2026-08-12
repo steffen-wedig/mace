@@ -70,6 +70,7 @@ from mace.tools.scripts_utils import (
     get_optimizer,
     get_params_options,
     get_swa,
+    parse_multilevel_level_quota,
     print_git_commit,
     remove_pt_head,
     setup_wandb,
@@ -769,7 +770,7 @@ def run(args) -> None:
             ]
         else:
             multilevel_force_heads = [heads[0]]
-        train_set, labelled_counts = data.load_multilevel_dataset(
+        train_set, labelled_counts, labelled_indices = data.load_multilevel_dataset(
             file_path=args.multilevel_train_file,
             r_max=args.r_max,
             z_table=z_table,
@@ -782,6 +783,49 @@ def run(args) -> None:
             f"Fused multi-level training set from {args.multilevel_train_file}: "
             f"{len(train_set)} configurations, labelled per head: {labelled_counts}, "
             f"force-carrying heads: {multilevel_force_heads}"
+        )
+
+    # Guaranteed batch composition for a sparsely labelled level: without it
+    # a random batch at 1 % coverage carries 0.3 CC labels, so that level's
+    # gradient is almost pure noise.
+    quota_batch_sampler = None
+    if args.multilevel_level_quota is not None:
+        if args.multilevel_train_file is None:
+            raise ValueError(
+                "--multilevel_level_quota composes fused multi-level batches; "
+                "set --multilevel_train_file (and --loss multilevel_weighted)"
+            )
+        if args.distributed:
+            raise ValueError(
+                "--multilevel_level_quota does not support distributed "
+                "training: each rank would draw the quota from the whole pool, "
+                "so the sparse level's structures would be duplicated across "
+                "ranks within a step"
+            )
+        quota_per_head = parse_multilevel_level_quota(
+            args.multilevel_level_quota, heads
+        )
+        if len(quota_per_head) > 1:
+            raise NotImplementedError(
+                "only one quota level is supported: with several pools the "
+                f"batch composition depends on their overlap (got {quota_per_head})"
+            )
+        quota_head, quota = next(iter(quota_per_head.items()))
+        quota_batch_sampler = data.LevelQuotaBatchSampler(
+            dataset_size=len(train_set),
+            quota_pool_indices=labelled_indices[quota_head],
+            batch_size=args.batch_size,
+            quota=quota,
+            seed=args.seed,
+        )
+        logging.info(
+            f"Level-quota batches for head {quota_head!r}: "
+            f"{quota_batch_sampler.effective_quota} of {args.batch_size} "
+            f"structures per batch (requested {quota}), drawn from "
+            f"{len(labelled_indices[quota_head])} labelled structures; "
+            f"{len(quota_batch_sampler)} batches per epoch, each labelled "
+            f"structure seen {quota_batch_sampler.pool_passes_per_epoch:.1f} "
+            "times per epoch"
         )
 
     train_sampler, valid_sampler = None, None
@@ -806,16 +850,27 @@ def run(args) -> None:
             )
             valid_samplers[head] = valid_sampler
 
-    train_loader = torch_geometric.dataloader.DataLoader(
-        dataset=train_set,
-        batch_size=args.batch_size,
-        sampler=train_sampler,
-        shuffle=(train_sampler is None),
-        drop_last=(train_sampler is None and not args.lbfgs),
-        pin_memory=args.pin_memory,
-        num_workers=args.num_workers,
-        generator=torch.Generator().manual_seed(args.seed),
-    )
+    if quota_batch_sampler is not None:
+        # batch_sampler is mutually exclusive with batch_size / shuffle /
+        # sampler / drop_last: it decides all four itself.
+        train_loader = torch_geometric.dataloader.DataLoader(
+            dataset=train_set,
+            batch_sampler=quota_batch_sampler,
+            pin_memory=args.pin_memory,
+            num_workers=args.num_workers,
+            generator=torch.Generator().manual_seed(args.seed),
+        )
+    else:
+        train_loader = torch_geometric.dataloader.DataLoader(
+            dataset=train_set,
+            batch_size=args.batch_size,
+            sampler=train_sampler,
+            shuffle=(train_sampler is None),
+            drop_last=(train_sampler is None and not args.lbfgs),
+            pin_memory=args.pin_memory,
+            num_workers=args.num_workers,
+            generator=torch.Generator().manual_seed(args.seed),
+        )
 
     valid_loaders = {heads[i]: None for i in range(len(heads))}
     if not isinstance(valid_sets, dict):

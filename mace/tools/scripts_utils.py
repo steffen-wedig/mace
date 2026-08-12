@@ -799,6 +799,46 @@ def parse_multilevel_energy_weights(
     return [weights_by_head[head] for head in heads]
 
 
+def parse_multilevel_level_quota(
+    specification: Optional[str], heads: List[str]
+) -> Optional[Dict[str, int]]:
+    """Parse 'head:count[,head:count]' into a per-head batch quota.
+
+    Unlike the per-level energy weights this is deliberately partial: only
+    the sparsely labelled levels need a quota, the rest of the batch is
+    filled from the structures outside their pools.
+    """
+    if specification is None:
+        return None
+    quota_by_head: Dict[str, int] = {}
+    for item in specification.split(","):
+        head_name, _, count = item.partition(":")
+        if not count:
+            raise ValueError(
+                f"malformed multilevel level quota {item!r}; expected "
+                "'head:count,head:count'"
+            )
+        head_name = head_name.strip()
+        if head_name in quota_by_head:
+            raise ValueError(f"duplicate multilevel level quota for {item!r}")
+        quota = int(count)
+        if quota < 1:
+            raise ValueError(
+                f"the multilevel level quota for {head_name!r} must be at "
+                f"least one structure, got {quota}"
+            )
+        quota_by_head[head_name] = quota
+    if not quota_by_head:
+        raise ValueError("empty multilevel level quota specification")
+    unknown = sorted(set(quota_by_head) - set(heads))
+    if unknown:
+        raise ValueError(
+            f"multilevel level quota names heads {unknown} but the run has "
+            f"heads {sorted(heads)}"
+        )
+    return quota_by_head
+
+
 def get_loss_fn(
     args: argparse.Namespace,
     dipole_only: bool,
