@@ -354,7 +354,7 @@ def make_fused_batch(tmp_path, entries):
 
     file_path = tmp_path / "multilevel.xyz"
     write_multilevel_xyz(file_path, entries)
-    dataset, labelled_counts = load_multilevel_dataset(
+    dataset, labelled_counts, _ = load_multilevel_dataset(
         file_path=str(file_path),
         r_max=5.0,
         z_table=TABLE,
@@ -782,3 +782,78 @@ def test_a_loss_without_per_level_weights_still_moves_between_devices():
     moved_loss = loss_fn.to(torch.device("meta"))
     assert moved_loss.energy_weights_per_level is None
     assert moved_loss.energy_weight.device.type == "meta"
+
+
+def test_fused_dataset_reports_the_indices_each_level_labels(tmp_path):
+    from mace.data.multilevel import load_multilevel_dataset
+
+    file_path = tmp_path / "multilevel.xyz"
+    write_multilevel_xyz(
+        file_path,
+        [
+            (POSITIONS, -1.5, FORCES, -1.6),
+            (POSITIONS + 0.01, -1.4, FORCES, None),
+            (POSITIONS + 0.02, -1.3, FORCES, -1.7),
+        ],
+    )
+    dataset, labelled_counts, labelled_indices = load_multilevel_dataset(
+        file_path=str(file_path),
+        r_max=5.0,
+        z_table=TABLE,
+        heads=list(LEVELS),
+        force_carrying_heads=[LEVELS[BASE_LEVEL]],
+        energy_key="REF_energy",
+        forces_key="REF_forces",
+    )
+    assert len(dataset) == 3
+    assert labelled_counts == {"revpbe": 3, "delta_cc": 2}
+    assert labelled_indices == {"revpbe": [0, 1, 2], "delta_cc": [0, 2]}
+    # The indices point at structures whose mask really carries the level.
+    for index in labelled_indices["delta_cc"]:
+        assert dataset[index].energy_levels_weight[0, 1] != 0.0
+
+
+def test_quota_batches_carry_the_sparse_level_at_a_fixed_rate(tmp_path):
+    """End to end: the fused dataset, the sampler, and the fused loss."""
+    from mace.data import LevelQuotaBatchSampler
+    from mace.data.multilevel import load_multilevel_dataset
+
+    file_path = tmp_path / "multilevel.xyz"
+    entries = [
+        (
+            POSITIONS + 0.001 * structure,
+            -1.5,
+            FORCES,
+            -1.6 if structure % 20 == 0 else None,  # 5 % coupled-cluster coverage
+        )
+        for structure in range(100)
+    ]
+    write_multilevel_xyz(file_path, entries)
+    dataset, labelled_counts, labelled_indices = load_multilevel_dataset(
+        file_path=str(file_path),
+        r_max=5.0,
+        z_table=TABLE,
+        heads=list(LEVELS),
+        force_carrying_heads=[LEVELS[BASE_LEVEL]],
+        energy_key="REF_energy",
+        forces_key="REF_forces",
+    )
+    assert labelled_counts["delta_cc"] == 5
+    sampler = LevelQuotaBatchSampler(
+        dataset_size=len(dataset),
+        quota_pool_indices=labelled_indices["delta_cc"],
+        batch_size=10,
+        quota=2,
+        seed=0,
+    )
+    assert sampler.effective_quota == 2  # natural share is 0.5, the quota wins
+    data_loader = torch_geometric.dataloader.DataLoader(
+        dataset=dataset, batch_sampler=sampler
+    )
+    batches = list(data_loader)
+    assert len(batches) == len(sampler)
+    for batch in batches:
+        assert int(batch.num_graphs) == 10
+        # Exactly two structures per batch carry the CC label, instead of the
+        # 0.5 a random draw at this coverage would average.
+        assert int((batch.energy_levels_weight[:, 1] != 0).sum()) == 2

@@ -1,7 +1,7 @@
 from .atomic_data import AtomicData
 from .hdf5_dataset import HDF5Dataset, dataset_from_sharded_hdf5
 from .lmdb_dataset import LMDBDataset
-from .multilevel import load_multilevel_dataset
+from .multilevel import LevelQuotaBatchSampler, load_multilevel_dataset
 from .neighborhood import get_neighborhood
 from .padding_tools import build_fake_padding_graph
 from .utils import (
@@ -43,4 +43,5 @@ __all__ = [
     "LMDBDataset",
     "build_fake_padding_graph",
     "load_multilevel_dataset",
+    "LevelQuotaBatchSampler",
 ]

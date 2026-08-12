@@ -208,6 +208,19 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument(
+        "--multilevel_level_quota",
+        help="guarantee at least this many structures labelled at the given "
+        "level in every training batch, e.g. 'ccsd_t:4' (comma-separated for "
+        "several levels). At low coverage a random batch carries a fraction of "
+        "a label at the sparse level, so its gradient is almost pure noise; "
+        "the batch is instead composed of a fixed quota of that level's "
+        "structures plus structures from outside its pool. The quota is a "
+        "floor: it is raised to the level's natural share of a batch where "
+        "that is larger. Requires --multilevel_train_file.",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
         "--multilevel_base_model",
         help="MultiLevelScaleShiftMACE only: warm-start the trunk and the "
         "base readout path from this trained single-head model (same trunk "
