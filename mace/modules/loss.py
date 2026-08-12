@@ -440,7 +440,10 @@ class MultiLevelWeightedEnergyForcesLoss(torch.nn.Module):
                 ),
             )
         else:
-            self.energy_weights_per_level = None
+            # A registered (empty) buffer on both construction paths, so
+            # ``.to(device)`` treats this loss the same way whichever mode it
+            # was built in.
+            self.register_buffer("energy_weights_per_level", None)
 
     def forward(
         self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None

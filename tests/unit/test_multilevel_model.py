@@ -717,3 +717,68 @@ def test_masked_loss_denominator_ignores_unlabelled_entries():
     assert diluted_value.item() == pytest.approx(
         reference_value.item() / 2, rel=1e-10
     )
+
+
+def test_stage_two_swap_puts_the_per_level_weights_on_the_training_device(tmp_path):
+    """Regression: Stage Two swapped in a loss that was still on the CPU.
+
+    The Stage One loss reaches the device as a submodule of the evaluation
+    metric; the Stage Two loss built by ``get_swa`` never was moved. Scalar
+    weights hide that (0-dim CPU tensors promote against CUDA operands), the
+    per-level weight VECTOR does not -- it raised "Expected all tensors to
+    be on the same device" exactly at the transition.
+    """
+    from mace.tools.train import MACELoss, SWAContainer, stage_two_loss_fn
+
+    stage_one_loss = modules.MultiLevelWeightedEnergyForcesLoss(
+        forces_weight=0.0, energy_weights_per_level=[10.0, 1000.0]
+    )
+    stage_two_loss = modules.MultiLevelWeightedEnergyForcesLoss(
+        forces_weight=0.0, energy_weights_per_level=[1000.0, 1000.0]
+    )
+    # The per-level weights must be a registered buffer, or nothing that
+    # moves the module would move them.
+    assert "energy_weights_per_level" in dict(stage_two_loss.named_buffers())
+
+    device = torch.device("cpu")
+    MACELoss(loss_fn=stage_one_loss).to(device)  # what evaluate() does in stage one
+    swa = SWAContainer(model=None, scheduler=None, start=0, loss_fn=stage_two_loss)
+    swapped_loss = stage_two_loss_fn(swa, device)
+    assert swapped_loss.energy_weights_per_level.device == device
+
+    # The move must be a real move, which a CPU-only run cannot show: the
+    # meta device stands in for the training device.
+    meta_loss = stage_two_loss_fn(
+        SWAContainer(
+            model=None,
+            scheduler=None,
+            start=0,
+            loss_fn=modules.MultiLevelWeightedEnergyForcesLoss(
+                forces_weight=0.0, energy_weights_per_level=[1.0, 2.0]
+            ),
+        ),
+        torch.device("meta"),
+    )
+    assert meta_loss.energy_weights_per_level.device.type == "meta"
+
+    # And the swapped-in loss still evaluates a fused batch.
+    model = make_model(atomic_inter_scale=(1.3, 0.01), atomic_inter_shift=(-3.0, -0.08))
+    model.force_carrying_levels = [BASE_LEVEL]
+    model.base_force_column = 0
+    batch, _ = make_fused_batch(
+        tmp_path,
+        [(POSITIONS, -1.5, FORCES, -1.6), (POSITIONS + 0.01, -1.4, FORCES, None)],
+    )
+    output = model(batch.to_dict(), training=True)
+    assert torch.isfinite(swapped_loss(batch, output))
+
+
+def test_a_loss_without_per_level_weights_still_moves_between_devices():
+    """Both construction paths register the same buffer, so ``.to`` is safe."""
+    loss_fn = modules.MultiLevelWeightedEnergyForcesLoss(
+        energy_weight=3.0, forces_weight=7.0
+    )
+    assert loss_fn.energy_weights_per_level is None
+    moved_loss = loss_fn.to(torch.device("meta"))
+    assert moved_loss.energy_weights_per_level is None
+    assert moved_loss.energy_weight.device.type == "meta"
