@@ -46,6 +46,21 @@ class SWAContainer:
     loss_fn: torch.nn.Module
 
 
+def stage_two_loss_fn(swa: SWAContainer, device: torch.device) -> torch.nn.Module:
+    """The Stage Two loss, on the training device.
+
+    ``get_swa`` builds the Stage Two loss before any device placement, while
+    the Stage One loss reaches the device as a submodule of the evaluation
+    metric (``MACELoss(loss_fn=loss_fn).to(device)``). A loss whose weights
+    are scalars survives the difference -- PyTorch promotes 0-dim CPU
+    tensors against CUDA operands -- but the multi-level loss carries a
+    per-level weight VECTOR, which raised "Expected all tensors to be on the
+    same device" at the Stage One/Two transition. Move the swapped-in loss
+    explicitly instead of relying on the evaluation path.
+    """
+    return swa.loss_fn.to(device)
+
+
 def valid_err_log(
     valid_loss,
     eval_metrics,
@@ -360,7 +375,7 @@ def train(
                 lowest_loss = np.inf
                 swa_start = False
                 keep_last = True
-            loss_fn = swa.loss_fn
+            loss_fn = stage_two_loss_fn(swa, device)
             swa.model.update_parameters(model)
             if epoch > start_epoch:
                 swa.scheduler.step()
