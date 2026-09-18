@@ -69,6 +69,7 @@ from .field_blocks import (
 )
 from .radial import ZBLBasis
 from .utils import get_edge_vectors_and_lengths, get_symmetric_displacement
+from .boundary_split import forward_by_boundary, graph_periodicity
 
 
 def _copy_mace_readout(
@@ -949,6 +950,7 @@ class PolarMACE(ScaleShiftMACE):
             pbc_handling=pbc_handling,
         )
         self.set_electrostatic_pbcs(pbc_handling)
+        self.split_mixed_boundary_batches = True
         self.return_electrostatic_potentials = return_electrostatic_potentials
         self.layer_feature_mixer = MultiLayerFeatureMixer(
             node_feats_irreps=hidden_irreps,
@@ -994,6 +996,38 @@ class PolarMACE(ScaleShiftMACE):
                 "Cannot import 'graph_longrange'. Please install graph_electrostatics "
                 "from https://github.com/WillBaldwin0/graph_electrostatics."
             )
+        # A batch mixing periodic and aperiodic graphs would dispatch ALL of them to the
+        # reciprocal-space electrostatics (see below): evaluate the two kinds separately so
+        # every structure sees the evaluator it gets on its own (mace.modules.boundary_split).
+        if (
+            self.pbc_handling == "auto"
+            and getattr(self, "split_mixed_boundary_batches", True)
+            and not lammps_mliap
+            and "pbc" in data
+        ):
+            graph_is_periodic = graph_periodicity(data)
+            if bool(graph_is_periodic.any()) and not bool(graph_is_periodic.all()):
+                if compute_hessian:
+                    raise NotImplementedError(
+                        "hessians are not available for batches mixing periodic and "
+                        "aperiodic graphs"
+                    )
+                return forward_by_boundary(
+                    self.forward,
+                    data,
+                    graph_is_periodic,
+                    training=training,
+                    compute_force=compute_force,
+                    compute_virials=compute_virials,
+                    compute_stress=compute_stress,
+                    compute_displacement=compute_displacement,
+                    compute_hessian=compute_hessian,
+                    compute_edge_forces=compute_edge_forces,
+                    compute_atomic_stresses=compute_atomic_stresses,
+                    lammps_mliap=lammps_mliap,
+                    fermi_level=fermi_level,
+                    external_field=external_field,
+                )
         ctx = prepare_graph(
             data,
             compute_virials=compute_virials,
