@@ -36,6 +36,13 @@ from .utils import (
     compute_rmse,
     filter_nonzero_weight,
 )
+from .torch_geometric.cluster_collate import (
+    cluster_atom_counts,
+    combine_energy,
+    combine_forces,
+    is_cluster_batch,
+    slot_to_cluster,
+)
 
 
 @dataclasses.dataclass
@@ -68,6 +75,17 @@ def valid_err_log(
         logging.info(
             f"{inintial_phrase}: head: {valid_loader_name}, loss={valid_loss:8.8f}, RMSE_E_per_atom={error_e:8.2f} meV, RMSE_F={error_f:8.2f} meV / A"
         )
+    elif log_errors == "PerAtomRMSEinteraction":
+        error_e = eval_metrics["rmse_e_per_atom"] * 1e3
+        error_f = eval_metrics["rmse_f"] * 1e3
+        msg = f"{inintial_phrase}: head: {valid_loader_name}, loss={valid_loss:8.8f}, RMSE_E_per_atom={error_e:8.2f} meV, RMSE_F={error_f:8.2f} meV / A"
+        if eval_metrics["rmse_stress"] is not None:
+            msg += f", RMSE_stress={eval_metrics['rmse_stress'] * 1e3:8.2f} meV / A^3"
+        if eval_metrics["rmse_e_int_per_atom"] is not None:
+            msg += f", RMSE_E_int_per_atom={eval_metrics['rmse_e_int_per_atom'] * 1e3:8.2f} meV"
+        if eval_metrics["rmse_f_int"] is not None:
+            msg += f", RMSE_F_int={eval_metrics['rmse_f_int'] * 1e3:8.2f} meV / A"
+        logging.info(msg)
     elif (
         log_errors == "PerAtomRMSEstressvirials"
         and eval_metrics["rmse_stress"] is not None
@@ -649,6 +667,13 @@ class MACELoss(Metric):
         )
         self.add_state("MagFs", default=[], dist_reduce_fx="cat")
         self.add_state("delta_MagFs", default=[], dist_reduce_fx="cat")
+        # Interaction energies/forces of cluster records (mace.data.cluster_records).
+        self.add_state(
+            "interaction_computed", default=torch.tensor(0.0), dist_reduce_fx="sum"
+        )
+        self.add_state("delta_e_int_per_atom", default=[], dist_reduce_fx="cat")
+        self.add_state("f_int", default=[], dist_reduce_fx="cat")
+        self.add_state("delta_f_int", default=[], dist_reduce_fx="cat")
 
     def update(self, batch, output):  # pylint: disable=arguments-differ
         loss = self.loss_fn(pred=output, ref=batch)
@@ -674,6 +699,24 @@ class MACELoss(Metric):
                 spread_atoms=True,
             )
 
+        if (
+            output.get("energy") is not None
+            and output.get("forces") is not None
+            and is_cluster_batch(batch)
+        ):
+            weighted = batch.cluster_interaction_weight > 0  # records with monomers
+            if bool(weighted.any()):
+                atom_counts = cluster_atom_counts(batch)
+                delta_e_int = combine_energy(batch, batch.energy) - combine_energy(
+                    batch, output["energy"]
+                )
+                self.delta_e_int_per_atom.append((delta_e_int / atom_counts)[weighted])
+                slot_weighted = weighted[slot_to_cluster(batch)]
+                f_int_ref = combine_forces(batch, batch.forces)
+                f_int_pred = combine_forces(batch, output["forces"])
+                self.f_int.append(f_int_ref[slot_weighted])
+                self.delta_f_int.append((f_int_ref - f_int_pred)[slot_weighted])
+                self.interaction_computed += 1.0
         if output.get("magforces") is not None and batch.magforces is not None:
             self.MagFs.append(batch.magforces)
             self.delta_MagFs.append(batch.magforces - output["magforces"])
@@ -777,6 +820,15 @@ class MACELoss(Metric):
             aux["rmse_magf"] = compute_rmse(delta_MagFs)
             aux["rel_rmse_magf"] = compute_rel_rmse(delta_MagFs, MagFs)
             aux["q95_magf"] = compute_q95(delta_MagFs)
+        if self.interaction_computed:
+            delta_e_int_per_atom = self.convert(self.delta_e_int_per_atom)
+            f_int = self.convert(self.f_int)
+            delta_f_int = self.convert(self.delta_f_int)
+            aux["mae_e_int_per_atom"] = compute_mae(delta_e_int_per_atom)
+            aux["rmse_e_int_per_atom"] = compute_rmse(delta_e_int_per_atom)
+            aux["mae_f_int"] = compute_mae(delta_f_int)
+            aux["rmse_f_int"] = compute_rmse(delta_f_int)
+            aux["rel_rmse_f_int"] = compute_rel_rmse(delta_f_int, f_int)
         if self.stress_computed:
             delta_stress = self.convert(self.delta_stress)
             aux["mae_stress"] = compute_mae(delta_stress)

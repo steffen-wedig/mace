@@ -118,6 +118,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "PerAtomRMSE",
             "TotalRMSE",
             "PerAtomRMSEstressvirials",
+            "PerAtomRMSEinteraction",
             "PerAtomMAEstressvirials",
             "PerAtomMAE",
             "TotalMAE",
@@ -784,6 +785,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "dipole_polar",
             "huber",
             "universal",
+            "interaction_universal",
             "energy_forces_dipole",
             "l1l2energyforces",
         ],
@@ -845,6 +847,41 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=10.0,
         dest="swa_stress_weight",
+    )
+    parser.add_argument(
+        "--interaction_energy_weight",
+        help="weight of the interaction-energy loss (cluster records, loss interaction_universal)",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--swa_interaction_energy_weight",
+        "--stage_two_interaction_energy_weight",
+        help="weight of the interaction-energy loss after starting Stage Two",
+        type=float,
+        default=1000.0,
+        dest="swa_interaction_energy_weight",
+    )
+    parser.add_argument(
+        "--interaction_forces_weight",
+        help="weight of the interaction-forces loss (cluster records, loss interaction_universal)",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--swa_interaction_forces_weight",
+        "--stage_two_interaction_forces_weight",
+        help="weight of the interaction-forces loss after starting Stage Two",
+        type=float,
+        default=1.0,
+        dest="swa_interaction_forces_weight",
+    )
+    parser.add_argument(
+        "--cluster_records",
+        help="train_file/valid_file are cluster-record HDF5 datasets (mace.data.cluster_records): "
+        "each item is a cluster graph plus its monomers, batched with the ClusterCollater",
+        type=str2bool,
+        default=False,
     )
     parser.add_argument(
         "--dipole_weight", help="weight of dipoles loss", type=float, default=1.0

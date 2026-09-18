@@ -657,3 +657,89 @@ class WeightedEnergyForcesL1L2Loss(torch.nn.Module):
             f"{self.__class__.__name__}(energy_weight={self.energy_weight:.3f}, "
             f"forces_weight={self.forces_weight:.3f})"
         )
+
+
+class InteractionUniversalLoss(UniversalLoss):
+    """``UniversalLoss`` plus Huber terms on the interaction energy and forces of cluster
+    records (``mace.data.cluster_records``): ``E_int = sum(sign * E)`` per record, per
+    cluster atom, and ``F_int = sum(sign_node * F)`` per cluster atom (slot). Both are
+    formed by the same signed scatter on reference and prediction, so the absolute-label
+    terms of the parent class and the interaction terms see the same batch. Requires
+    batches from ``ClusterCollater`` (``--cluster_records``)."""
+
+    def __init__(
+        self,
+        energy_weight=1.0,
+        forces_weight=1.0,
+        stress_weight=1.0,
+        magforces_weight=1.0,
+        huber_delta=0.01,
+        interaction_energy_weight=1.0,
+        interaction_forces_weight=1.0,
+    ) -> None:
+        super().__init__(
+            energy_weight=energy_weight,
+            forces_weight=forces_weight,
+            stress_weight=stress_weight,
+            magforces_weight=magforces_weight,
+            huber_delta=huber_delta,
+        )
+        self.register_buffer(
+            "interaction_energy_weight",
+            torch.tensor(interaction_energy_weight, dtype=torch.get_default_dtype()),
+        )
+        self.register_buffer(
+            "interaction_forces_weight",
+            torch.tensor(interaction_forces_weight, dtype=torch.get_default_dtype()),
+        )
+
+    def forward(
+        self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
+    ) -> torch.Tensor:
+        from mace.tools.torch_geometric.cluster_collate import (  # pylint: disable=import-outside-toplevel
+            cluster_atom_counts,
+            combine_energy,
+            combine_forces,
+            is_cluster_batch,
+            slot_to_cluster,
+        )
+
+        if not is_cluster_batch(ref):
+            raise ValueError(
+                "InteractionUniversalLoss needs cluster-record batches "
+                "(train with --cluster_records on a cluster HDF5 dataset)"
+            )
+        if ddp:
+            raise NotImplementedError("InteractionUniversalLoss does not support ddp")
+        loss = super().forward(ref, pred, ddp)
+
+        record_weight = ref["cluster_interaction_weight"]  # [n_clusters]
+        atom_counts = cluster_atom_counts(ref)  # [n_clusters]
+        energy_scale = record_weight / atom_counts
+        loss_interaction_energy = torch.nn.functional.huber_loss(
+            energy_scale * combine_energy(ref, ref["energy"]),
+            energy_scale * combine_energy(ref, pred["energy"]),
+            reduction="mean",
+            delta=self.huber_delta,
+        )
+        slot_weight = record_weight[slot_to_cluster(ref)].unsqueeze(-1)  # [n_slots, 1]
+        loss_interaction_forces = torch.nn.functional.huber_loss(
+            slot_weight * combine_forces(ref, ref["forces"]),
+            slot_weight * combine_forces(ref, pred["forces"]),
+            reduction="mean",
+            delta=self.huber_delta,
+        )
+        return (
+            loss
+            + self.interaction_energy_weight * loss_interaction_energy
+            + self.interaction_forces_weight * loss_interaction_forces
+        )
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}(energy_weight={self.energy_weight:.3f}, "
+            f"forces_weight={self.forces_weight:.3f}, stress_weight={self.stress_weight:.3f}, "
+            f"magforces_weight={self.magforces_weight:.3f}, "
+            f"interaction_energy_weight={self.interaction_energy_weight:.3f}, "
+            f"interaction_forces_weight={self.interaction_forces_weight:.3f})"
+        )
