@@ -1,4 +1,11 @@
 from .atomic_data import AtomicData
+from .cluster_records import (
+    ClusterHDF5Dataset,
+    MonomerSubsystem,
+    build_cluster_record,
+    cluster_dataset_from_sharded_hdf5,
+    save_cluster_records_as_HDF5,
+)
 from .hdf5_dataset import HDF5Dataset, dataset_from_sharded_hdf5
 from .lmdb_dataset import LMDBDataset
 from .neighborhood import get_neighborhood
@@ -34,6 +41,11 @@ __all__ = [
     "estimate_e0s_from_foundation",
     "save_dataset_as_HDF5",
     "HDF5Dataset",
+    "ClusterHDF5Dataset",
+    "MonomerSubsystem",
+    "build_cluster_record",
+    "cluster_dataset_from_sharded_hdf5",
+    "save_cluster_records_as_HDF5",
     "dataset_from_sharded_hdf5",
     "save_AtomicData_to_HDF5",
     "save_configurations_as_HDF5",

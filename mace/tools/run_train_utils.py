@@ -36,6 +36,7 @@ def load_dataset_for_path(
     heads: List[str],
     head_config: Any,
     collection: Optional[Any] = None,
+    cluster_records: bool = False,
 ) -> Union[Dataset, List]:
     """
     Load a dataset from a file path based on its format.
@@ -75,6 +76,20 @@ def load_dataset_for_path(
         ]
 
     filepath = Path(file_path)
+    if cluster_records:
+        if check_path_ase_read(str(filepath)):
+            raise ValueError(
+                f"--cluster_records needs cluster-record HDF5 files, got {file_path}"
+            )
+        if filepath.is_dir():
+            logging.info(f"Loading cluster-record HDF5 shards from {file_path}")
+            return data.cluster_dataset_from_sharded_hdf5(
+                str(filepath), r_max=r_max, z_table=z_table, heads=heads, head=head_config.head_name
+            )
+        logging.info(f"Loading cluster-record HDF5 file {file_path}")
+        return data.ClusterHDF5Dataset(
+            str(filepath), r_max=r_max, z_table=z_table, heads=heads, head=head_config.head_name
+        )
     if filepath.is_dir():
 
         if filepath.name.endswith("_lmdb") or any(

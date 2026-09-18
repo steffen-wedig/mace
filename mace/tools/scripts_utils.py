@@ -808,6 +808,16 @@ def get_loss_fn(
             magforces_weight=args.magforces_weight,
             huber_delta=args.huber_delta,
         )
+    elif args.loss == "interaction_universal":
+        loss_fn = modules.InteractionUniversalLoss(
+            energy_weight=args.energy_weight,
+            forces_weight=args.forces_weight,
+            stress_weight=args.stress_weight,
+            magforces_weight=args.magforces_weight,
+            huber_delta=args.huber_delta,
+            interaction_energy_weight=args.interaction_energy_weight,
+            interaction_forces_weight=args.interaction_forces_weight,
+        )
     elif args.loss == "l1l2energyforces":
         loss_fn = modules.WeightedEnergyForcesL1L2Loss(
             energy_weight=args.energy_weight,
@@ -890,6 +900,19 @@ def get_swa(
         )
         logging.info(
             f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight}, dipole weight : {args.swa_dipole_weight} and learning rate : {args.swa_lr}"
+        )
+    elif args.loss == "interaction_universal":
+        loss_fn_energy = modules.InteractionUniversalLoss(
+            energy_weight=args.swa_energy_weight,
+            forces_weight=args.swa_forces_weight,
+            stress_weight=args.swa_stress_weight,
+            magforces_weight=args.swa_magforces_weight,
+            huber_delta=args.huber_delta,
+            interaction_energy_weight=args.swa_interaction_energy_weight,
+            interaction_forces_weight=args.swa_interaction_forces_weight,
+        )
+        logging.info(
+            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy} and learning rate : {args.swa_lr}"
         )
     elif args.loss == "universal":
         loss_fn_energy = modules.UniversalLoss(

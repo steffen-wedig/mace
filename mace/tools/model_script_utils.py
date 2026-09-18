@@ -25,7 +25,7 @@ def configure_model(
 ):
     # Selecting outputs
     compute_virials = args.loss == "virials"
-    compute_stress = args.loss in ("stress", "huber", "universal")
+    compute_stress = args.loss in ("stress", "huber", "universal", "interaction_universal")
 
     if compute_virials:
         args.compute_virials = True

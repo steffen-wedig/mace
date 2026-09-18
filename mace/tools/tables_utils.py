@@ -57,6 +57,17 @@ def create_error_table(
             "relative F RMSE %",
             "RMSE Stress (Virials) / meV / A (A^3)",
         ]
+    elif table_type == "PerAtomRMSEinteraction":
+        table.field_names = [
+            "config_type",
+            "RMSE E / meV / atom",
+            "RMSE F / meV / A",
+            "relative F RMSE %",
+            "RMSE Stress / meV / A^3",
+            "RMSE E_int / meV / atom",
+            "RMSE F_int / meV / A",
+            "relative F_int RMSE %",
+        ]
     elif table_type == "PerAtomMAEstressvirials":
         table.field_names = [
             "config_type",
@@ -177,6 +188,19 @@ def create_error_table(
                     f"{metrics['rmse_f'] * 1000:8.1f}",
                     f"{metrics['rel_rmse_f']:8.2f}",
                     f"{metrics['rmse_virials'] * 1000:8.1f}",
+                ]
+            )
+        elif table_type == "PerAtomRMSEinteraction":
+            table.add_row(
+                [
+                    name,
+                    f"{metrics['rmse_e_per_atom'] * 1000:8.1f}",
+                    f"{metrics['rmse_f'] * 1000:8.1f}",
+                    f"{metrics['rel_rmse_f']:8.2f}",
+                    (f"{metrics['rmse_stress'] * 1000:8.1f}" if metrics["rmse_stress"] is not None else "n/a"),
+                    (f"{metrics['rmse_e_int_per_atom'] * 1000:8.1f}" if metrics["rmse_e_int_per_atom"] is not None else "n/a"),
+                    (f"{metrics['rmse_f_int'] * 1000:8.1f}" if metrics["rmse_f_int"] is not None else "n/a"),
+                    (f"{metrics['rel_rmse_f_int']:8.2f}" if metrics["rel_rmse_f_int"] is not None else "n/a"),
                 ]
             )
         elif (
