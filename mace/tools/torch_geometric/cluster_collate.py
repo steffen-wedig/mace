@@ -6,7 +6,8 @@ A record (``mace.data.cluster_records``) is a ``List[AtomicData]``: the cluster 
 :class:`ClusterCollater` flattens it into a single ``Batch`` -- a cluster's subsystems are
 ordinary graphs of the disconnected union, so the model forward is untouched -- and makes
 the bookkeeping disjoint across records: ``cluster_id`` becomes the record's position in
-the minibatch and ``slot`` is shifted by a running offset. Neither name matches
+the minibatch and ``slot`` is shifted by a running offset, both on shallow copies so the
+input records are never modified. Neither name matches
 ``(index|face)``, so ``Batch.from_data_list`` leaves both alone; the collater owns them.
 
 mace's own ``torch_geometric.dataloader.DataLoader`` deletes any ``collate_fn``, so the
@@ -15,6 +16,7 @@ collater is attached to a stock ``torch.utils.data.DataLoader`` (:func:`get_clus
 
 from __future__ import annotations
 
+import copy
 from typing import List, Sequence
 
 import torch
@@ -53,9 +55,11 @@ class ClusterCollater:
                     raise ValueError(
                         f"record {record_index}: a slot exceeds the cluster's atom count"
                     )
-                subsystem.cluster_id = torch.tensor(record_index, dtype=torch.long)
-                subsystem.slot = subsystem.slot + slot_offset
-                flat.append(subsystem)
+                # a shallow copy: the dataset's records (possibly cached) stay untouched
+                shifted = copy.copy(subsystem)
+                shifted.cluster_id = torch.tensor(record_index, dtype=torch.long)
+                shifted.slot = subsystem.slot + slot_offset
+                flat.append(shifted)
             interaction_weights.append(
                 torch.as_tensor(cluster_subsystems[0].interaction_weight).reshape(())
             )

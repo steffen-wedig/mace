@@ -121,6 +121,43 @@ def test_stage_two_alias_maps_to_swa_dest():
     assert args2.swa_energy_weight == 88.0
 
 
+def test_interaction_huber_loss_arguments():
+    args = build_default_arg_parser().parse_args(MINIMAL_ARGV)
+    # None means "equal to the frame weight of the same stage", resolved where the loss is built
+    assert args.monomer_energy_weight is None
+    assert args.monomer_forces_weight is None
+    assert args.swa_monomer_energy_weight is None
+    assert args.swa_monomer_forces_weight is None
+    terms = (
+        "frame_energy",
+        "frame_forces",
+        "monomer_energy",
+        "monomer_forces",
+        "interaction_energy",
+        "interaction_forces",
+    )
+    for term in terms:
+        assert getattr(args, f"huber_delta_{term}") == 0.01
+
+    args = build_default_arg_parser().parse_args(
+        MINIMAL_ARGV
+        + [
+            "--loss",
+            "interaction_huber",
+            "--monomer_energy_weight",
+            "0.0",
+            "--stage_two_monomer_forces_weight",
+            "5.0",
+            "--huber_delta_interaction_forces",
+            "0.05",
+        ]
+    )
+    assert args.loss == "interaction_huber"
+    assert args.monomer_energy_weight == 0.0
+    assert args.swa_monomer_forces_weight == 5.0
+    assert args.huber_delta_interaction_forces == 0.05
+
+
 # ---------------------------------------------------------------------------
 # YAML --config mode (configargparse)
 # ---------------------------------------------------------------------------

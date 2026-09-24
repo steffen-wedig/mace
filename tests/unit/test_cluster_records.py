@@ -138,6 +138,28 @@ def test_collater_offsets_do_not_depend_on_record_order(tmp_path):
     assert batch.slot[batch.sign[batch.batch] > 0].tolist() == list(range(9))
 
 
+def test_collater_does_not_modify_its_input_records(tmp_path):
+    """Collating the same records twice (a caching dataset, a second epoch) gives identical
+    batches and leaves every input's slot and cluster_id as the dataset built them."""
+    bulk, _, _ = _periodic_two_water_record(4)
+    path = _write_records(tmp_path, [_lone_monomer_record(), bulk])
+    dataset = ClusterHDF5Dataset(str(path), r_max=3.0, z_table=Z_TABLE)
+    records = [dataset[0], dataset[1]]
+    slots_before = [[subsystem.slot.clone() for subsystem in record] for record in records]
+
+    collater = ClusterCollater()
+    first = collater(records)
+    second = collater(records)
+
+    for key in ("slot", "cluster_id", "sign", "batch", "energy", "forces", "positions"):
+        assert torch.equal(first[key], second[key]), key
+    assert int(first.n_slots) == int(second.n_slots) == 9
+    for record, record_slots in zip(records, slots_before):
+        for subsystem, slot in zip(record, record_slots):
+            assert torch.equal(subsystem.slot, slot)
+            assert int(subsystem.cluster_id) == 0
+
+
 def test_interaction_loss_sees_only_the_interaction_residual(tmp_path):
     bulk, _, _ = _periodic_two_water_record(3)
     path = _write_records(tmp_path, [bulk, _lone_monomer_record()])

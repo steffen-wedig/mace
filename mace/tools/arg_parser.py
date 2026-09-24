@@ -786,6 +786,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "huber",
             "universal",
             "interaction_universal",
+            "interaction_huber",
             "energy_forces_dipole",
             "l1l2energyforces",
         ],
@@ -877,11 +878,88 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         dest="swa_interaction_forces_weight",
     )
     parser.add_argument(
+        "--monomer_energy_weight",
+        help="weight of the energy loss of standalone (aperiodic, sign +1) monomers "
+        "(loss interaction_huber); default: equal to --energy_weight",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--swa_monomer_energy_weight",
+        "--stage_two_monomer_energy_weight",
+        help="weight of the monomer energy loss after starting Stage Two; "
+        "default: equal to --swa_energy_weight",
+        type=float,
+        default=None,
+        dest="swa_monomer_energy_weight",
+    )
+    parser.add_argument(
+        "--monomer_forces_weight",
+        help="weight of the forces loss of standalone (aperiodic, sign +1) monomers "
+        "(loss interaction_huber); default: equal to --forces_weight",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--swa_monomer_forces_weight",
+        "--stage_two_monomer_forces_weight",
+        help="weight of the monomer forces loss after starting Stage Two; "
+        "default: equal to --swa_forces_weight",
+        type=float,
+        default=None,
+        dest="swa_monomer_forces_weight",
+    )
+    parser.add_argument(
+        "--huber_delta_frame_energy",
+        help="Huber threshold of the frame energy term (loss interaction_huber)",
+        type=float,
+        default=0.01,
+    )
+    parser.add_argument(
+        "--huber_delta_frame_forces",
+        help="Huber threshold of the frame forces term (loss interaction_huber)",
+        type=float,
+        default=0.01,
+    )
+    parser.add_argument(
+        "--huber_delta_monomer_energy",
+        help="Huber threshold of the monomer energy term (loss interaction_huber)",
+        type=float,
+        default=0.01,
+    )
+    parser.add_argument(
+        "--huber_delta_monomer_forces",
+        help="Huber threshold of the monomer forces term (loss interaction_huber)",
+        type=float,
+        default=0.01,
+    )
+    parser.add_argument(
+        "--huber_delta_interaction_energy",
+        help="Huber threshold of the interaction energy term (loss interaction_huber)",
+        type=float,
+        default=0.01,
+    )
+    parser.add_argument(
+        "--huber_delta_interaction_forces",
+        help="Huber threshold of the interaction forces term (loss interaction_huber)",
+        type=float,
+        default=0.01,
+    )
+    parser.add_argument(
         "--cluster_records",
         help="train_file/valid_file are cluster-record HDF5 datasets (mace.data.cluster_records): "
         "each item is a cluster graph plus its monomers, batched with the ClusterCollater",
         type=str2bool,
         default=False,
+    )
+    parser.add_argument(
+        "--loss_term_probe_interval",
+        help="per-term loss logging (losses with compute_terms, e.g. interaction_huber): "
+        "run the per-term gradient probe on one fixed training batch every this many "
+        "optimizer steps, and at step 0; 0 turns the probe off (epoch summaries are "
+        "still written to results/<tag>_loss_terms.jsonl)",
+        type=int,
+        default=200,
     )
     parser.add_argument(
         "--dipole_weight", help="weight of dipoles loss", type=float, default=1.0

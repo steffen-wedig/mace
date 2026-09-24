@@ -1,4 +1,4 @@
-"""End-to-end: train a tiny MACE on cluster records with the interaction loss."""
+"""End-to-end: train a tiny MACE on cluster records with each interaction loss."""
 
 import json
 from pathlib import Path
@@ -48,7 +48,19 @@ def _records(count: int, seed: int):
     return records
 
 
-def test_run_train_cluster_records(tmp_path: Path):
+LOSS_SETTINGS = {
+    "interaction_universal": {"loss": "interaction_universal", "compute_stress": True},
+    "interaction_huber": {
+        "loss": "interaction_huber",
+        "monomer_energy_weight": 0.0,
+        "swa_monomer_forces_weight": 50.0,
+        "huber_delta_interaction_energy": 0.02,
+    },
+}
+
+
+@pytest.mark.parametrize("loss_name", sorted(LOSS_SETTINGS))
+def test_run_train_cluster_records(tmp_path: Path, loss_name: str):
     train_path = tmp_path / "train.h5"
     valid_path = tmp_path / "valid.h5"
     with h5py.File(train_path, "w") as handle:
@@ -65,7 +77,6 @@ def test_run_train_cluster_records(tmp_path: Path):
             "cluster_records": True,
             "atomic_numbers": "[1, 8]",
             "E0s": "{1: -0.5, 8: -13.0}",
-            "loss": "interaction_universal",
             "interaction_energy_weight": 10.0,
             "interaction_forces_weight": 10.0,
             "swa_interaction_energy_weight": 100.0,
@@ -80,9 +91,9 @@ def test_run_train_cluster_records(tmp_path: Path):
             "results_dir": str(tmp_path),
             "log_dir": str(tmp_path),
             "default_dtype": "float64",
-            "compute_stress": True,
         }
     )
+    params.update(LOSS_SETTINGS[loss_name])
     params.pop("valid_fraction", None)
     run_mace_train(params, cwd=tmp_path)
 
@@ -94,3 +105,7 @@ def test_run_train_cluster_records(tmp_path: Path):
     assert evaluations
     assert all(np.isfinite(entry["rmse_e_int_per_atom"]) for entry in evaluations)
     assert all(np.isfinite(entry["rmse_f_int"]) for entry in evaluations)
+    if loss_name == "interaction_huber":  # no stress term: stress is never computed
+        assert all(entry.get("rmse_stress") is None for entry in evaluations)
+    else:
+        assert all(np.isfinite(entry["rmse_stress"]) for entry in evaluations)
