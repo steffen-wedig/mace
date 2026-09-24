@@ -39,6 +39,7 @@ from mace.data import KeySpecification, update_keyspec_from_kwargs
 from mace.modules.lora import inject_LoRAs, merge_lora_weights
 from mace.tools import deprecation, torch_geometric
 from mace.tools.distributed_tools import init_distributed, xpu_device_index
+from mace.tools.loss_terms import LossTermInstrumentation, supports_loss_terms
 from mace.tools.model_script_utils import configure_model
 from mace.tools.multihead_tools import (
     HeadConfig,
@@ -892,6 +893,7 @@ def run(args) -> None:
     # Model
     model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
     model.to(device)
+    loss_fn.to(device)  # the term weights are buffers
 
     if args.lora:
         lora_rank = args.lora_rank
@@ -986,6 +988,7 @@ def run(args) -> None:
     swas = [False]
     if args.swa:
         swa, swas = get_swa(args, model, optimizer, swas, dipole_only)
+        swa.loss_fn.to(device)
 
     checkpoint_handler = tools.CheckpointHandler(
         directory=args.checkpoints_dir,
@@ -1081,6 +1084,10 @@ def run(args) -> None:
         logging.info("DRY RUN mode enabled. Stopping now.")
         return
 
+    loss_term_instrumentation = create_loss_term_instrumentation(
+        args, loss_fn, tag, rank, device
+    )
+
     tools.train(
         model=model,
         loss_fn=loss_fn,
@@ -1109,6 +1116,7 @@ def run(args) -> None:
         rank=rank,
         data_aug_magmom=args.data_aug_magmom,
         data_aug_magmom_mode=getattr(args, "data_aug_magmom_mode", "non-soc"),
+        loss_term_instrumentation=loss_term_instrumentation,
     )
 
     logging.info("")
@@ -1347,6 +1355,41 @@ def run(args) -> None:
     logging.info("Done")
     if args.distributed:
         torch.distributed.destroy_process_group()
+
+
+def create_loss_term_instrumentation(
+    args, loss_fn, tag: str, rank: int, device
+) -> Optional[LossTermInstrumentation]:
+    """Per-term loss logging to `<results_dir>/<tag>_loss_terms.jsonl`, or None.
+
+    Only losses that follow the term contract of `mace.tools.loss_terms` are logged.
+    Distributed and LBFGS training are left uninstrumented (with a warning): the
+    summaries would cover one rank's shard only, and LBFGS has no per-batch steps.
+    """
+    if not supports_loss_terms(loss_fn):
+        return None
+    if args.distributed:
+        logging.warning(
+            "Per-term loss logging is off under distributed training "
+            "(it would only see rank %s's shard of the data)",
+            rank,
+        )
+        return None
+    if args.lbfgs:
+        logging.warning("Per-term loss logging is off with the LBFGS optimizer")
+        return None
+    instrumentation = LossTermInstrumentation.for_run(
+        results_dir=args.results_dir,
+        tag=tag,
+        loss_fn=loss_fn,
+        probe_interval=args.loss_term_probe_interval,
+        device=device,
+    )
+    logging.info(
+        f"Per-term loss logging to {instrumentation.writer.path} "
+        f"(gradient probe every {args.loss_term_probe_interval} steps, 0 = off)"
+    )
+    return instrumentation
 
 
 if __name__ == "__main__":

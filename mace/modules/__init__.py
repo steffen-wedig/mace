@@ -39,7 +39,9 @@ from .gate import GatedEquivariantBlock
 from .loss import (
     DipolePolarLoss,
     DipoleSingleLoss,
+    InteractionHuberLoss,
     InteractionUniversalLoss,
+    LossTermStatistics,
     UniversalLoss,
     WeightedEnergyForcesDipoleLoss,
     WeightedEnergyForcesL1L2Loss,
@@ -140,6 +142,8 @@ __all__ = [
     "WeightedHuberEnergyForcesStressLoss",
     "UniversalLoss",
     "InteractionUniversalLoss",
+    "InteractionHuberLoss",
+    "LossTermStatistics",
     "WeightedEnergyForcesL1L2Loss",
     "SymmetricContraction",
     "interaction_classes",

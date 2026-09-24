@@ -26,6 +26,11 @@ from mace.cli.visualise_train import TrainingPlotter
 
 from . import torch_geometric
 from .checkpoint import CheckpointHandler, CheckpointState
+from .loss_terms import (
+    LossTermAccumulator,
+    LossTermInstrumentation,
+    training_forward_kwargs,
+)
 from .torch_tools import to_numpy
 from .utils import (
     MetricsLogger,
@@ -199,6 +204,7 @@ def train(
     rank: Optional[int] = 0,
     data_aug_magmom: Optional[bool] = False,
     data_aug_magmom_mode: str = "non-soc",
+    loss_term_instrumentation: Optional[LossTermInstrumentation] = None,
 ):
     lowest_loss = np.inf
     valid_loss = np.inf
@@ -219,16 +225,26 @@ def train(
 
     # log validation loss before _any_ training
     for valid_loader_name, valid_loader in valid_loaders.items():
+        term_accumulator = (
+            loss_term_instrumentation.validation_accumulator()
+            if loss_term_instrumentation is not None
+            else None
+        )
         valid_loss_head, eval_metrics = evaluate(
             model=model,
             loss_fn=loss_fn,
             data_loader=valid_loader,
             output_args=output_args,
             device=device,
+            term_accumulator=term_accumulator,
         )
         valid_err_log(
             valid_loss_head, eval_metrics, logger, log_errors, None, valid_loader_name
         )
+        if loss_term_instrumentation is not None and term_accumulator is not None:
+            loss_term_instrumentation.write_validation_summary(
+                term_accumulator, head=valid_loader_name, epoch=None
+            )
     valid_loss = valid_loss_head  # consider only the last head for the checkpoint
 
     # variable used for broadcast by rank == 0 if epoch loop is exited early, e.g. patience
@@ -255,6 +271,10 @@ def train(
                 lowest_loss = np.inf
                 swa_start = False
                 keep_last = True
+                if loss_term_instrumentation is not None:
+                    loss_term_instrumentation.stage_switch(
+                        epoch=epoch, old_loss_fn=loss_fn, new_loss_fn=swa.loss_fn
+                    )
             loss_fn = swa.loss_fn
             swa.model.update_parameters(model)
             if epoch > start_epoch:
@@ -280,6 +300,7 @@ def train(
             distributed=distributed,
             distributed_model=distributed_model,
             rank=rank,
+            loss_term_instrumentation=loss_term_instrumentation,
         )
         if distributed:
             torch.distributed.barrier()
@@ -297,13 +318,23 @@ def train(
             with param_context:
                 wandb_log_dict = {}
                 for valid_loader_name, valid_loader in valid_loaders.items():
+                    term_accumulator = (
+                        loss_term_instrumentation.validation_accumulator()
+                        if loss_term_instrumentation is not None
+                        else None
+                    )
                     valid_loss_head, eval_metrics = evaluate(
                         model=model_to_evaluate,
                         loss_fn=loss_fn,
                         data_loader=valid_loader,
                         output_args=output_args,
                         device=device,
+                        term_accumulator=term_accumulator,
                     )
+                    if loss_term_instrumentation is not None and term_accumulator is not None:
+                        loss_term_instrumentation.write_validation_summary(
+                            term_accumulator, head=valid_loader_name, epoch=epoch
+                        )
                     if rank == 0:
                         valid_err_log(
                             valid_loss_head,
@@ -398,10 +429,15 @@ def train_one_epoch(
     distributed: bool,
     distributed_model: Optional[DistributedDataParallel] = None,
     rank: Optional[int] = 0,
+    loss_term_instrumentation: Optional[LossTermInstrumentation] = None,
 ) -> None:
     model_to_train = model if distributed_model is None else distributed_model
 
     if isinstance(optimizer, LBFGS):
+        if loss_term_instrumentation is not None:
+            raise NotImplementedError(
+                "per-term loss logging does not support the LBFGS optimizer"
+            )
         _, opt_metrics = take_step_lbfgs(
             model=model_to_train,
             loss_fn=loss_fn,
@@ -419,7 +455,17 @@ def train_one_epoch(
         if rank == 0:
             logger.log(opt_metrics)
     else:
+        if loss_term_instrumentation is not None:
+            loss_term_instrumentation.start_train_epoch()
         for batch in data_loader:
+            if loss_term_instrumentation is not None:
+                loss_term_instrumentation.before_train_step(
+                    model=model_to_train,
+                    loss_fn=loss_fn,
+                    batch=batch,
+                    output_args=output_args,
+                    epoch=epoch,
+                )
             _, opt_metrics = take_step(
                 model=model_to_train,
                 loss_fn=loss_fn,
@@ -430,10 +476,15 @@ def train_one_epoch(
                 max_grad_norm=max_grad_norm,
                 device=device,
             )
+            if loss_term_instrumentation is not None:
+                # The loss call inside `take_step` left its term statistics behind.
+                loss_term_instrumentation.after_train_step(loss_fn)
             opt_metrics["mode"] = "opt"
             opt_metrics["epoch"] = epoch
             if rank == 0:
                 logger.log(opt_metrics)
+        if loss_term_instrumentation is not None:
+            loss_term_instrumentation.finish_train_epoch(epoch)
 
 
 def take_step(
@@ -452,15 +503,7 @@ def take_step(
 
     def closure():
         optimizer.zero_grad(set_to_none=True)
-        kwargs = dict(
-            training=True,
-            compute_force=output_args["forces"],
-            compute_virials=output_args["virials"],
-            compute_stress=output_args["stress"],
-        )
-        if output_args.get("magforces", False):
-            kwargs["compute_magforces"] = True
-        output = model(batch_dict, **kwargs)
+        output = model(batch_dict, **training_forward_kwargs(output_args))
         loss = loss_fn(pred=output, ref=batch)
         loss.backward()
         if max_grad_norm is not None:
@@ -602,7 +645,13 @@ def evaluate(
     data_loader: DataLoader,
     output_args: Dict[str, bool],
     device: torch.device,
+    term_accumulator: Optional[LossTermAccumulator] = None,
 ) -> Tuple[float, Dict[str, Any]]:
+    """Loss and error metrics of `model` on `data_loader`.
+
+    With a `term_accumulator`, the per-term statistics of every batch's loss call are
+    summed into it (the loss must follow the term contract of `mace.tools.loss_terms`).
+    """
 
     metrics = MACELoss(loss_fn=loss_fn).to(device)
 
@@ -622,6 +671,8 @@ def evaluate(
                 kwargs["compute_magforces"] = True
             output = model(batch_dict, **kwargs)
             avg_loss, aux = metrics(batch, output)
+            if term_accumulator is not None:
+                term_accumulator.update(loss_fn)
     avg_loss, aux = metrics.compute()
     aux["time"] = time.time() - start_time
     metrics.reset()

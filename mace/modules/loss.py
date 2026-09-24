@@ -4,7 +4,8 @@
 # This program is distributed under the MIT License (see MIT.md)
 ###########################################################################################
 
-from typing import Optional
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -208,33 +209,58 @@ def conditional_mse_forces(
     return reduce_loss(raw_loss, ddp)
 
 
+FORCE_MAGNITUDE_BIN_EDGES = (100.0, 200.0, 300.0)
+FORCE_MAGNITUDE_HUBER_FACTORS = (1.0, 0.7, 0.4, 0.1)
+
+
+def conditional_huber_force_thresholds(
+    ref_forces: torch.Tensor, huber_delta: float
+) -> torch.Tensor:
+    """Per-atom Huber threshold ``[n_atoms]`` of :func:`conditional_huber_forces`: the delta
+    shrinks by the factors 1, 0.7, 0.4, 0.1 for reference force norms below 100, 200, 300
+    and above."""
+    norm_forces = torch.norm(ref_forces, dim=-1)
+    factors = huber_delta * torch.tensor(
+        FORCE_MAGNITUDE_HUBER_FACTORS, device=ref_forces.device, dtype=ref_forces.dtype
+    )
+    edges = torch.tensor(
+        FORCE_MAGNITUDE_BIN_EDGES, device=ref_forces.device, dtype=ref_forces.dtype
+    )
+    return factors[torch.bucketize(norm_forces, edges, right=True)]
+
+
+def huber_elementwise(
+    ref_values: torch.Tensor, pred_values: torch.Tensor, thresholds: torch.Tensor
+) -> torch.Tensor:
+    """``torch.nn.functional.huber_loss(reduction="none")`` with a threshold tensor that
+    broadcasts against the values: ``0.5 x^2`` for ``|x| < delta``, else
+    ``delta (|x| - 0.5 delta)``."""
+    absolute_errors = (pred_values - ref_values).abs()
+    return torch.where(
+        absolute_errors < thresholds,
+        0.5 * absolute_errors.square(),
+        thresholds * (absolute_errors - 0.5 * thresholds),
+    )
+
+
+def conditional_huber_forces_unreduced(
+    ref_forces: torch.Tensor,
+    pred_forces: torch.Tensor,
+    huber_delta: float,
+) -> torch.Tensor:
+    """Element-wise Huber loss ``[n_atoms, 3]`` with the magnitude-dependent thresholds of
+    :func:`conditional_huber_force_thresholds`."""
+    thresholds = conditional_huber_force_thresholds(ref_forces, huber_delta)
+    return huber_elementwise(ref_forces, pred_forces, thresholds.unsqueeze(-1))
+
+
 def conditional_huber_forces(
     ref_forces: torch.Tensor,
     pred_forces: torch.Tensor,
     huber_delta: float,
     ddp: Optional[bool] = None,
 ) -> torch.Tensor:
-    factors = huber_delta * torch.tensor(
-        [1.0, 0.7, 0.4, 0.1], device=ref_forces.device, dtype=ref_forces.dtype
-    )
-    norm_forces = torch.norm(ref_forces, dim=-1)
-    c1 = norm_forces < 100
-    c2 = (norm_forces >= 100) & (norm_forces < 200)
-    c3 = (norm_forces >= 200) & (norm_forces < 300)
-    c4 = ~(c1 | c2 | c3)
-    se = torch.zeros_like(pred_forces)
-    se[c1] = torch.nn.functional.huber_loss(
-        ref_forces[c1], pred_forces[c1], reduction="none", delta=factors[0]
-    )
-    se[c2] = torch.nn.functional.huber_loss(
-        ref_forces[c2], pred_forces[c2], reduction="none", delta=factors[1]
-    )
-    se[c3] = torch.nn.functional.huber_loss(
-        ref_forces[c3], pred_forces[c3], reduction="none", delta=factors[2]
-    )
-    se[c4] = torch.nn.functional.huber_loss(
-        ref_forces[c4], pred_forces[c4], reduction="none", delta=factors[3]
-    )
+    se = conditional_huber_forces_unreduced(ref_forces, pred_forces, huber_delta)
     return reduce_loss(se, ddp)
 
 
@@ -743,3 +769,276 @@ class InteractionUniversalLoss(UniversalLoss):
             f"interaction_energy_weight={self.interaction_energy_weight:.3f}, "
             f"interaction_forces_weight={self.interaction_forces_weight:.3f})"
         )
+
+
+@dataclass
+class LossTermStatistics:
+    """Components of one :class:`InteractionHuberLoss` term from its last forward pass.
+
+    All tensors are detached scalars on the batch device. ``entry_count`` and
+    ``linear_count`` are floats so they can be accumulated alongside the sums."""
+
+    weight: torch.Tensor  # the global term weight used in this forward pass
+    unweighted_mean: torch.Tensor  # sum(w_i * loss_i) / sum(w_i), 0 without entries
+    weighted_sum: torch.Tensor  # sum(w_i * loss_i)
+    weight_sum: torch.Tensor  # sum(w_i) over entries with w_i > 0
+    entry_count: torch.Tensor  # number of entries with w_i > 0
+    linear_count: torch.Tensor  # those entries whose |error| exceeds their Huber threshold
+
+
+def weighted_huber_term(
+    ref_values: torch.Tensor,
+    pred_values: torch.Tensor,
+    entry_weights: torch.Tensor,
+    thresholds: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Weighted mean of element-wise Huber losses over the entries with a positive weight.
+
+    ``entry_weights`` and ``thresholds`` broadcast against the values; the weights sit
+    outside the Huber function. Entries with weight <= 0 neither contribute nor dilute.
+    Returns ``(mean, weighted_sum, weight_sum, entry_count, linear_count)``; the mean keeps
+    the autograd graph (it is exactly zero, and still connected, without entries), the
+    others are detached."""
+    absolute_errors = (pred_values - ref_values).abs()
+    per_entry_loss = huber_elementwise(ref_values, pred_values, thresholds)
+    entry_weights = entry_weights.expand_as(per_entry_loss)
+    included = entry_weights > 0
+    weighted_sum = torch.where(
+        included, entry_weights * per_entry_loss, torch.zeros_like(per_entry_loss)
+    ).sum()
+    weight_sum = torch.where(
+        included, entry_weights, torch.zeros_like(entry_weights)
+    ).sum()
+    safe_weight_sum = torch.where(
+        weight_sum > 0, weight_sum, torch.ones_like(weight_sum)
+    )
+    mean = weighted_sum / safe_weight_sum
+    entry_count = included.sum().to(per_entry_loss.dtype)
+    linear_count = (
+        (included & (absolute_errors > thresholds)).sum().to(per_entry_loss.dtype)
+    )
+    return (
+        mean,
+        weighted_sum.detach(),
+        weight_sum.detach(),
+        entry_count.detach(),
+        linear_count.detach(),
+    )
+
+
+class InteractionHuberLoss(torch.nn.Module):
+    """Six Huber terms, each a weighted mean over the entries that carry it.
+
+    ================== =============================================== =====================
+    term               entries                                         entry weight
+    ================== =============================================== =====================
+    frame_energy       periodic configurations with sign +1 (per atom) weight * energy_weight
+    frame_forces       force components of their atoms                 weight * forces_weight
+    monomer_energy     aperiodic configurations with sign +1           weight * energy_weight
+    monomer_forces     force components of their atoms                 weight * forces_weight
+    interaction_energy records, ``E_int / cluster atoms``              interaction weight
+    interaction_forces slot components of ``F_int``                    interaction weight
+    ================== =============================================== =====================
+
+    A term is ``sum(w_i * huber_i) / sum(w_i)`` over its entries with ``w_i > 0``, so
+    zero-weight entries neither contribute nor dilute; the global term weight multiplies it.
+    In-place monomers (sign -1) get no absolute terms: they enter only through ``E_int`` and
+    ``F_int`` (``mace.tools.torch_geometric.cluster_collate``). Batches without ``sign``
+    (extxyz) count every configuration as +1 and have empty interaction terms. The force
+    terms of frames and monomers use the magnitude-dependent thresholds of
+    :func:`conditional_huber_forces`; ``F_int`` uses a plain threshold. There is no stress
+    term: neither ``ref["stress"]`` nor ``pred["stress"]`` is read.
+
+    Every forward pass stores the detached components of each term in ``last_statistics``.
+    """
+
+    term_names: Tuple[str, ...] = (
+        "frame_energy",
+        "frame_forces",
+        "monomer_energy",
+        "monomer_forces",
+        "interaction_energy",
+        "interaction_forces",
+    )
+    # buffer holding the global weight of each term
+    _weight_buffer_names: Dict[str, str] = {
+        "frame_energy": "energy_weight",
+        "frame_forces": "forces_weight",
+        "monomer_energy": "monomer_energy_weight",
+        "monomer_forces": "monomer_forces_weight",
+        "interaction_energy": "interaction_energy_weight",
+        "interaction_forces": "interaction_forces_weight",
+    }
+
+    def __init__(
+        self,
+        energy_weight=1.0,
+        forces_weight=1.0,
+        monomer_energy_weight=1.0,
+        monomer_forces_weight=1.0,
+        interaction_energy_weight=1.0,
+        interaction_forces_weight=1.0,
+        huber_delta_frame_energy=0.01,
+        huber_delta_frame_forces=0.01,
+        huber_delta_monomer_energy=0.01,
+        huber_delta_monomer_forces=0.01,
+        huber_delta_interaction_energy=0.01,
+        huber_delta_interaction_forces=0.01,
+    ) -> None:
+        super().__init__()
+        weights = {
+            "energy_weight": energy_weight,
+            "forces_weight": forces_weight,
+            "monomer_energy_weight": monomer_energy_weight,
+            "monomer_forces_weight": monomer_forces_weight,
+            "interaction_energy_weight": interaction_energy_weight,
+            "interaction_forces_weight": interaction_forces_weight,
+        }
+        for buffer_name, value in weights.items():
+            self.register_buffer(
+                buffer_name, torch.tensor(value, dtype=torch.get_default_dtype())
+            )
+        self.huber_deltas: Dict[str, float] = {
+            "frame_energy": float(huber_delta_frame_energy),
+            "frame_forces": float(huber_delta_frame_forces),
+            "monomer_energy": float(huber_delta_monomer_energy),
+            "monomer_forces": float(huber_delta_monomer_forces),
+            "interaction_energy": float(huber_delta_interaction_energy),
+            "interaction_forces": float(huber_delta_interaction_forces),
+        }
+        self.last_statistics: Dict[str, LossTermStatistics] = {}
+
+    def term_weights(self) -> Dict[str, float]:
+        return {
+            name: float(getattr(self, buffer_name))
+            for name, buffer_name in self._weight_buffer_names.items()
+        }
+
+    def _absolute_terms(
+        self, ref: Batch, pred: TensorDict, configuration_mask: torch.Tensor, kind: str
+    ):
+        """Energy and force terms of the configurations in ``configuration_mask``."""
+        num_atoms = (ref.ptr[1:] - ref.ptr[:-1]).to(pred["energy"].dtype)
+        selected = configuration_mask.to(pred["energy"].dtype)
+        energy_entry_weights = ref.weight * ref.energy_weight * selected
+        energy_term = weighted_huber_term(
+            ref["energy"] / num_atoms,
+            pred["energy"] / num_atoms,
+            energy_entry_weights,
+            torch.full_like(pred["energy"], self.huber_deltas[f"{kind}_energy"]),
+        )
+        atom_entry_weights = (ref.weight * ref.forces_weight * selected)[ref.batch]
+        forces_term = weighted_huber_term(
+            ref["forces"],
+            pred["forces"],
+            atom_entry_weights.unsqueeze(-1),
+            conditional_huber_force_thresholds(
+                ref["forces"], self.huber_deltas[f"{kind}_forces"]
+            ).unsqueeze(-1),
+        )
+        return energy_term, forces_term
+
+    def _interaction_terms(self, ref: Batch, pred: TensorDict):
+        from mace.tools.torch_geometric.cluster_collate import (  # pylint: disable=import-outside-toplevel
+            cluster_atom_counts,
+            combine_energy,
+            combine_forces,
+            is_cluster_batch,
+            slot_to_cluster,
+        )
+
+        if not is_cluster_batch(ref):
+            # empty slices keep the terms connected to the prediction's graph
+            empty_energy = pred["energy"][:0]
+            empty_forces = pred["forces"][:0]
+            energy_term = weighted_huber_term(
+                empty_energy.detach(), empty_energy, empty_energy.detach(), empty_energy.detach()
+            )
+            forces_term = weighted_huber_term(
+                empty_forces.detach(), empty_forces, empty_forces.detach(), empty_forces.detach()
+            )
+            return energy_term, forces_term
+
+        record_weights = ref["cluster_interaction_weight"]  # [n_clusters]
+        atom_counts = cluster_atom_counts(ref).to(pred["energy"].dtype)  # [n_clusters]
+        energy_term = weighted_huber_term(
+            combine_energy(ref, ref["energy"]) / atom_counts,
+            combine_energy(ref, pred["energy"]) / atom_counts,
+            record_weights,
+            torch.full_like(record_weights, self.huber_deltas["interaction_energy"]),
+        )
+        slot_weights = record_weights[slot_to_cluster(ref)].unsqueeze(-1)  # [n_slots, 1]
+        forces_term = weighted_huber_term(
+            combine_forces(ref, ref["forces"]),
+            combine_forces(ref, pred["forces"]),
+            slot_weights,
+            torch.full_like(slot_weights, self.huber_deltas["interaction_forces"]),
+        )
+        return energy_term, forces_term
+
+    def compute_terms(self, ref: Batch, pred: TensorDict) -> Dict[str, torch.Tensor]:
+        """The six weighted terms (with autograd graph); fills ``last_statistics``."""
+        periodic = ref.pbc.any(dim=-1)  # [n_graphs]
+        sign = getattr(ref, "sign", None)
+        positive = (
+            sign > 0 if sign is not None else torch.ones_like(periodic, dtype=torch.bool)
+        )
+        frame_energy, frame_forces = self._absolute_terms(
+            ref, pred, periodic & positive, "frame"
+        )
+        monomer_energy, monomer_forces = self._absolute_terms(
+            ref, pred, ~periodic & positive, "monomer"
+        )
+        interaction_energy, interaction_forces = self._interaction_terms(ref, pred)
+        components = dict(
+            zip(
+                self.term_names,
+                (
+                    frame_energy,
+                    frame_forces,
+                    monomer_energy,
+                    monomer_forces,
+                    interaction_energy,
+                    interaction_forces,
+                ),
+            )
+        )
+
+        terms: Dict[str, torch.Tensor] = {}
+        statistics: Dict[str, LossTermStatistics] = {}
+        for name, (mean, weighted_sum, weight_sum, entry_count, linear_count) in components.items():
+            weight = getattr(self, self._weight_buffer_names[name]).to(
+                device=mean.device, dtype=mean.dtype
+            )
+            terms[name] = weight * mean
+            statistics[name] = LossTermStatistics(
+                weight=weight.detach(),
+                unweighted_mean=mean.detach(),
+                weighted_sum=weighted_sum,
+                weight_sum=weight_sum,
+                entry_count=entry_count,
+                linear_count=linear_count,
+            )
+        self.last_statistics = statistics
+        return terms
+
+    def forward(
+        self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
+    ) -> torch.Tensor:
+        ddp = is_ddp_enabled() if ddp is None else ddp
+        if ddp:
+            raise NotImplementedError(
+                "InteractionHuberLoss does not support distributed training: its "
+                "per-term weighted means would need a global reduction of the weight sums"
+            )
+        return torch.stack(list(self.compute_terms(ref, pred).values())).sum()
+
+    def __repr__(self):
+        weights = ", ".join(
+            f"{buffer_name}={float(getattr(self, buffer_name)):.3f}"
+            for buffer_name in self._weight_buffer_names.values()
+        )
+        thresholds = ", ".join(
+            f"huber_delta_{name}={delta:g}" for name, delta in self.huber_deltas.items()
+        )
+        return f"{self.__class__.__name__}({weights}, {thresholds})"

@@ -770,6 +770,44 @@ def get_avg_num_neighbors(head_configs, args, train_loader, device):
     return avg_num_neighbors_out
 
 
+def get_interaction_huber_loss(
+    args: argparse.Namespace, stage_two: bool
+) -> torch.nn.Module:
+    """``InteractionHuberLoss`` with the weights of stage one or two (``swa_*``) and the same
+    Huber thresholds in both. Monomer weights left at None follow the frame weights of the
+    same stage."""
+    prefix = "swa_" if stage_two else ""
+    energy_weight = getattr(args, f"{prefix}energy_weight")
+    forces_weight = getattr(args, f"{prefix}forces_weight")
+    monomer_energy_weight = getattr(args, f"{prefix}monomer_energy_weight")
+    monomer_forces_weight = getattr(args, f"{prefix}monomer_forces_weight")
+    stage = "Stage Two" if stage_two else "Stage One"
+    if monomer_energy_weight is None:
+        monomer_energy_weight = energy_weight
+        logging.info(
+            f"{stage}: --{prefix}monomer_energy_weight not set, using the frame energy weight {energy_weight}"
+        )
+    if monomer_forces_weight is None:
+        monomer_forces_weight = forces_weight
+        logging.info(
+            f"{stage}: --{prefix}monomer_forces_weight not set, using the frame forces weight {forces_weight}"
+        )
+    return modules.InteractionHuberLoss(
+        energy_weight=energy_weight,
+        forces_weight=forces_weight,
+        monomer_energy_weight=monomer_energy_weight,
+        monomer_forces_weight=monomer_forces_weight,
+        interaction_energy_weight=getattr(args, f"{prefix}interaction_energy_weight"),
+        interaction_forces_weight=getattr(args, f"{prefix}interaction_forces_weight"),
+        huber_delta_frame_energy=args.huber_delta_frame_energy,
+        huber_delta_frame_forces=args.huber_delta_frame_forces,
+        huber_delta_monomer_energy=args.huber_delta_monomer_energy,
+        huber_delta_monomer_forces=args.huber_delta_monomer_forces,
+        huber_delta_interaction_energy=args.huber_delta_interaction_energy,
+        huber_delta_interaction_forces=args.huber_delta_interaction_forces,
+    )
+
+
 def get_loss_fn(
     args: argparse.Namespace,
     dipole_only: bool,
@@ -818,6 +856,8 @@ def get_loss_fn(
             interaction_energy_weight=args.interaction_energy_weight,
             interaction_forces_weight=args.interaction_forces_weight,
         )
+    elif args.loss == "interaction_huber":
+        loss_fn = get_interaction_huber_loss(args, stage_two=False)
     elif args.loss == "l1l2energyforces":
         loss_fn = modules.WeightedEnergyForcesL1L2Loss(
             energy_weight=args.energy_weight,
@@ -911,6 +951,11 @@ def get_swa(
             interaction_energy_weight=args.swa_interaction_energy_weight,
             interaction_forces_weight=args.swa_interaction_forces_weight,
         )
+        logging.info(
+            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy} and learning rate : {args.swa_lr}"
+        )
+    elif args.loss == "interaction_huber":
+        loss_fn_energy = get_interaction_huber_loss(args, stage_two=True)
         logging.info(
             f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy} and learning rate : {args.swa_lr}"
         )
