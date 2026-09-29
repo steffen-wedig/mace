@@ -1060,6 +1060,16 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument(
+        "--freeze_modules",
+        help="Names of top-level model submodules to freeze during training, e.g. the "
+        "PolarMACE charge channel: lr_source_maps fukui_source_map "
+        "field_dependent_charges_maps local_electron_energy layer_feature_mixer. Frozen "
+        "parameters keep their (foundation) values and are left out of the optimizer.",
+        type=str,
+        nargs="+",
+        default=None,
+    )
+    parser.add_argument(
         "--amsgrad",
         help="use amsgrad variant of optimizer",
         action="store_true",
