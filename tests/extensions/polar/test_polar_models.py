@@ -1349,3 +1349,65 @@ def test_polar_mace_registers_all_trainable_parameters():
     model = _build_minimal_model(torch.device("cpu"), torch.get_default_dtype())
     args = _optimizer_args()
     get_optimizer(args, get_params_options(args, model))
+
+
+POLAR_CHARGE_CHANNEL_MODULES = [
+    "lr_source_maps",
+    "fukui_source_map",
+    "field_dependent_charges_maps",
+    "local_electron_energy",
+    "layer_feature_mixer",
+]
+
+
+def test_polar_mace_freeze_modules_keeps_the_charge_channel_fixed():
+    """freeze_modules leaves the named submodules out of the optimizer, and an
+    optimizer step changes the backbone but not a single frozen parameter."""
+    torch.manual_seed(0)
+    model = _build_minimal_model(torch.device("cpu"), torch.get_default_dtype())
+    args = _optimizer_args()
+    args.freeze_modules = POLAR_CHARGE_CHANNEL_MODULES
+    optimizer = get_optimizer(args, get_params_options(args, model))
+
+    frozen_ids = {
+        id(parameter)
+        for name in POLAR_CHARGE_CHANNEL_MODULES
+        for parameter in getattr(model, name).parameters()
+    }
+    assert frozen_ids
+    optimizer_ids = {
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    assert not frozen_ids & optimizer_ids
+    assert all(
+        not parameter.requires_grad
+        for name in POLAR_CHARGE_CHANNEL_MODULES
+        for parameter in getattr(model, name).parameters()
+    )
+
+    before = {name: value.detach().clone() for name, value in model.named_parameters()}
+    output = model(_build_model_batch(model), training=True, compute_force=True)
+    (output["energy"].sum() + output["forces"].square().sum()).backward()
+    optimizer.step()
+    changed = {
+        name
+        for name, value in model.named_parameters()
+        if not torch.equal(value.detach(), before[name])
+    }
+    frozen_names = {
+        name
+        for name, _ in model.named_parameters()
+        if name.split(".")[0] in POLAR_CHARGE_CHANNEL_MODULES
+    }
+    assert changed, "the optimizer step should move the unfrozen backbone"
+    assert not changed & frozen_names
+
+
+def test_freeze_modules_rejects_an_unknown_submodule():
+    model = _build_minimal_model(torch.device("cpu"), torch.get_default_dtype())
+    args = _optimizer_args()
+    args.freeze_modules = ["no_such_module"]
+    with pytest.raises(ValueError, match="no_such_module"):
+        get_params_options(args, model)
