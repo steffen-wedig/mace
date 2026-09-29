@@ -808,6 +808,44 @@ def get_interaction_huber_loss(
     )
 
 
+def get_likelihood_huber_loss(
+    args: argparse.Namespace, stage_two: bool
+) -> "modules.LikelihoodHuberLoss":
+    """``LikelihoodHuberLoss`` with the energy and forces weights of stage one or two
+    (``swa_*``) for every calculation, and the same Huber thresholds in both stages.
+
+    The loss has one weight per label kind, so a monomer weight that differs from the frame
+    weight of the same stage is refused (it cannot be honoured); interaction weights have
+    no term and are ignored."""
+    prefix = "swa_" if stage_two else ""
+    stage = "Stage Two" if stage_two else "Stage One"
+    energy_weight = getattr(args, f"{prefix}energy_weight")
+    forces_weight = getattr(args, f"{prefix}forces_weight")
+    for label_kind, frame_weight in (("energy", energy_weight), ("forces", forces_weight)):
+        monomer_weight = getattr(args, f"{prefix}monomer_{label_kind}_weight")
+        if monomer_weight is not None and monomer_weight != frame_weight:
+            raise ValueError(
+                f"--loss likelihood_huber has one {label_kind} weight for every calculation, "
+                f"but --{prefix}monomer_{label_kind}_weight={monomer_weight} differs from "
+                f"--{prefix}{label_kind}_weight={frame_weight}"
+            )
+    for label_kind in ("energy", "forces"):
+        interaction_weight = getattr(args, f"{prefix}interaction_{label_kind}_weight")
+        if interaction_weight:
+            logging.info(
+                f"{stage}: --{prefix}interaction_{label_kind}_weight={interaction_weight} is "
+                "ignored: likelihood_huber has no interaction terms"
+            )
+    return modules.LikelihoodHuberLoss(
+        energy_weight=energy_weight,
+        forces_weight=forces_weight,
+        huber_delta_frame_energy=args.huber_delta_frame_energy,
+        huber_delta_frame_forces=args.huber_delta_frame_forces,
+        huber_delta_monomer_energy=args.huber_delta_monomer_energy,
+        huber_delta_monomer_forces=args.huber_delta_monomer_forces,
+    )
+
+
 def get_loss_fn(
     args: argparse.Namespace,
     dipole_only: bool,
@@ -858,6 +896,8 @@ def get_loss_fn(
         )
     elif args.loss == "interaction_huber":
         loss_fn = get_interaction_huber_loss(args, stage_two=False)
+    elif args.loss == "likelihood_huber":
+        loss_fn = get_likelihood_huber_loss(args, stage_two=False)
     elif args.loss == "l1l2energyforces":
         loss_fn = modules.WeightedEnergyForcesL1L2Loss(
             energy_weight=args.energy_weight,
@@ -956,6 +996,11 @@ def get_swa(
         )
     elif args.loss == "interaction_huber":
         loss_fn_energy = get_interaction_huber_loss(args, stage_two=True)
+        logging.info(
+            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy} and learning rate : {args.swa_lr}"
+        )
+    elif args.loss == "likelihood_huber":
+        loss_fn_energy = get_likelihood_huber_loss(args, stage_two=True)
         logging.info(
             f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy} and learning rate : {args.swa_lr}"
         )

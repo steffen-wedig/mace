@@ -56,6 +56,15 @@ LOSS_SETTINGS = {
         "swa_monomer_forces_weight": 50.0,
         "huber_delta_interaction_energy": 0.02,
     },
+    "likelihood_huber": {
+        "loss": "likelihood_huber",
+        "energy_weight": 50.0,
+        "swa_energy_weight": 50.0,
+        "forces_weight": 10.0,
+        "swa_forces_weight": 10.0,
+        "huber_delta_monomer_energy": 0.02,
+        "loss_term_probe_interval": 2,
+    },
 }
 
 
@@ -105,7 +114,41 @@ def test_run_train_cluster_records(tmp_path: Path, loss_name: str):
     assert evaluations
     assert all(np.isfinite(entry["rmse_e_int_per_atom"]) for entry in evaluations)
     assert all(np.isfinite(entry["rmse_f_int"]) for entry in evaluations)
-    if loss_name == "interaction_huber":  # no stress term: stress is never computed
-        assert all(entry.get("rmse_stress") is None for entry in evaluations)
-    else:
+    if loss_name == "interaction_universal":
         assert all(np.isfinite(entry["rmse_stress"]) for entry in evaluations)
+    else:  # no stress term: stress is never computed
+        assert all(entry.get("rmse_stress") is None for entry in evaluations)
+    if loss_name == "likelihood_huber":
+        loss_term_logs = sorted(tmp_path.glob("cluster_records_run-*_loss_terms.jsonl"))
+        assert len(loss_term_logs) == 1
+        _check_likelihood_loss_terms(loss_term_logs[0])
+
+
+def _check_likelihood_loss_terms(path: Path) -> None:
+    """In-place monomers carry absolute terms, there are no interaction terms, and both
+    stages keep the configured weights."""
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    kinds = {record["record"] for record in records}
+    assert kinds == {"run_start", "term_summary", "gradient_probe", "stage_switch"}
+    assert records[0]["term_names"] == [
+        "frame_energy",
+        "frame_forces",
+        "monomer_energy",
+        "monomer_forces",
+        "in_place_monomer_energy",
+        "in_place_monomer_forces",
+    ]
+    switch = next(record for record in records if record["record"] == "stage_switch")
+    assert switch["old_weights"] == switch["new_weights"]
+    assert switch["new_weights"]["in_place_monomer_energy"] == 50.0
+    train_summary = next(
+        record for record in records if record["record"] == "term_summary" and record["split"] == "train"
+    )
+    terms = train_summary["terms"]
+    # every frame holds two waters, each also an in-place monomer at the same atoms
+    assert terms["in_place_monomer_energy"]["entry_count"] == 2 * terms["frame_energy"]["entry_count"]
+    assert terms["in_place_monomer_forces"]["entry_count"] == terms["frame_forces"]["entry_count"]
+    assert sum(term["share_of_total"] for term in terms.values()) == pytest.approx(1.0)
+    probe = next(record for record in records if record["record"] == "gradient_probe")
+    assert probe["gradient_norms"]["in_place_monomer_forces"] > 0.0
+    assert "frame_forces_vs_in_place_monomer_forces" in probe["cosine_similarities"]

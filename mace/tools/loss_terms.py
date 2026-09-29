@@ -56,6 +56,8 @@ COSINE_PAIRS: Tuple[Tuple[str, str], ...] = (
     ("frame_forces", "interaction_forces"),
     ("frame_energy", "monomer_energy"),
     ("frame_forces", "monomer_forces"),
+    ("frame_energy", "in_place_monomer_energy"),
+    ("frame_forces", "in_place_monomer_forces"),
 )
 
 

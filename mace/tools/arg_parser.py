@@ -787,6 +787,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "universal",
             "interaction_universal",
             "interaction_huber",
+            "likelihood_huber",
             "energy_forces_dipole",
             "l1l2energyforces",
         ],
@@ -911,25 +912,25 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--huber_delta_frame_energy",
-        help="Huber threshold of the frame energy term (loss interaction_huber)",
+        help="Huber threshold of the frame energy term (losses interaction_huber, likelihood_huber)",
         type=float,
         default=0.01,
     )
     parser.add_argument(
         "--huber_delta_frame_forces",
-        help="Huber threshold of the frame forces term (loss interaction_huber)",
+        help="Huber threshold of the frame forces term (losses interaction_huber, likelihood_huber)",
         type=float,
         default=0.01,
     )
     parser.add_argument(
         "--huber_delta_monomer_energy",
-        help="Huber threshold of the monomer energy term (loss interaction_huber)",
+        help="Huber threshold of the monomer energy term (loss interaction_huber; likelihood_huber: standalone and in-place monomers)",
         type=float,
         default=0.01,
     )
     parser.add_argument(
         "--huber_delta_monomer_forces",
-        help="Huber threshold of the monomer forces term (loss interaction_huber)",
+        help="Huber threshold of the monomer forces term (loss interaction_huber; likelihood_huber: standalone and in-place monomers)",
         type=float,
         default=0.01,
     )

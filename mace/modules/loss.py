@@ -773,32 +773,37 @@ class InteractionUniversalLoss(UniversalLoss):
 
 @dataclass
 class LossTermStatistics:
-    """Components of one :class:`InteractionHuberLoss` term from its last forward pass.
+    """Components of one per-term loss term (:class:`InteractionHuberLoss`,
+    :class:`LikelihoodHuberLoss`) from its last forward pass.
 
     All tensors are detached scalars on the batch device. ``entry_count`` and
-    ``linear_count`` are floats so they can be accumulated alongside the sums."""
+    ``linear_count`` are floats so they can be accumulated alongside the sums. The term's
+    value is always ``weight * unweighted_mean``; ``unweighted_mean`` is its weighted Huber
+    sum divided by the loss's normalizer: the term's own ``weight_sum`` in
+    :class:`InteractionHuberLoss`, the batch's observation count (shared by all terms) in
+    :class:`LikelihoodHuberLoss`."""
 
     weight: torch.Tensor  # the global term weight used in this forward pass
-    unweighted_mean: torch.Tensor  # sum(w_i * loss_i) / sum(w_i), 0 without entries
+    unweighted_mean: torch.Tensor  # sum(w_i * loss_i) / normalizer, 0 without entries
     weighted_sum: torch.Tensor  # sum(w_i * loss_i)
     weight_sum: torch.Tensor  # sum(w_i) over entries with w_i > 0
     entry_count: torch.Tensor  # number of entries with w_i > 0
     linear_count: torch.Tensor  # those entries whose |error| exceeds their Huber threshold
 
 
-def weighted_huber_term(
+def huber_sum_term(
     ref_values: torch.Tensor,
     pred_values: torch.Tensor,
     entry_weights: torch.Tensor,
     thresholds: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Weighted mean of element-wise Huber losses over the entries with a positive weight.
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Weighted sum of element-wise Huber losses over the entries with a positive weight.
 
     ``entry_weights`` and ``thresholds`` broadcast against the values; the weights sit
-    outside the Huber function. Entries with weight <= 0 neither contribute nor dilute.
-    Returns ``(mean, weighted_sum, weight_sum, entry_count, linear_count)``; the mean keeps
-    the autograd graph (it is exactly zero, and still connected, without entries), the
-    others are detached."""
+    outside the Huber function. Entries with weight <= 0 are excluded. Returns
+    ``(weighted_sum, weight_sum, entry_count, linear_count)``; the sum keeps the autograd
+    graph (it is exactly zero, and still connected, without entries), the others are
+    detached."""
     absolute_errors = (pred_values - ref_values).abs()
     per_entry_loss = huber_elementwise(ref_values, pred_values, thresholds)
     entry_weights = entry_weights.expand_as(per_entry_loss)
@@ -809,21 +814,39 @@ def weighted_huber_term(
     weight_sum = torch.where(
         included, entry_weights, torch.zeros_like(entry_weights)
     ).sum()
-    safe_weight_sum = torch.where(
-        weight_sum > 0, weight_sum, torch.ones_like(weight_sum)
-    )
-    mean = weighted_sum / safe_weight_sum
     entry_count = included.sum().to(per_entry_loss.dtype)
     linear_count = (
         (included & (absolute_errors > thresholds)).sum().to(per_entry_loss.dtype)
     )
     return (
-        mean,
-        weighted_sum.detach(),
+        weighted_sum,
         weight_sum.detach(),
         entry_count.detach(),
         linear_count.detach(),
     )
+
+
+def _safe_normalizer(normalizer: torch.Tensor) -> torch.Tensor:
+    """``normalizer`` where positive, else 1 (an empty term stays exactly zero)."""
+    return torch.where(normalizer > 0, normalizer, torch.ones_like(normalizer))
+
+
+def weighted_huber_term(
+    ref_values: torch.Tensor,
+    pred_values: torch.Tensor,
+    entry_weights: torch.Tensor,
+    thresholds: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Weighted mean of element-wise Huber losses over the entries with a positive weight.
+
+    See :func:`huber_sum_term`; entries with weight <= 0 neither contribute nor dilute.
+    Returns ``(mean, weighted_sum, weight_sum, entry_count, linear_count)``; the mean keeps
+    the autograd graph, the others are detached."""
+    weighted_sum, weight_sum, entry_count, linear_count = huber_sum_term(
+        ref_values, pred_values, entry_weights, thresholds
+    )
+    mean = weighted_sum / _safe_normalizer(weight_sum)
+    return mean, weighted_sum.detach(), weight_sum, entry_count, linear_count
 
 
 class InteractionHuberLoss(torch.nn.Module):
@@ -1042,3 +1065,189 @@ class InteractionHuberLoss(torch.nn.Module):
             f"huber_delta_{name}={delta:g}" for name, delta in self.huber_deltas.items()
         )
         return f"{self.__class__.__name__}({weights}, {thresholds})"
+
+
+class LikelihoodHuberLoss(torch.nn.Module):
+    """A Huber likelihood over every calculation in the batch, one weight per label kind.
+
+    Every configuration is one independent DFT calculation with an energy and forces, and
+    each contributes on its own::
+
+        L = [ energy_weight * sum_c u_c huber(dE_c / n_c)
+              + forces_weight * sum_{c,a,k} v_c huber(dF_cak) ] / N
+
+    with ``u_c = weight * energy_weight`` and ``v_c = weight * forces_weight`` of
+    configuration ``c`` (the dataset's per-configuration weights), the per-atom energy
+    residual ``dE_c / n_c``, and ``N`` the batch's weighted observation count: the sum of
+    ``u_c`` over all energy entries plus the sum of ``v_c`` over all force components. One
+    normalizer shared by every term keeps the ratio between entries that of the
+    likelihood: an entry counts as often as it is present (duplicating it doubles its
+    contribution), a frame with 20 molecules contributes one frame energy and 20 monomer
+    energies, and every atom of a record enters the force sum twice (frame and in-place
+    monomer). With ``energy_weight = c / sigma_E^2`` and ``forces_weight = c / sigma_F^2``
+    the loss is ``c`` times the Huber negative log-likelihood per observation.
+
+    ======================== ===================================================
+    term                     entries
+    ======================== ===================================================
+    frame_energy             periodic configurations, sign +1 (per atom)
+    frame_forces             force components of their atoms
+    monomer_energy           aperiodic configurations, sign +1 (standalone)
+    monomer_forces           force components of their atoms
+    in_place_monomer_energy  configurations with sign -1 (per atom)
+    in_place_monomer_forces  force components of their atoms
+    ======================== ===================================================
+
+    The terms only split the two sums by kind of calculation for the loss-term log; all
+    energy terms share ``energy_weight`` and all force terms ``forces_weight``. There are
+    no interaction terms: ``E_int`` and ``F_int`` are linear combinations of the absolute
+    labels above. Batches without ``sign`` (extxyz) count every configuration as +1.
+    Frames use the frame Huber thresholds, standalone and in-place monomers the monomer
+    thresholds; forces use the magnitude-dependent thresholds of
+    :func:`conditional_huber_forces`. There is no stress term: neither ``ref["stress"]``
+    nor ``pred["stress"]`` is read.
+
+    Every forward pass stores the detached components of each term in
+    ``last_statistics`` (``unweighted_mean`` = weighted Huber sum / ``N``) and ``N`` in
+    ``last_observation_count``.
+    """
+
+    term_names: Tuple[str, ...] = (
+        "frame_energy",
+        "frame_forces",
+        "monomer_energy",
+        "monomer_forces",
+        "in_place_monomer_energy",
+        "in_place_monomer_forces",
+    )
+    # the calculations each term covers, and its label kind
+    _term_layout: Dict[str, Tuple[str, str]] = {
+        "frame_energy": ("frame", "energy"),
+        "frame_forces": ("frame", "forces"),
+        "monomer_energy": ("monomer", "energy"),
+        "monomer_forces": ("monomer", "forces"),
+        "in_place_monomer_energy": ("in_place_monomer", "energy"),
+        "in_place_monomer_forces": ("in_place_monomer", "forces"),
+    }
+
+    def __init__(
+        self,
+        energy_weight=1.0,
+        forces_weight=1.0,
+        huber_delta_frame_energy=0.01,
+        huber_delta_frame_forces=0.01,
+        huber_delta_monomer_energy=0.01,
+        huber_delta_monomer_forces=0.01,
+    ) -> None:
+        super().__init__()
+        self.register_buffer(
+            "energy_weight", torch.tensor(energy_weight, dtype=torch.get_default_dtype())
+        )
+        self.register_buffer(
+            "forces_weight", torch.tensor(forces_weight, dtype=torch.get_default_dtype())
+        )
+        self.huber_deltas: Dict[str, float] = {
+            "frame_energy": float(huber_delta_frame_energy),
+            "frame_forces": float(huber_delta_frame_forces),
+            "monomer_energy": float(huber_delta_monomer_energy),
+            "monomer_forces": float(huber_delta_monomer_forces),
+        }
+        self.last_statistics: Dict[str, LossTermStatistics] = {}
+        self.last_observation_count: Optional[torch.Tensor] = None
+
+    def _kind_weight(self, label_kind: str) -> torch.Tensor:
+        return self.energy_weight if label_kind == "energy" else self.forces_weight
+
+    def term_weights(self) -> Dict[str, float]:
+        return {
+            name: float(self._kind_weight(label_kind))
+            for name, (_, label_kind) in self._term_layout.items()
+        }
+
+    def _huber_delta(self, calculation: str, label_kind: str) -> float:
+        threshold_group = "frame" if calculation == "frame" else "monomer"
+        return self.huber_deltas[f"{threshold_group}_{label_kind}"]
+
+    @staticmethod
+    def _calculation_masks(ref: Batch) -> Dict[str, torch.Tensor]:
+        periodic = ref.pbc.any(dim=-1)  # [n_graphs]
+        sign = getattr(ref, "sign", None)
+        if sign is None:
+            positive = torch.ones_like(periodic, dtype=torch.bool)
+        else:
+            positive = sign > 0
+        return {
+            "frame": periodic & positive,
+            "monomer": ~periodic & positive,
+            "in_place_monomer": ~positive,
+        }
+
+    def compute_terms(self, ref: Batch, pred: TensorDict) -> Dict[str, torch.Tensor]:
+        """The six weighted terms (with autograd graph); fills ``last_statistics``."""
+        dtype = pred["energy"].dtype
+        num_atoms = (ref.ptr[1:] - ref.ptr[:-1]).to(dtype)
+        masks = self._calculation_masks(ref)
+        sums = {}
+        for name, (calculation, label_kind) in self._term_layout.items():
+            selected = masks[calculation].to(dtype)
+            delta = self._huber_delta(calculation, label_kind)
+            if label_kind == "energy":
+                sums[name] = huber_sum_term(
+                    ref["energy"] / num_atoms,
+                    pred["energy"] / num_atoms,
+                    ref.weight * ref.energy_weight * selected,
+                    torch.full_like(pred["energy"], delta),
+                )
+            else:
+                atom_weights = (ref.weight * ref.forces_weight * selected)[ref.batch]
+                sums[name] = huber_sum_term(
+                    ref["forces"],
+                    pred["forces"],
+                    atom_weights.unsqueeze(-1),
+                    conditional_huber_force_thresholds(ref["forces"], delta).unsqueeze(-1),
+                )
+        observation_count = torch.stack(
+            [weight_sum for _, weight_sum, _, _ in sums.values()]
+        ).sum()
+        normalizer = _safe_normalizer(observation_count)
+
+        terms: Dict[str, torch.Tensor] = {}
+        statistics: Dict[str, LossTermStatistics] = {}
+        for name, (weighted_sum, weight_sum, entry_count, linear_count) in sums.items():
+            _, label_kind = self._term_layout[name]
+            weight = self._kind_weight(label_kind).to(
+                device=weighted_sum.device, dtype=dtype
+            )
+            normalized = weighted_sum / normalizer
+            terms[name] = weight * normalized
+            statistics[name] = LossTermStatistics(
+                weight=weight.detach(),
+                unweighted_mean=normalized.detach(),
+                weighted_sum=weighted_sum.detach(),
+                weight_sum=weight_sum,
+                entry_count=entry_count,
+                linear_count=linear_count,
+            )
+        self.last_statistics = statistics
+        self.last_observation_count = observation_count
+        return terms
+
+    def forward(
+        self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
+    ) -> torch.Tensor:
+        ddp = is_ddp_enabled() if ddp is None else ddp
+        if ddp:
+            raise NotImplementedError(
+                "LikelihoodHuberLoss does not support distributed training: its "
+                "observation count would need a global reduction"
+            )
+        return torch.stack(list(self.compute_terms(ref, pred).values())).sum()
+
+    def __repr__(self):
+        thresholds = ", ".join(
+            f"huber_delta_{name}={delta:g}" for name, delta in self.huber_deltas.items()
+        )
+        return (
+            f"{self.__class__.__name__}(energy_weight={float(self.energy_weight):.3f}, "
+            f"forces_weight={float(self.forces_weight):.3f}, {thresholds})"
+        )
