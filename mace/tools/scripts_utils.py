@@ -1028,6 +1028,7 @@ def get_params_options(
             lr_params_factors["embedding_lr_factor"] = 0.0
             freeze_module(model.node_embedding, True)
 
+    frozen_parameter_ids = set()
     for submodule_name in getattr(args, "freeze_modules", None) or []:
         submodule = getattr(model, submodule_name, None)
         if not isinstance(submodule, torch.nn.Module):
@@ -1041,6 +1042,7 @@ def get_params_options(
                 f"freeze_modules: submodule {submodule_name!r} has no parameters"
             )
         freeze_module(submodule, True)
+        frozen_parameter_ids.update(id(parameter) for parameter in submodule.parameters())
         logging.info(f"Freezing {submodule_name} ({parameter_count} parameters)")
 
     param_options = dict(
@@ -1102,9 +1104,11 @@ def get_params_options(
         submodule = getattr(model, submodule_name, None)
         if submodule is None:
             continue
-        # Frozen submodules (freeze_modules) are left out of the optimizer entirely.
+        # Submodules frozen by freeze_modules are left out of the optimizer entirely.
         submodule_parameters = [
-            parameter for parameter in submodule.parameters() if parameter.requires_grad
+            parameter
+            for parameter in submodule.parameters()
+            if id(parameter) not in frozen_parameter_ids
         ]
         if not submodule_parameters:
             continue
