@@ -1133,6 +1133,11 @@ def run(args) -> None:
         loss_term_instrumentation=loss_term_instrumentation,
         selection_loss_fn=selection_loss_fn,
         best_checkpoint_handler=best_checkpoint_handler,
+        lowest_selection_loss=(
+            tools.logged_best_selection_loss(logger.path)
+            if args.restart_latest
+            else float("inf")
+        ),
     )
 
     logging.info("")
