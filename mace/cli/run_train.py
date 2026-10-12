@@ -70,6 +70,7 @@ from mace.tools.scripts_utils import (
     get_loss_fn,
     get_optimizer,
     get_params_options,
+    get_selection_loss_fn,
     get_swa,
     print_git_commit,
     remove_pt_head,
@@ -894,10 +895,10 @@ def run(args) -> None:
     model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
     model.to(device)
     loss_fn.to(device)  # the term weights are buffers
-    # The fixed criterion for the best model of the whole run: the stage-one loss, kept as a
-    # separate copy so stage two's reweighting and the loss-term instrumentation of `loss_fn`
-    # never touch it.
-    selection_loss_fn = deepcopy(loss_fn)
+    # The fixed criterion for the best model of the whole run (frame energy and forces at the
+    # stage-two weights for interaction_huber), a separate module so stage two's reweighting
+    # and the loss-term instrumentation of `loss_fn` never touch it.
+    selection_loss_fn = get_selection_loss_fn(args, loss_fn).to(device)
 
     if args.lora:
         lora_rank = args.lora_rank
@@ -1128,9 +1129,11 @@ def run(args) -> None:
         loss_term_instrumentation=loss_term_instrumentation,
         selection_loss_fn=selection_loss_fn,
         best_checkpoint_handler=best_checkpoint_handler,
+        # Resume the run-level best only when a checkpoint was actually restored: a fresh
+        # start under --restart_latest must not inherit a stale results file's best value.
         lowest_selection_loss=(
             tools.logged_best_selection_loss(logger.path)
-            if args.restart_latest
+            if opt_start_epoch is not None
             else float("inf")
         ),
     )
@@ -1222,14 +1225,22 @@ def run(args) -> None:
         else ("Stage one", checkpoint_handler, False, "")
         for swa_eval in swas
     ] + [("Best", best_checkpoint_handler, False, "_best")]
+    stage_checkpoint_epochs = []
     for export_label, export_handler, swa_eval, model_suffix in model_exports:
         epoch = export_handler.load_latest(
             state=tools.CheckpointState(model, optimizer, lr_scheduler),
             swa=swa_eval,
             device=device,
         )
-        if epoch is None and export_handler is best_checkpoint_handler:
-            # Only a selection loss that was never finite leaves no best checkpoint.
+        if export_handler is not best_checkpoint_handler:
+            stage_checkpoint_epochs.append(epoch)
+        elif epoch is None:
+            if all(stage_epoch is None for stage_epoch in stage_checkpoint_epochs):
+                # Nothing was trained (e.g. --max_num_epochs=0): there is no best model.
+                logging.info("No checkpoint was written in this run: no Best model to export")
+                continue
+            # Stage checkpoints exist, so validation ran: only a selection loss that was
+            # never finite leaves no best checkpoint.
             raise RuntimeError(
                 "No best-model checkpoint was written: the fixed-weight validation loss "
                 "never became finite"

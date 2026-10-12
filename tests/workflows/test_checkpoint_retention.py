@@ -7,7 +7,8 @@ the flags reach it, and the two flags reach it differently. `--keep_checkpoints`
 sets `keep` on the handler once; `--save_all_checkpoints` leaves `keep` alone and
 instead saves again at every evaluation with `keep_last=True`.
 
-So a run with neither leaves one checkpoint, and a run with either leaves one per
+So a run with neither leaves one checkpoint per handler (the training checkpoint
+and the run-level best, ``*_best_epoch-*.pt``), and a run with either leaves one per
 evaluation. Getting that backwards either fills a disk or throws away the history
 a restart needs, and a training run reports neither.
 """
@@ -44,13 +45,19 @@ def train(tmp_path, name, **extra):
     params.update(extra)
     result = run_mace_train(params)
     assert result.returncode == 0
-    return sorted(p.name for p in checkpoints.glob("*.pt"))
+    return sorted(p.name for p in checkpoints.glob("*.pt") if "_best_epoch-" not in p.name)
+
+
+def best_checkpoints(tmp_path, name):
+    return sorted(p.name for p in (tmp_path / f"ckpt_{name}").glob("*_best_epoch-*.pt"))
 
 
 def test_a_plain_run_leaves_one_checkpoint(tmp_path):
     kept = train(tmp_path, "plain")
 
     assert len(kept) == 1, kept
+    best = best_checkpoints(tmp_path, "plain")
+    assert len(best) == 1, best
 
 
 def test_save_all_checkpoints_leaves_one_per_evaluation(tmp_path):
