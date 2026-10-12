@@ -899,6 +899,10 @@ def run(args) -> None:
     model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
     model.to(device)
     loss_fn.to(device)  # the term weights are buffers
+    # The fixed criterion for the best model of the whole run: the stage-one loss, kept as a
+    # separate copy so stage two's reweighting and the loss-term instrumentation of `loss_fn`
+    # never touch it.
+    selection_loss_fn = deepcopy(loss_fn)
 
     if args.lora:
         lora_rank = args.lora_rank
@@ -1000,6 +1004,11 @@ def run(args) -> None:
         tag=tag,
         keep=args.keep_checkpoints,
         swa_start=args.start_swa,
+    )
+    best_checkpoint_handler = tools.CheckpointHandler(
+        directory=args.checkpoints_dir,
+        tag=tag + "_best",
+        keep=args.keep_checkpoints,
     )
 
     start_epoch = 0
@@ -1122,6 +1131,8 @@ def run(args) -> None:
         data_aug_magmom=args.data_aug_magmom,
         data_aug_magmom_mode=getattr(args, "data_aug_magmom_mode", "non-soc"),
         loss_term_instrumentation=loss_term_instrumentation,
+        selection_loss_fn=selection_loss_fn,
+        best_checkpoint_handler=best_checkpoint_handler,
     )
 
     logging.info("")
@@ -1204,12 +1215,26 @@ def run(args) -> None:
         if stop_first_test:
             break
 
-    for swa_eval in swas:
-        epoch = checkpoint_handler.load_latest(
+    # (label, checkpoint handler, stage-two checkpoint, file suffix): the best model of each
+    # stage by its own loss, then the best model of the whole run by the fixed selection loss.
+    model_exports = [
+        ("Stage two", checkpoint_handler, True, "_stagetwo")
+        if swa_eval
+        else ("Stage one", checkpoint_handler, False, "")
+        for swa_eval in swas
+    ] + [("Best", best_checkpoint_handler, False, "_best")]
+    for export_label, export_handler, swa_eval, model_suffix in model_exports:
+        epoch = export_handler.load_latest(
             state=tools.CheckpointState(model, optimizer, lr_scheduler),
             swa=swa_eval,
             device=device,
         )
+        if epoch is None and export_handler is best_checkpoint_handler:
+            # Only a selection loss that was never finite leaves no best checkpoint.
+            raise RuntimeError(
+                "No best-model checkpoint was written: the fixed-weight validation loss "
+                "never became finite"
+            )
         model.to(device)
         if args.distributed:
             # re-enable gradients for distributed model for evaluation of stage-two model
@@ -1227,17 +1252,11 @@ def run(args) -> None:
                 device_ids = None
             distributed_model = DDP(model, device_ids=device_ids)
         model_to_evaluate = model if not args.distributed else distributed_model
-        if swa_eval:
-            logging.info(f"Loaded Stage two model from epoch {epoch} for evaluation")
-        else:
-            logging.info(f"Loaded Stage one model from epoch {epoch} for evaluation")
+        logging.info(f"Loaded {export_label} model from epoch {epoch} for evaluation")
 
         if rank == 0:
             # Save entire model
-            if swa_eval:
-                model_path = Path(args.checkpoints_dir) / (tag + "_stagetwo.model")
-            else:
-                model_path = Path(args.checkpoints_dir) / (tag + ".model")
+            model_path = Path(args.checkpoints_dir) / (tag + model_suffix + ".model")
             logging.info(f"Saving model to {model_path}")
             model_to_save = deepcopy(model)
             if args.lora:
@@ -1259,52 +1278,29 @@ def run(args) -> None:
                 ),
             }
             os.makedirs(args.model_dir, exist_ok=True)
-            if swa_eval:
-                torch.save(
-                    model_to_save, Path(args.model_dir) / (args.name + "_stagetwo.model")
+            torch.save(
+                model_to_save, Path(args.model_dir) / (args.name + model_suffix + ".model")
+            )
+            # Outside the try: under -W error this warning is an
+            # exception, and the handler below reports anything it catches
+            # as a compile failure, which would lose the artifact.
+            deprecation.warn("lammps.compiled_side_artifact")
+            try:
+                path_complied = Path(args.model_dir) / (
+                    args.name + model_suffix + "_compiled.model"
                 )
-                # Outside the try: under -W error this warning is an
-                # exception, and the handler below reports anything it catches
-                # as a compile failure, which would lose the artifact.
-                deprecation.warn("lammps.compiled_side_artifact")
-                try:
-                    path_complied = Path(args.model_dir) / (
-                        args.name + "_stagetwo_compiled.model"
-                    )
-                    logging.info(f"Compiling model, saving metadata {path_complied}")
-                    model_compiled = jit.compile(deepcopy(model_to_save))
-                    torch.jit.save(
-                        model_compiled,
-                        path_complied,
-                        _extra_files=extra_files,
-                    )
-                except Exception as e:  # pylint: disable=W0718
-                    logging.warning(
-                        f"Compiling the model failed, so {path_complied.name} "
-                        f"was not written: {e}"
-                    )
-            else:
-                torch.save(model_to_save, Path(args.model_dir) / (args.name + ".model"))
-                # Outside the try: under -W error this warning is an
-                # exception, and the handler below reports anything it catches
-                # as a compile failure, which would lose the artifact.
-                deprecation.warn("lammps.compiled_side_artifact")
-                try:
-                    path_complied = Path(args.model_dir) / (
-                        args.name + "_compiled.model"
-                    )
-                    logging.info(f"Compiling model, saving metadata to {path_complied}")
-                    model_compiled = jit.compile(deepcopy(model_to_save))
-                    torch.jit.save(
-                        model_compiled,
-                        path_complied,
-                        _extra_files=extra_files,
-                    )
-                except Exception as e:  # pylint: disable=W0718
-                    logging.warning(
-                        f"Compiling the model failed, so {path_complied.name} "
-                        f"was not written: {e}"
-                    )
+                logging.info(f"Compiling model, saving metadata to {path_complied}")
+                model_compiled = jit.compile(deepcopy(model_to_save))
+                torch.jit.save(
+                    model_compiled,
+                    path_complied,
+                    _extra_files=extra_files,
+                )
+            except Exception as e:  # pylint: disable=W0718
+                logging.warning(
+                    f"Compiling the model failed, so {path_complied.name} "
+                    f"was not written: {e}"
+                )
 
         logging.info("Computing metrics for training, validation, and test sets")
         for param in model.parameters():

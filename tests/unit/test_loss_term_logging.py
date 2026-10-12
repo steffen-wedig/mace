@@ -498,7 +498,11 @@ def build_loaders():
 
 
 def run_training(
-    tmp_path, instrumentation_interval, max_num_epochs=3, loss_factory=FakeTermLoss
+    tmp_path,
+    instrumentation_interval,
+    max_num_epochs=3,
+    loss_factory=FakeTermLoss,
+    select_best=False,
 ):
     """Two optimizer steps per epoch; stage two from epoch 1."""
     model = build_model()
@@ -544,6 +548,14 @@ def run_training(
         log_errors="PerAtomRMSE",
         swa=swa,
         loss_term_instrumentation=instrumentation,
+        selection_loss_fn=loss_factory(STAGE_ONE_WEIGHTS) if select_best else None,
+        best_checkpoint_handler=(
+            tools.CheckpointHandler(
+                directory=str(tmp_path / "checkpoints"), tag="tiny_run_best"
+            )
+            if select_best
+            else None
+        ),
     )
     return model
 
@@ -692,3 +704,58 @@ def test_training_with_the_interaction_huber_loss(tmp_path, float64):  # pylint:
     assert probe["gradient_norms"]["monomer_forces"] > 0.0
     assert probe["gradient_norms"]["frame_energy"] == 0.0
     assert probe["cosine_similarities"]["frame_forces_vs_monomer_forces"] is None
+
+
+def read_results(tmp_path):
+    path = tmp_path / "results" / "tiny_run_train.txt"
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def test_best_model_is_selected_by_the_fixed_loss_across_both_stages(tmp_path, float64):  # pylint: disable=unused-argument
+    run_training(tmp_path, instrumentation_interval=None, max_num_epochs=4, select_best=True)
+    entries = read_results(tmp_path)
+    evaluations = [
+        entry for entry in entries if entry["mode"] == "eval" and entry["epoch"] is not None
+    ]
+    # Stage one (epoch 0) trains on the selection loss itself; stage two reweights.
+    assert evaluations[0]["selection_loss"] == pytest.approx(evaluations[0]["loss"])
+    assert any(
+        entry["selection_loss"] != pytest.approx(entry["loss"]) for entry in evaluations[1:]
+    )
+    best_entries = [entry for entry in entries if entry["mode"] == "best"]
+    best = min(evaluations, key=lambda entry: entry["selection_loss"])
+    assert best_entries[-1]["epoch"] == best["epoch"]
+    assert best_entries[-1]["selection_loss"] == pytest.approx(best["selection_loss"])
+    best_checkpoints = sorted((tmp_path / "checkpoints").glob("tiny_run_best_epoch-*.pt"))
+    assert [path.name for path in best_checkpoints] == [
+        f"tiny_run_best_epoch-{best['epoch']}.pt"
+    ]
+
+
+def test_selection_loss_and_best_handler_come_together(tmp_path, float64):  # pylint: disable=unused-argument
+    model = build_model()
+    train_loader, valid_loaders = build_loaders()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+    with pytest.raises(ValueError, match="must be given together"):
+        train(
+            model=model,
+            loss_fn=FakeTermLoss(STAGE_ONE_WEIGHTS),
+            train_loader=train_loader,
+            valid_loaders=valid_loaders,
+            optimizer=optimizer,
+            lr_scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer),
+            start_epoch=0,
+            max_num_epochs=1,
+            patience=100,
+            checkpoint_handler=tools.CheckpointHandler(
+                directory=str(tmp_path / "checkpoints"), tag="tiny_run"
+            ),
+            logger=tools.MetricsLogger(
+                directory=str(tmp_path / "results"), tag="tiny_run_train"
+            ),
+            eval_interval=1,
+            output_args={"forces": True, "virials": False, "stress": False},
+            device=torch.device("cpu"),
+            log_errors="PerAtomRMSE",
+            selection_loss_fn=FakeTermLoss(STAGE_ONE_WEIGHTS),
+        )

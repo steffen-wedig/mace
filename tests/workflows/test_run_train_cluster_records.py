@@ -99,10 +99,17 @@ def test_run_train_cluster_records(tmp_path: Path, loss_name: str):
 
     assert (tmp_path / "cluster_records.model").is_file()
     assert (tmp_path / "cluster_records_stagetwo.model").is_file()
+    # The best model of the whole run, by the fixed (stage-one) validation loss.
+    assert (tmp_path / "cluster_records_best.model").is_file()
     results = sorted(tmp_path.glob("cluster_records_run-*_train.txt"))
     assert results, "no results file written"
     evaluations = [json.loads(line) for line in results[0].read_text().splitlines() if '"mode": "eval"' in line]
     assert evaluations
+    best_entries = [json.loads(line) for line in results[0].read_text().splitlines() if '"mode": "best"' in line]
+    scored = [entry for entry in evaluations if entry["epoch"] is not None]
+    assert best_entries[-1]["selection_loss"] == pytest.approx(
+        min(entry["selection_loss"] for entry in scored)
+    )
     assert all(np.isfinite(entry["rmse_e_int_per_atom"]) for entry in evaluations)
     assert all(np.isfinite(entry["rmse_f_int"]) for entry in evaluations)
     if loss_name == "interaction_huber":  # no stress term: stress is never computed
