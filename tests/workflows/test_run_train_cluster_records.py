@@ -59,8 +59,7 @@ LOSS_SETTINGS = {
 }
 
 
-@pytest.mark.parametrize("loss_name", sorted(LOSS_SETTINGS))
-def test_run_train_cluster_records(tmp_path: Path, loss_name: str):
+def _cluster_run_params(tmp_path: Path) -> dict:
     train_path = tmp_path / "train.h5"
     valid_path = tmp_path / "valid.h5"
     with h5py.File(train_path, "w") as handle:
@@ -93,13 +92,20 @@ def test_run_train_cluster_records(tmp_path: Path, loss_name: str):
             "default_dtype": "float64",
         }
     )
-    params.update(LOSS_SETTINGS[loss_name])
     params.pop("valid_fraction", None)
+    return params
+
+
+@pytest.mark.parametrize("loss_name", sorted(LOSS_SETTINGS))
+def test_run_train_cluster_records(tmp_path: Path, loss_name: str):
+    params = _cluster_run_params(tmp_path)
+    params.update(LOSS_SETTINGS[loss_name])
     run_mace_train(params, cwd=tmp_path)
 
     assert (tmp_path / "cluster_records.model").is_file()
     assert (tmp_path / "cluster_records_stagetwo.model").is_file()
-    # The best model of the whole run, by the fixed (stage-one) validation loss.
+    # The best model of the whole run, by a fixed validation loss (interaction_huber: frame
+    # energy and forces at the stage-two weights; other losses: the stage-one loss).
     assert (tmp_path / "cluster_records_best.model").is_file()
     results = sorted(tmp_path.glob("cluster_records_run-*_train.txt"))
     assert results, "no results file written"
@@ -115,7 +121,23 @@ def test_run_train_cluster_records(tmp_path: Path, loss_name: str):
     # Frames-only metrics: the periodic frames alone, without the in-place monomers.
     assert all(np.isfinite(entry["rmse_f_frames"]) for entry in evaluations)
     assert all(np.isfinite(entry["rmse_e_per_atom_frames"]) for entry in evaluations)
+    if loss_name == "interaction_huber":
+        log_text = "".join(path.read_text() for path in tmp_path.glob("cluster_records_run-*.log"))
+        assert "Best-model criterion: frame energy (weight 1000.0) and frame forces" in log_text
     if loss_name == "interaction_huber":  # no stress term: stress is never computed
         assert all(entry.get("rmse_stress") is None for entry in evaluations)
     else:
         assert all(np.isfinite(entry["rmse_stress"]) for entry in evaluations)
+
+
+def test_a_fresh_start_ignores_a_stale_logged_best(tmp_path: Path):
+    """`--restart_latest` (set by the base params) with no checkpoint to restore is a fresh
+    start: a best entry left in the results file by an earlier run must not become the value
+    the new run has to beat, or no best model is ever written."""
+    params = _cluster_run_params(tmp_path)
+    params.update(LOSS_SETTINGS["interaction_huber"])
+    assert "restart_latest" in params
+    stale = {"mode": "best", "epoch": 0, "head": "Default", "selection_loss": 0.0}
+    (tmp_path / f"cluster_records_run-{params['seed']}_train.txt").write_text(json.dumps(stale) + "\n")
+    run_mace_train(params, cwd=tmp_path)
+    assert (tmp_path / "cluster_records_best.model").is_file()

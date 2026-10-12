@@ -10,6 +10,7 @@ import dataclasses
 import json
 import logging
 import os
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -799,6 +800,43 @@ def get_interaction_huber_loss(
         monomer_forces_weight=monomer_forces_weight,
         interaction_energy_weight=getattr(args, f"{prefix}interaction_energy_weight"),
         interaction_forces_weight=getattr(args, f"{prefix}interaction_forces_weight"),
+        huber_delta_frame_energy=args.huber_delta_frame_energy,
+        huber_delta_frame_forces=args.huber_delta_frame_forces,
+        huber_delta_monomer_energy=args.huber_delta_monomer_energy,
+        huber_delta_monomer_forces=args.huber_delta_monomer_forces,
+        huber_delta_interaction_energy=args.huber_delta_interaction_energy,
+        huber_delta_interaction_forces=args.huber_delta_interaction_forces,
+    )
+
+
+def get_selection_loss_fn(
+    args: argparse.Namespace, loss_fn: torch.nn.Module
+) -> torch.nn.Module:
+    """The fixed criterion for the best model of the whole run.
+
+    For ``interaction_huber``: the frame energy and frame forces terms only, at the stage-two
+    (``swa_*``) frame weights when the run has a stage two, else at the stage-one frame
+    weights. Monomer and interaction terms get weight 0, so every loss arm is selected by the
+    same quantity. For any other loss: a copy of the stage-one loss."""
+    if args.loss != "interaction_huber":
+        return deepcopy(loss_fn)
+    prefix = "swa_" if args.swa else ""
+    energy_weight = getattr(args, f"{prefix}energy_weight")
+    forces_weight = getattr(args, f"{prefix}forces_weight")
+    logging.info(
+        "Best-model criterion: frame energy (weight %s) and frame forces (weight %s), "
+        "%s weights; monomer and interaction terms excluded",
+        energy_weight,
+        forces_weight,
+        "stage-two" if args.swa else "stage-one",
+    )
+    return modules.InteractionHuberLoss(
+        energy_weight=energy_weight,
+        forces_weight=forces_weight,
+        monomer_energy_weight=0.0,
+        monomer_forces_weight=0.0,
+        interaction_energy_weight=0.0,
+        interaction_forces_weight=0.0,
         huber_delta_frame_energy=args.huber_delta_frame_energy,
         huber_delta_frame_forces=args.huber_delta_frame_forces,
         huber_delta_monomer_energy=args.huber_delta_monomer_energy,

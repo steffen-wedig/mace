@@ -586,3 +586,77 @@ def test_both_stage_factories_build_the_loss():
     for loss_fn in (stage_one, stage_two):
         assert loss_fn.huber_deltas["interaction_energy"] == 0.04
         assert loss_fn.huber_deltas["frame_energy"] == 0.01
+
+
+def _selection_args(*extra: str):
+    from mace.tools.arg_parser import build_default_arg_parser  # pylint: disable=import-outside-toplevel
+
+    return build_default_arg_parser().parse_args(
+        [
+            "--name",
+            "selection_loss",
+            "--energy_weight",
+            "1.0",
+            "--forces_weight",
+            "100.0",
+            "--swa_energy_weight",
+            "1000.0",
+            "--swa_forces_weight",
+            "50.0",
+            "--interaction_energy_weight",
+            "1.0",
+            "--interaction_forces_weight",
+            "100.0",
+            "--huber_delta_frame_forces",
+            "0.02",
+            *extra,
+        ]
+    )
+
+
+def test_selection_loss_scores_frames_at_stage_two_weights(tmp_path):
+    from mace.tools.scripts_utils import get_loss_fn, get_selection_loss_fn  # pylint: disable=import-outside-toplevel
+
+    args = _selection_args("--loss", "interaction_huber", "--swa")
+    training_loss = get_loss_fn(args, dipole_only=False, compute_dipole=False)
+    selection_loss = get_selection_loss_fn(args, training_loss)
+    assert selection_loss.term_weights() == {
+        "frame_energy": 1000.0,
+        "frame_forces": 50.0,
+        "monomer_energy": 0.0,
+        "monomer_forces": 0.0,
+        "interaction_energy": 0.0,
+        "interaction_forces": 0.0,
+    }
+    assert selection_loss.huber_deltas == training_loss.huber_deltas
+    assert selection_loss.huber_deltas["frame_forces"] == 0.02
+
+    # the value is the frame terms alone, whatever the batch also holds
+    records = _cluster_records()
+    batch = _cluster_batch(tmp_path, records)
+    reference = _loss(**{name: 1.0 for name in TERM_NAMES})
+    reference.huber_deltas = dict(selection_loss.huber_deltas)
+    unit_terms = reference.compute_terms(batch, _prediction(records))
+    expected = 1000.0 * unit_terms["frame_energy"] + 50.0 * unit_terms["frame_forces"]
+    assert float(selection_loss(batch, _prediction(records))) == pytest.approx(float(expected), rel=1e-12)
+
+
+def test_selection_loss_without_stage_two_uses_the_stage_one_frame_weights():
+    from mace.tools.scripts_utils import get_loss_fn, get_selection_loss_fn  # pylint: disable=import-outside-toplevel
+
+    args = _selection_args("--loss", "interaction_huber")
+    selection_loss = get_selection_loss_fn(args, get_loss_fn(args, dipole_only=False, compute_dipole=False))
+    weights = selection_loss.term_weights()
+    assert (weights["frame_energy"], weights["frame_forces"]) == (1.0, 100.0)
+    assert weights["interaction_forces"] == 0.0
+
+
+def test_selection_loss_of_other_losses_is_a_copy_of_the_stage_one_loss():
+    from mace.tools.scripts_utils import get_loss_fn, get_selection_loss_fn  # pylint: disable=import-outside-toplevel
+
+    args = _selection_args("--loss", "weighted", "--swa")
+    training_loss = get_loss_fn(args, dipole_only=False, compute_dipole=False)
+    selection_loss = get_selection_loss_fn(args, training_loss)
+    assert selection_loss is not training_loss
+    assert type(selection_loss) is type(training_loss)
+    assert float(selection_loss.energy_weight) == float(training_loss.energy_weight) == 1.0
