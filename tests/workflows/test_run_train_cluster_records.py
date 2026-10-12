@@ -112,6 +112,9 @@ def test_run_train_cluster_records(tmp_path: Path, loss_name: str):
     )
     assert all(np.isfinite(entry["rmse_e_int_per_atom"]) for entry in evaluations)
     assert all(np.isfinite(entry["rmse_f_int"]) for entry in evaluations)
+    # Frames-only metrics: the periodic frames alone, without the in-place monomers.
+    assert all(np.isfinite(entry["rmse_f_frames"]) for entry in evaluations)
+    assert all(np.isfinite(entry["rmse_e_per_atom_frames"]) for entry in evaluations)
     if loss_name == "interaction_huber":  # no stress term: stress is never computed
         assert all(entry.get("rmse_stress") is None for entry in evaluations)
     else:

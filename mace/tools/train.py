@@ -5,7 +5,9 @@
 ###########################################################################################
 
 import dataclasses
+import json
 import logging
+import os
 import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -58,6 +60,38 @@ class SWAContainer:
     loss_fn: torch.nn.Module
 
 
+def logged_best_selection_loss(results_path: str) -> float:
+    """Lowest selection loss of the `mode: "best"` entries in a results file (inf if none).
+
+    A resumed run appends to the same results file, so this restores the run-level best
+    tracker; without it a resumed run could overwrite a better `_best` checkpoint.
+    """
+    if not os.path.isfile(results_path):
+        return np.inf
+    lowest = np.inf
+    with open(results_path, encoding="utf-8") as results_file:
+        for line in results_file:
+            if '"mode": "best"' not in line:
+                continue
+            value = json.loads(line).get("selection_loss")
+            if value is not None and np.isfinite(value):
+                lowest = min(lowest, float(value))
+    return lowest
+
+
+def periodic_frame_mask(batch) -> torch.Tensor:
+    """[n_graphs] bool: periodic configurations that are frames, not in-place monomers.
+
+    The same split InteractionHuberLoss uses for its frame terms: any periodic direction,
+    and sign +1 when the batch carries cluster-record signs.
+    """
+    periodic = batch.pbc.view(-1, 3).any(dim=-1)
+    sign = getattr(batch, "sign", None)
+    if sign is None:
+        return periodic
+    return periodic & (sign > 0)
+
+
 def valid_err_log(
     valid_loss,
     eval_metrics,
@@ -86,6 +120,11 @@ def valid_err_log(
         msg = f"{inintial_phrase}: head: {valid_loader_name}, loss={valid_loss:8.8f}, RMSE_E_per_atom={error_e:8.2f} meV, RMSE_F={error_f:8.2f} meV / A"
         if eval_metrics["rmse_stress"] is not None:
             msg += f", RMSE_stress={eval_metrics['rmse_stress'] * 1e3:8.2f} meV / A^3"
+        if eval_metrics["rmse_f_frames"] is not None:
+            msg += (
+                f", RMSE_E_per_atom_frames={eval_metrics['rmse_e_per_atom_frames'] * 1e3:8.2f} meV"
+                f", RMSE_F_frames={eval_metrics['rmse_f_frames'] * 1e3:8.2f} meV / A"
+            )
         if eval_metrics["rmse_e_int_per_atom"] is not None:
             msg += f", RMSE_E_int_per_atom={eval_metrics['rmse_e_int_per_atom'] * 1e3:8.2f} meV"
         if eval_metrics["rmse_f_int"] is not None:
@@ -207,6 +246,7 @@ def train(
     loss_term_instrumentation: Optional[LossTermInstrumentation] = None,
     selection_loss_fn: Optional[torch.nn.Module] = None,
     best_checkpoint_handler: Optional[CheckpointHandler] = None,
+    lowest_selection_loss: float = np.inf,
 ):
     """Train `model`; with `best_checkpoint_handler`, also keep the best model of the run.
 
@@ -215,14 +255,14 @@ def train(
     run is selected by `selection_loss_fn` instead: one fixed loss evaluated at every
     validation of both stages (run_train passes a copy of the stage-one loss). Its checkpoint
     is saved through `best_checkpoint_handler`, and each new best writes a `mode: "best"`
-    entry to the results log, so the last such entry describes the best model.
+    entry to the results log, so the last such entry describes the best model. A resumed
+    run passes the best value logged so far as `lowest_selection_loss`.
     """
     if (selection_loss_fn is None) != (best_checkpoint_handler is None):
         raise ValueError(
             "selection_loss_fn and best_checkpoint_handler must be given together"
         )
     lowest_loss = np.inf
-    lowest_selection_loss = np.inf
     valid_loss = np.inf
     patience_counter = 0
     swa_start = True
@@ -779,6 +819,12 @@ class MACELoss(Metric):
         self.add_state("delta_e_int_per_atom", default=[], dist_reduce_fx="cat")
         self.add_state("f_int", default=[], dist_reduce_fx="cat")
         self.add_state("delta_f_int", default=[], dist_reduce_fx="cat")
+        # Periodic frames only (pbc and, on cluster records, sign +1): the configurations
+        # the frame terms of InteractionHuberLoss train on. The plain E/F metrics above also
+        # count in-place monomers, which inherit the frame weights.
+        self.add_state("frames_computed", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("delta_es_per_atom_frames", default=[], dist_reduce_fx="cat")
+        self.add_state("delta_fs_frames", default=[], dist_reduce_fx="cat")
 
     def update(self, batch, output):  # pylint: disable=arguments-differ
         loss = self.loss_fn(pred=output, ref=batch)
@@ -805,6 +851,24 @@ class MACELoss(Metric):
                 batch.forces_weight,
                 spread_atoms=True,
             )
+
+        if (
+            output.get("energy") is not None
+            and output.get("forces") is not None
+            and batch.energy is not None
+            and batch.forces is not None
+            and getattr(batch, "pbc", None) is not None
+        ):
+            frames = periodic_frame_mask(batch)
+            if bool(frames.any()):
+                atoms_per_graph = batch.ptr[1:] - batch.ptr[:-1]
+                self.delta_es_per_atom_frames.append(
+                    ((batch.energy - output["energy"]) / atoms_per_graph)[frames]
+                )
+                self.delta_fs_frames.append(
+                    (batch.forces - output["forces"])[frames[batch.batch]]
+                )
+                self.frames_computed += 1.0
 
         if (
             output.get("energy") is not None
@@ -931,6 +995,13 @@ class MACELoss(Metric):
             aux["rmse_magf"] = compute_rmse(delta_MagFs)
             aux["rel_rmse_magf"] = compute_rel_rmse(delta_MagFs, MagFs)
             aux["q95_magf"] = compute_q95(delta_MagFs)
+        if self.frames_computed:
+            delta_es_per_atom_frames = self.convert(self.delta_es_per_atom_frames)
+            delta_fs_frames = self.convert(self.delta_fs_frames)
+            aux["mae_e_per_atom_frames"] = compute_mae(delta_es_per_atom_frames)
+            aux["rmse_e_per_atom_frames"] = compute_rmse(delta_es_per_atom_frames)
+            aux["mae_f_frames"] = compute_mae(delta_fs_frames)
+            aux["rmse_f_frames"] = compute_rmse(delta_fs_frames)
         if self.interaction_computed:
             delta_e_int_per_atom = self.convert(self.delta_e_int_per_atom)
             f_int = self.convert(self.f_int)

@@ -759,3 +759,112 @@ def test_selection_loss_and_best_handler_come_together(tmp_path, float64):  # py
             log_errors="PerAtomRMSE",
             selection_loss_fn=FakeTermLoss(STAGE_ONE_WEIGHTS),
         )
+
+
+def test_a_resumed_run_does_not_overwrite_a_better_best_model(tmp_path, float64):  # pylint: disable=unused-argument
+    # The tracker starts at the best value logged before the restart; nothing beats 0.
+    model = build_model()
+    train_loader, valid_loaders = build_loaders()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+    train(
+        model=model,
+        loss_fn=FakeTermLoss(STAGE_ONE_WEIGHTS),
+        train_loader=train_loader,
+        valid_loaders=valid_loaders,
+        optimizer=optimizer,
+        lr_scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer),
+        start_epoch=0,
+        max_num_epochs=2,
+        patience=100,
+        checkpoint_handler=tools.CheckpointHandler(
+            directory=str(tmp_path / "checkpoints"), tag="tiny_run"
+        ),
+        logger=tools.MetricsLogger(
+            directory=str(tmp_path / "results"), tag="tiny_run_train"
+        ),
+        eval_interval=1,
+        output_args={"forces": True, "virials": False, "stress": False},
+        device=torch.device("cpu"),
+        log_errors="PerAtomRMSE",
+        selection_loss_fn=FakeTermLoss(STAGE_ONE_WEIGHTS),
+        best_checkpoint_handler=tools.CheckpointHandler(
+            directory=str(tmp_path / "checkpoints"), tag="tiny_run_best"
+        ),
+        lowest_selection_loss=0.0,
+    )
+    assert not list((tmp_path / "checkpoints").glob("tiny_run_best_epoch-*.pt"))
+    assert all(entry["mode"] != "best" for entry in read_results(tmp_path))
+
+
+def test_the_logged_best_selection_loss_is_the_lowest_best_entry(tmp_path):
+    from mace.tools.train import logged_best_selection_loss
+
+    results = tmp_path / "run_train.txt"
+    assert logged_best_selection_loss(str(results)) == math.inf
+    entries = [
+        {"mode": "eval", "epoch": 0, "selection_loss": 0.01},
+        {"mode": "best", "epoch": 0, "selection_loss": 0.5},
+        {"mode": "best", "epoch": 4, "selection_loss": 0.2},
+        {"mode": "opt", "epoch": 5, "loss": 0.1},
+    ]
+    results.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+    assert logged_best_selection_loss(str(results)) == pytest.approx(0.2)
+
+
+def test_the_frame_mask_matches_the_frame_terms_of_the_loss():
+    from types import SimpleNamespace
+
+    from mace.tools.train import periodic_frame_mask
+
+    pbc = torch.tensor([[True] * 3, [False] * 3, [True] * 3, [False] * 3])
+    assert periodic_frame_mask(SimpleNamespace(pbc=pbc)).tolist() == [
+        True,
+        False,
+        True,
+        False,
+    ]
+    # In-place monomers (sign -1) are excluded even when periodic.
+    sign = torch.tensor([1.0, 1.0, -1.0, -1.0])
+    assert periodic_frame_mask(SimpleNamespace(pbc=pbc, sign=sign)).tolist() == [
+        True,
+        False,
+        False,
+        False,
+    ]
+
+
+def test_frames_only_metrics_ignore_aperiodic_configurations(float64):  # pylint: disable=unused-argument
+    import dataclasses as dataclass_tools
+
+    table = tools.AtomicNumberTable([1, 8])
+    periodic = dataclass_tools.replace(
+        water_configuration(0.0, -1.5), pbc=(True, True, True), cell=np.eye(3) * 20.0
+    )
+    aperiodic = water_configuration(0.2, -1.8)
+    graphs = [
+        data.AtomicData.from_config(config, z_table=table, cutoff=5.0)
+        for config in (periodic, aperiodic)
+    ]
+    model = build_model()
+    output_args = {"forces": True, "virials": False, "stress": False}
+    loader = torch_geometric.dataloader.DataLoader(dataset=graphs, batch_size=2)
+    _, metrics = evaluate(
+        model=model,
+        loss_fn=FakeTermLoss(STAGE_ONE_WEIGHTS),
+        data_loader=loader,
+        output_args=output_args,
+        device=torch.device("cpu"),
+    )
+    alone = torch_geometric.dataloader.DataLoader(dataset=graphs[:1], batch_size=1)
+    _, periodic_only = evaluate(
+        model=model,
+        loss_fn=FakeTermLoss(STAGE_ONE_WEIGHTS),
+        data_loader=alone,
+        output_args=output_args,
+        device=torch.device("cpu"),
+    )
+    assert metrics["rmse_f_frames"] == pytest.approx(periodic_only["rmse_f"])
+    assert metrics["rmse_e_per_atom_frames"] == pytest.approx(
+        periodic_only["rmse_e_per_atom"]
+    )
+    assert metrics["rmse_f"] != pytest.approx(metrics["rmse_f_frames"])

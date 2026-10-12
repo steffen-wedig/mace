@@ -17,7 +17,7 @@ from .torch_tools import (
     to_one_hot,
     voigt_to_matrix,
 )
-from .train import SWAContainer, evaluate, train
+from .train import SWAContainer, evaluate, logged_best_selection_loss, train
 from .utils import (
     AtomicNumberTable,
     MetricsLogger,
@@ -50,6 +50,7 @@ __all__ = [
     "MetricsLogger",
     "get_atomic_number_table_from_zs",
     "train",
+    "logged_best_selection_loss",
     "evaluate",
     "SWAContainer",
     "CheckpointHandler",
