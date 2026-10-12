@@ -205,8 +205,24 @@ def train(
     data_aug_magmom: Optional[bool] = False,
     data_aug_magmom_mode: str = "non-soc",
     loss_term_instrumentation: Optional[LossTermInstrumentation] = None,
+    selection_loss_fn: Optional[torch.nn.Module] = None,
+    best_checkpoint_handler: Optional[CheckpointHandler] = None,
 ):
+    """Train `model`; with `best_checkpoint_handler`, also keep the best model of the run.
+
+    The per-stage checkpoints are selected by each stage's own validation loss, which is not
+    comparable across the stage switch (the loss weights change). The best model of the whole
+    run is selected by `selection_loss_fn` instead: one fixed loss evaluated at every
+    validation of both stages (run_train passes a copy of the stage-one loss). Its checkpoint
+    is saved through `best_checkpoint_handler`, and each new best writes a `mode: "best"`
+    entry to the results log, so the last such entry describes the best model.
+    """
+    if (selection_loss_fn is None) != (best_checkpoint_handler is None):
+        raise ValueError(
+            "selection_loss_fn and best_checkpoint_handler must be given together"
+        )
     lowest_loss = np.inf
+    lowest_selection_loss = np.inf
     valid_loss = np.inf
     patience_counter = 0
     swa_start = True
@@ -330,7 +346,11 @@ def train(
                         output_args=output_args,
                         device=device,
                         term_accumulator=term_accumulator,
+                        selection_loss_fn=selection_loss_fn,
                     )
+                    # Plain copy before valid_err_log fills the defaultdict with
+                    # placeholders for the metrics the error table asks for.
+                    selection_metrics = dict(eval_metrics)
                     if loss_term_instrumentation is not None and term_accumulator is not None:
                         loss_term_instrumentation.write_validation_summary(
                             term_accumulator, head=valid_loader_name, epoch=epoch
@@ -361,6 +381,29 @@ def train(
                 valid_loss = (
                     valid_loss_head  # consider only the last head for the checkpoint
                 )
+                if (
+                    rank == 0
+                    and best_checkpoint_handler is not None
+                    and selection_metrics["selection_loss"] < lowest_selection_loss
+                ):
+                    lowest_selection_loss = selection_metrics["selection_loss"]
+                    logging.info(
+                        f"New best model of the run at epoch {epoch}: fixed-weight "
+                        f"validation loss {lowest_selection_loss:.8f}"
+                    )
+                    best_checkpoint_handler.save(
+                        state=CheckpointState(model, optimizer, lr_scheduler),
+                        epochs=epoch,
+                        keep_last=save_all_checkpoints,
+                    )
+                    logger.log(
+                        {
+                            **selection_metrics,
+                            "mode": "best",
+                            "epoch": epoch,
+                            "head": valid_loader_name,
+                        }
+                    )
             if log_wandb:
                 wandb.log(wandb_log_dict)
             if rank == 0:
@@ -646,14 +689,17 @@ def evaluate(
     output_args: Dict[str, bool],
     device: torch.device,
     term_accumulator: Optional[LossTermAccumulator] = None,
+    selection_loss_fn: Optional[torch.nn.Module] = None,
 ) -> Tuple[float, Dict[str, Any]]:
     """Loss and error metrics of `model` on `data_loader`.
 
     With a `term_accumulator`, the per-term statistics of every batch's loss call are
     summed into it (the loss must follow the term contract of `mace.tools.loss_terms`).
+    With a `selection_loss_fn`, its loss on the same predictions is reported as
+    `aux["selection_loss"]` (the fixed-weight criterion for the best model of a run).
     """
 
-    metrics = MACELoss(loss_fn=loss_fn).to(device)
+    metrics = MACELoss(loss_fn=loss_fn, selection_loss_fn=selection_loss_fn).to(device)
 
     start_time = time.time()
 
@@ -681,10 +727,18 @@ def evaluate(
 
 
 class MACELoss(Metric):
-    def __init__(self, loss_fn: torch.nn.Module):
+    def __init__(
+        self,
+        loss_fn: torch.nn.Module,
+        selection_loss_fn: Optional[torch.nn.Module] = None,
+    ):
         super().__init__()
         self.loss_fn = loss_fn
+        self.selection_loss_fn = selection_loss_fn
         self.add_state("total_loss", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state(
+            "total_selection_loss", default=torch.tensor(0.0), dist_reduce_fx="sum"
+        )
         self.add_state("num_data", default=torch.tensor(0.0), dist_reduce_fx="sum")
         self.add_state("E_computed", default=torch.tensor(0.0), dist_reduce_fx="sum")
         self.add_state("delta_es", default=[], dist_reduce_fx="cat")
@@ -729,6 +783,8 @@ class MACELoss(Metric):
     def update(self, batch, output):  # pylint: disable=arguments-differ
         loss = self.loss_fn(pred=output, ref=batch)
         self.total_loss += loss
+        if self.selection_loss_fn is not None:
+            self.total_selection_loss += self.selection_loss_fn(pred=output, ref=batch)
         self.num_data += batch.num_graphs
 
         if output.get("energy") is not None and batch.energy is not None:
@@ -847,6 +903,10 @@ class MACELoss(Metric):
 
         aux = defaultdict(NoneMultiply)
         aux["loss"] = to_numpy(self.total_loss / self.num_data).item()
+        if self.selection_loss_fn is not None:
+            aux["selection_loss"] = to_numpy(
+                self.total_selection_loss / self.num_data
+            ).item()
         if self.E_computed:
             delta_es = self.convert(self.delta_es)
             delta_es_per_atom = self.convert(self.delta_es_per_atom)
