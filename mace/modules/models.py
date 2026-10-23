@@ -803,6 +803,7 @@ class MultiLevelScaleShiftMACE(MACE):
         vectors = ctx.vectors
         lengths = ctx.lengths
         cell = ctx.cell
+        pbc = ctx.pbc
         node_heads = ctx.node_heads.to(torch.int64)
         interaction_kwargs = ctx.interaction_kwargs
         lammps_natoms = interaction_kwargs.lammps_natoms
@@ -971,6 +972,7 @@ class MultiLevelScaleShiftMACE(MACE):
                 displacement=displacement,
                 vectors=vectors,
                 cell=cell,
+                pbc=pbc,
                 training=training,
                 compute_force=compute_force,
                 compute_virials=compute_virials,
@@ -989,6 +991,7 @@ class MultiLevelScaleShiftMACE(MACE):
                 num_atoms=positions.shape[0],
                 batch=data["batch"],
                 cell=cell,
+                pbc=pbc,
             )
         return {
             "energy": total_energy,

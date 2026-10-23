@@ -59,6 +59,7 @@ WIDENS_NODE_ENERGY = {
     "MACELES": True,
     "PolarMACE": True,
     "MagneticScaleShiftMACE": False,
+    "MultiLevelScaleShiftMACE": True,
 }
 
 
