@@ -35,7 +35,7 @@ FIXTURES, R_MAX = _fixtures()
 
 
 def _backend(kind):
-    return NEIGHBOR_BACKENDS.build(NeighborListConfig.of(kind))
+    return NEIGHBOR_BACKENDS.build(NeighborListConfig.model_validate({"kind": kind}))
 
 
 def _geometry(atoms):
@@ -63,7 +63,7 @@ def test_the_matscipy_neighbor_list_is_the_legacy_one_exactly(name):
     assert np.array_equal(neighbors.cell, returned)
 
 
-@pytest.mark.parametrize("backend", NeighborListConfig.kinds())
+@pytest.mark.parametrize("backend", sorted(NeighborListConfig.kinds))
 @pytest.mark.parametrize("name", sorted(FIXTURES))
 def test_neighbor_backend_reproduces_the_oracle(name, backend):
     positions, pbc, cell = _geometry(FIXTURES[name])
@@ -91,7 +91,7 @@ def test_a_length_that_rounds_onto_the_cutoff_is_the_legacy_decision():
     expected = canonical_edges(legacy_index, legacy_unit_shifts)
     assert len(expected) == 18
     assert canonical_edges(reference_index, reference_unit_shifts) == expected
-    for backend in NeighborListConfig.kinds():
+    for backend in sorted(NeighborListConfig.kinds):
         neighbors = get_neighborhood(
             positions, cutoff, pbc, cell, backend=_backend(backend)
         )

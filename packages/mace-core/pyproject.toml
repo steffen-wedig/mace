@@ -47,15 +47,6 @@ vesin = ["vesin>=0.6.2"]
 # order-exact parity tests need it. It brings scipy and no framework.
 matscipy = ["matscipy>=1.0"]
 
-[project.entry-points."mace.neighbor_backends"]
-# The module that registers each kind's builder, imported when that kind is
-# built, the same way a third-party backend is found. The config classes of
-# these kinds are defined in mace_core.neighbors.config and need no entry; a
-# third-party kind adds its config class to "mace.neighbor_list".
-vesin = "mace_core.neighbors.vesin_backend"
-matscipy = "mace_core.neighbors.matscipy_backend"
-brute_force = "mace_core.neighbors.brute_force"
-
 [project.urls]
 Homepage = "https://github.com/ACEsuit/mace"
 

@@ -15,14 +15,6 @@ from __future__ import annotations
 
 import numpy as np
 
-try:
-    from matscipy.neighbours import neighbour_list
-except ImportError as missing:
-    raise ImportError(
-        "the matscipy neighbour-list backend needs matscipy: "
-        "pip install 'mace-core[matscipy]'"
-    ) from missing
-
 from mace_core.neighbors.backends import NEIGHBOR_BACKENDS
 from mace_core.neighbors.config import MatscipyConfig
 from mace_core.neighbors.geometry import SearchGeometry
@@ -35,6 +27,14 @@ class MatscipyBackend:
 
     def __init__(self, config: MatscipyConfig | None = None) -> None:
         del config  # nothing to set
+        try:
+            from matscipy.neighbours import neighbour_list
+        except ImportError as missing:
+            raise ImportError(
+                "the matscipy neighbour-list backend needs matscipy: "
+                "pip install 'mace-core[matscipy]'"
+            ) from missing
+        self._neighbour_list = neighbour_list
 
     def search(
         self, positions: np.ndarray, cutoff: float, geometry: SearchGeometry
@@ -43,7 +43,7 @@ class MatscipyBackend:
 
         Edges come out in matscipy's order.
         """
-        senders, receivers, unit_shifts = neighbour_list(
+        senders, receivers, unit_shifts = self._neighbour_list(
             quantities="ijS",
             pbc=geometry.pbc,
             cell=geometry.search_cell,

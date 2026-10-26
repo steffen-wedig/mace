@@ -1,16 +1,12 @@
 """The ``neighbor_list`` config section: one class per backend.
 
-These classes import nothing beyond pydantic, so validating a config that
-names vesin imports neither vesin nor torch; the backend is imported when it
-is built (:data:`~mace_core.neighbors.backends.NEIGHBOR_BACKENDS`).
-
-A backend from another distribution adds its config class here through the
-``mace.neighbor_list`` entry point group, named after its kind.
+A backend from another distribution adds a kind by subclassing
+:class:`NeighborListConfig` in a ``mace.plugins`` module.
 """
 
 from __future__ import annotations
 
-from typing import ClassVar, Literal
+from typing import Literal
 
 from pydantic import Field
 
@@ -33,8 +29,6 @@ class NeighborListConfig(KindedSection):
     choice never changes a number, since every backend returns the same edge
     set, so it is run configuration and not part of a model's state.
     """
-
-    entry_point_group: ClassVar[str | None] = "mace.neighbor_list"
 
 
 class BruteForceConfig(NeighborListConfig):

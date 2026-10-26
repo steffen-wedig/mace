@@ -173,10 +173,11 @@ class BaseConfig(ConfigSection):
 
     def to_resolved_dict(self) -> dict[str, Any]:
         """A JSON-compatible dict that loads back to this config, defaults
-        filled in."""
-        return self.model_dump(mode="json")
+        filled in. A section typed with a `KindedSection` family keeps the
+        fields of its kind."""
+        return self.model_dump(mode="json", serialize_as_any=True)
 
     def to_user_dict(self) -> dict[str, Any]:
         """A JSON-compatible dict that loads back to this config, holding only
         the fields that were set."""
-        return self.model_dump(mode="json", exclude_unset=True)
+        return self.model_dump(mode="json", exclude_unset=True, serialize_as_any=True)

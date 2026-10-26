@@ -12,10 +12,9 @@ reproduce the brute-force edge set.
 Which backend, with which settings, is a
 :class:`~mace_core.neighbors.config.NeighborListConfig` kind; how it is built
 is registered here, on :data:`NEIGHBOR_BACKENDS`, by the module that defines
-it. That module is found through the ``mace.neighbor_backends`` entry point
-named after the kind and imported only when the kind is built, so a backend
-that sets up a device at import costs nothing to a run that uses another. The
-providers registered here return numpy arrays and import no framework.
+it. Those modules import their library only when a backend is built, so
+importing them all costs nothing. The providers registered here return numpy
+arrays and import no framework.
 
 **One default per framework; anything else is asked for by name.** A config
 that names no backend gets the default of the framework building the graphs,
@@ -90,8 +89,8 @@ class NeighborListBackend(Protocol):
 
 
 #: Builds a numpy neighbour-list backend from its config section.
-NEIGHBOR_BACKENDS = Builders[NeighborListConfig, NeighborListBackend, []](
-    NeighborListConfig, NeighborListBackend, group="mace.neighbor_backends"
+NEIGHBOR_BACKENDS: Builders[NeighborListConfig, NeighborListBackend, []] = Builders(
+    NeighborListConfig
 )
 
 
@@ -105,7 +104,9 @@ def resolve_neighbor_backend(
         default: The framework's default kind, used when the config names none.
 
     Raises:
-        mace_core.plugins.NotAvailableError: if the backend did not import or
-            has no builder. No other backend is tried.
+        mace_core.plugins.NotAvailableError: if the kind has no builder.
+        ImportError: if its library is not installed, naming the extra.
+            No other backend is tried.
     """
-    return NEIGHBOR_BACKENDS.build(config or NeighborListConfig.of(default))
+    config = config or NeighborListConfig.model_validate({"kind": default})
+    return NEIGHBOR_BACKENDS.build(config)

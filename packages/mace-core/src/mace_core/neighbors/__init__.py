@@ -24,18 +24,22 @@ from mace_core.neighbors.config import (
     VesinConfig,
 )
 from mace_core.neighbors.geometry import SearchGeometry, search_geometry
+from mace_core.neighbors.matscipy_backend import MatscipyBackend
 from mace_core.neighbors.neighborhood import NeighborList, get_neighborhood
+from mace_core.neighbors.vesin_backend import VesinBackend
 
 __all__ = [
     "DEFAULT_NEIGHBOR_BACKEND",
     "NEIGHBOR_BACKENDS",
     "BruteForceBackend",
     "BruteForceConfig",
+    "MatscipyBackend",
     "MatscipyConfig",
     "NeighborList",
     "NeighborListBackend",
     "NeighborListConfig",
     "SearchGeometry",
+    "VesinBackend",
     "VesinConfig",
     "get_neighborhood",
     "resolve_neighbor_backend",

@@ -14,13 +14,11 @@ name it.
 vesin is the ``mace-core[vesin]`` extra. It is imported when the backend is
 built rather than with this module, because importing vesin also imports torch
 or cupy whenever either is installed, and ``mace-core`` reaches no framework.
-Without vesin, importing this module fails, so the registry lists the backend
-as not loaded and says how to install it.
+Without vesin, building the backend raises and says how to install it.
 """
 
 from __future__ import annotations
 
-from importlib.util import find_spec
 from typing import Any
 
 import numpy as np
@@ -28,11 +26,6 @@ import numpy as np
 from mace_core.neighbors.backends import NEIGHBOR_BACKENDS
 from mace_core.neighbors.config import VesinConfig
 from mace_core.neighbors.geometry import SearchGeometry
-
-if find_spec("vesin") is None:
-    raise ImportError(
-        "the vesin neighbour-list backend needs vesin: pip install 'mace-core[vesin]'"
-    )
 
 __all__ = ["VesinBackend"]
 
@@ -46,7 +39,13 @@ class VesinBackend:
 
     def __init__(self, config: VesinConfig | None = None) -> None:
         config = config or VesinConfig()
-        from vesin import NeighborList
+        try:
+            from vesin import NeighborList
+        except ImportError as missing:
+            raise ImportError(
+                "the vesin neighbour-list backend needs vesin: "
+                "pip install 'mace-core[vesin]'"
+            ) from missing
 
         self._neighbor_list: Any = NeighborList
         self.n_threads = config.n_threads
