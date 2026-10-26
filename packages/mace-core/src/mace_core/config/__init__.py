@@ -12,6 +12,7 @@ from mace_core.config.base import (
     read_config_file,
 )
 from mace_core.config.cli import apply_overrides, parse_overrides
+from mace_core.config.kinds import KindedSection
 from mace_core.config.model import (
     AgnesiTransformConfig,
     BesselBasisConfig,
@@ -33,6 +34,7 @@ __all__ = [
     "ConfigSection",
     "DistanceTransformConfig",
     "GaussianBasisConfig",
+    "KindedSection",
     "NoDistanceTransformConfig",
     "PolynomialCutoffConfig",
     "RadialBasisConfig",

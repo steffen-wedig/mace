@@ -3,7 +3,8 @@
 :func:`get_neighborhood` is the one entry point every graph builder calls, and
 no dataset backend ships neighbour code of its own. The search itself is a
 pluggable :class:`NeighborListBackend`, selected by the ``neighbor_list``
-config section (:class:`NeighborListConfig`); the search box and the returned
+config section (a :class:`NeighborListConfig` kind) and built by
+:data:`NEIGHBOR_BACKENDS`; the search box and the returned
 cell are decided once, by :func:`search_geometry`, whichever backend runs.
 
 Everything here is numpy. No framework is imported.
@@ -11,33 +12,31 @@ Everything here is numpy. No framework is imported.
 
 from mace_core.neighbors.backends import (
     DEFAULT_NEIGHBOR_BACKEND,
-    NEIGHBOR_BACKEND_GROUP,
-    DiscoveredNeighborBackend,
-    DuplicateNeighborBackendError,
-    NeighborBackendNotAvailableError,
+    NEIGHBOR_BACKENDS,
     NeighborListBackend,
-    NeighborListConfig,
-    available_neighbor_backends,
-    get_neighbor_backend,
     resolve_neighbor_backend,
 )
 from mace_core.neighbors.brute_force import BruteForceBackend
+from mace_core.neighbors.config import (
+    BruteForceConfig,
+    MatscipyConfig,
+    NeighborListConfig,
+    VesinConfig,
+)
 from mace_core.neighbors.geometry import SearchGeometry, search_geometry
 from mace_core.neighbors.neighborhood import NeighborList, get_neighborhood
 
 __all__ = [
     "DEFAULT_NEIGHBOR_BACKEND",
-    "NEIGHBOR_BACKEND_GROUP",
+    "NEIGHBOR_BACKENDS",
     "BruteForceBackend",
-    "DiscoveredNeighborBackend",
-    "DuplicateNeighborBackendError",
-    "NeighborBackendNotAvailableError",
+    "BruteForceConfig",
+    "MatscipyConfig",
     "NeighborList",
     "NeighborListBackend",
     "NeighborListConfig",
     "SearchGeometry",
-    "available_neighbor_backends",
-    "get_neighbor_backend",
+    "VesinConfig",
     "get_neighborhood",
     "resolve_neighbor_backend",
     "search_geometry",

@@ -25,6 +25,8 @@ from typing import Any
 
 import numpy as np
 
+from mace_core.neighbors.backends import NEIGHBOR_BACKENDS
+from mace_core.neighbors.config import VesinConfig
 from mace_core.neighbors.geometry import SearchGeometry
 
 if find_spec("vesin") is None:
@@ -39,30 +41,15 @@ class VesinBackend:
     """Neighbour search through :class:`vesin.NeighborList`.
 
     Args:
-        n_threads: CPU threads per search. ``0`` lets vesin choose:
-            ``OMP_NUM_THREADS`` when it is set, otherwise every available core.
-            The default is one thread, because graphs are usually built in
-            several data-loader workers at once and each of them would
-            otherwise take every core.
-
-    Raises:
-        ValueError: if ``n_threads`` is not a non-negative integer.
+        config: The thread count; see :class:`VesinConfig`, which checks it.
     """
 
-    def __init__(self, n_threads: int = 1) -> None:
-        if isinstance(n_threads, bool) or not isinstance(n_threads, int):
-            raise ValueError(
-                f"n_threads must be an integer, not {type(n_threads).__name__}."
-            )
-        if n_threads < 0:
-            raise ValueError(
-                f"n_threads is {n_threads}. It must be 0, for vesin's own choice, "
-                f"or a positive number of threads."
-            )
+    def __init__(self, config: VesinConfig | None = None) -> None:
+        config = config or VesinConfig()
         from vesin import NeighborList
 
         self._neighbor_list: Any = NeighborList
-        self.n_threads = n_threads
+        self.n_threads = config.n_threads
 
     def search(
         self, positions: np.ndarray, cutoff: float, geometry: SearchGeometry
@@ -81,3 +68,6 @@ class VesinBackend:
             quantities="ijS",
         )
         return np.stack((senders, receivers)), unit_shifts
+
+
+NEIGHBOR_BACKENDS.register(VesinConfig, VesinBackend)

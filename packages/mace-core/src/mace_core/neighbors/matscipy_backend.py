@@ -23,6 +23,8 @@ except ImportError as missing:
         "pip install 'mace-core[matscipy]'"
     ) from missing
 
+from mace_core.neighbors.backends import NEIGHBOR_BACKENDS
+from mace_core.neighbors.config import MatscipyConfig
 from mace_core.neighbors.geometry import SearchGeometry
 
 __all__ = ["MatscipyBackend"]
@@ -30,6 +32,9 @@ __all__ = ["MatscipyBackend"]
 
 class MatscipyBackend:
     """Neighbour search through :func:`matscipy.neighbours.neighbour_list`."""
+
+    def __init__(self, config: MatscipyConfig | None = None) -> None:
+        del config  # nothing to set
 
     def search(
         self, positions: np.ndarray, cutoff: float, geometry: SearchGeometry
@@ -46,3 +51,6 @@ class MatscipyBackend:
             cutoff=cutoff,
         )
         return np.stack((senders, receivers)), unit_shifts
+
+
+NEIGHBOR_BACKENDS.register(MatscipyConfig, MatscipyBackend)

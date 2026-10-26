@@ -24,6 +24,8 @@ import math
 
 import numpy as np
 
+from mace_core.neighbors.backends import NEIGHBOR_BACKENDS
+from mace_core.neighbors.config import BruteForceConfig
 from mace_core.neighbors.geometry import SearchGeometry
 
 __all__ = ["BruteForceBackend"]
@@ -31,6 +33,9 @@ __all__ = ["BruteForceBackend"]
 
 class BruteForceBackend:
     """Neighbour search by enumerating every pair and every reachable image."""
+
+    def __init__(self, config: BruteForceConfig | None = None) -> None:
+        del config  # nothing to set
 
     def search(
         self, positions: np.ndarray, cutoff: float, geometry: SearchGeometry
@@ -86,3 +91,6 @@ def _image_ranges(
         reach = math.ceil(cutoff * float(np.linalg.norm(reciprocal[axis])) + spread)
         ranges.append(range(-reach, reach + 1))
     return ranges
+
+
+NEIGHBOR_BACKENDS.register(BruteForceConfig, BruteForceBackend)

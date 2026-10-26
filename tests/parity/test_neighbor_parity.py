@@ -11,8 +11,8 @@ import json
 import numpy as np
 import pytest
 from mace_core.neighbors import (
-    available_neighbor_backends,
-    get_neighbor_backend,
+    NEIGHBOR_BACKENDS,
+    NeighborListConfig,
     get_neighborhood,
 )
 
@@ -34,6 +34,10 @@ def _fixtures():
 FIXTURES, R_MAX = _fixtures()
 
 
+def _backend(kind):
+    return NEIGHBOR_BACKENDS.build(NeighborListConfig.of(kind))
+
+
 def _geometry(atoms):
     return (
         atoms.get_positions(),
@@ -51,7 +55,7 @@ def test_the_matscipy_neighbor_list_is_the_legacy_one_exactly(name):
         positions, cutoff=R_MAX, pbc=pbc, cell=cell
     )
     neighbors = get_neighborhood(
-        positions, R_MAX, pbc, cell, backend=get_neighbor_backend("matscipy")
+        positions, R_MAX, pbc, cell, backend=_backend("matscipy")
     )
     assert np.array_equal(neighbors.edge_index, edge_index)
     assert np.array_equal(neighbors.unit_shifts, unit_shifts)
@@ -59,15 +63,11 @@ def test_the_matscipy_neighbor_list_is_the_legacy_one_exactly(name):
     assert np.array_equal(neighbors.cell, returned)
 
 
-@pytest.mark.parametrize(
-    "backend", sorted(b.name for b in available_neighbor_backends())
-)
+@pytest.mark.parametrize("backend", NeighborListConfig.kinds())
 @pytest.mark.parametrize("name", sorted(FIXTURES))
 def test_neighbor_backend_reproduces_the_oracle(name, backend):
     positions, pbc, cell = _geometry(FIXTURES[name])
-    neighbors = get_neighborhood(
-        positions, R_MAX, pbc, cell, backend=get_neighbor_backend(backend)
-    )
+    neighbors = get_neighborhood(positions, R_MAX, pbc, cell, backend=_backend(backend))
     reference_index, _, reference_unit_shifts = brute_force_neighborhood(
         positions, R_MAX, pbc, cell
     )
@@ -91,8 +91,8 @@ def test_a_length_that_rounds_onto_the_cutoff_is_the_legacy_decision():
     expected = canonical_edges(legacy_index, legacy_unit_shifts)
     assert len(expected) == 18
     assert canonical_edges(reference_index, reference_unit_shifts) == expected
-    for backend in sorted(b.name for b in available_neighbor_backends()):
+    for backend in NeighborListConfig.kinds():
         neighbors = get_neighborhood(
-            positions, cutoff, pbc, cell, backend=get_neighbor_backend(backend)
+            positions, cutoff, pbc, cell, backend=_backend(backend)
         )
         assert canonical_edges(neighbors.edge_index, neighbors.unit_shifts) == expected

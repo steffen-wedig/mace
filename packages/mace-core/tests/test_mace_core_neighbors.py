@@ -12,19 +12,20 @@ from __future__ import annotations
 
 import sys
 import textwrap
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pytest
-from mace_core.config import ConfigSection
+from mace_core import plugins
+from mace_core.config import BaseConfig, KindedSection
 from mace_core.neighbors import (
     DEFAULT_NEIGHBOR_BACKEND,
+    NEIGHBOR_BACKENDS,
     BruteForceBackend,
-    DuplicateNeighborBackendError,
-    NeighborBackendNotAvailableError,
+    MatscipyConfig,
+    NeighborListBackend,
     NeighborListConfig,
-    available_neighbor_backends,
-    get_neighbor_backend,
+    VesinConfig,
     get_neighborhood,
     resolve_neighbor_backend,
     search_geometry,
@@ -32,8 +33,15 @@ from mace_core.neighbors import (
 from mace_core.neighbors import geometry as geometry_module
 from mace_core.neighbors.matscipy_backend import MatscipyBackend
 from mace_core.neighbors.vesin_backend import VesinBackend
+from mace_core.plugins import DuplicateRegistrationError, NotAvailableError
+from pydantic import ValidationError
 
 MATSCIPY = MatscipyBackend()
+
+
+def _backend(kind, **settings):
+    """The backend a config section of ``kind`` describes."""
+    return NEIGHBOR_BACKENDS.build(NeighborListConfig.of(kind, **settings))
 
 
 def _edges(neighbors):
@@ -136,19 +144,17 @@ def test_every_registered_backend_reproduces_the_brute_force_edge_set(case):
     expected = _edges(
         get_neighborhood(positions, cutoff, pbc, cell, backend=BruteForceBackend())
     )
-    for discovered in available_neighbor_backends():
-        backend = get_neighbor_backend(discovered.name)
+    for kind in NeighborListConfig.kinds():
+        backend = _backend(kind)
         neighbors = get_neighborhood(positions, cutoff, pbc, cell, backend=backend)
-        assert _edges(neighbors) == expected, discovered.name
+        assert _edges(neighbors) == expected, kind
 
 
 def test_the_returned_cell_does_not_depend_on_the_backend(case):
     positions, cutoff, pbc, cell = case
     cells = [
-        get_neighborhood(
-            positions, cutoff, pbc, cell, backend=get_neighbor_backend(d.name)
-        ).cell
-        for d in available_neighbor_backends()
+        get_neighborhood(positions, cutoff, pbc, cell, backend=_backend(kind)).cell
+        for kind in NeighborListConfig.kinds()
     ]
     for returned in cells[1:]:
         assert np.array_equal(returned, cells[0])
@@ -175,15 +181,11 @@ def test_a_length_that_rounds_onto_the_cutoff_is_inside_for_every_backend():
     positions, cell, cutoff = np.zeros((1, 3)), np.eye(3), np.sqrt(2)
     diagonal = np.array([1.0, 1.0, 0.0])
     assert not np.linalg.norm(diagonal) < cutoff
-    for discovered in available_neighbor_backends():
+    for kind in NeighborListConfig.kinds():
         neighbors = get_neighborhood(
-            positions,
-            cutoff,
-            (True, True, True),
-            cell,
-            backend=get_neighbor_backend(discovered.name),
+            positions, cutoff, (True, True, True), cell, backend=_backend(kind)
         )
-        assert neighbors.edge_index.shape[1] == 6 + 12, discovered.name
+        assert neighbors.edge_index.shape[1] == 6 + 12, kind
 
 
 def test_shifts_are_unit_shifts_times_the_returned_cell(case):
@@ -356,98 +358,158 @@ def test_only_search_geometry_decides_a_regime():
     assert "2 * cutoff + 1" in inspect.getsource(geometry_module)
 
 
-# --- the registry and the config section ------------------------------------------
+# --- the config section and the registry --------------------------------------
 
 
-def test_vesin_matscipy_and_brute_force_are_registered():
-    names = {backend.name for backend in available_neighbor_backends()}
-    assert {"vesin", "matscipy", "brute_force"} <= names
+@pytest.fixture(autouse=True)
+def _isolated_registry():
+    """Kinds and builders a test installs are forgotten after it."""
+    kinds = dict(NeighborListConfig._kinds)
+    builders = dict(NEIGHBOR_BACKENDS._builders)
+    plugins.clear_caches()
+    yield
+    NeighborListConfig._kinds.clear()
+    NeighborListConfig._kinds.update(kinds)
+    NEIGHBOR_BACKENDS._builders.clear()
+    NEIGHBOR_BACKENDS._builders.update(builders)
+    plugins.clear_caches()
 
 
-def test_the_config_section_leaves_the_choice_to_the_framework_by_default():
-    assert NeighborListConfig().kind is None
-    assert NeighborListConfig().settings == {}
-    with pytest.raises(ValueError, match=r"without neighbor_list\.kind"):
-        NeighborListConfig(settings={"n_threads": 2})
-    assert issubclass(NeighborListConfig, ConfigSection)
-    with pytest.raises(ValueError, match="kind"):
-        NeighborListConfig(kind=" ")
-    with pytest.raises(ValueError):
-        NeighborListConfig.model_validate({"kind": "matscipy", "cutoff": 5.0})
+class _Run(BaseConfig):
+    neighbor_list: NeighborListConfig | None = None
 
 
-def test_an_unregistered_name_is_refused_with_the_registered_ones():
-    with pytest.raises(NeighborBackendNotAvailableError, match="brute_force"):
-        get_neighbor_backend("cell_list_on_the_moon")
+def test_vesin_matscipy_and_brute_force_are_kinds_with_builders():
+    assert {"vesin", "matscipy", "brute_force"} <= set(NeighborListConfig.kinds())
+    listed = {entry.kind: entry for entry in NEIGHBOR_BACKENDS.available()}
+    assert all(listed[kind].loaded for kind in ("vesin", "matscipy", "brute_force"))
 
 
-def _install(path, distribution, entry_point):
-    """A distribution whose metadata declares one neighbour backend."""
-    info = path / f"{distribution}-1.0.dist-info"
-    info.mkdir()
-    (info / "METADATA").write_text(
-        f"Metadata-Version: 2.1\nName: {distribution}\nVersion: 1.0\n"
+def test_the_kind_picks_the_class_and_the_class_checks_the_rest():
+    run = _Run.from_dict({"neighbor_list": {"kind": "vesin", "n_threads": 4}})
+    assert isinstance(run.neighbor_list, VesinConfig)
+    assert run.neighbor_list.n_threads == 4
+    with pytest.raises(ValidationError, match=r"neighbor_list\.n_thread\b"):
+        _Run.from_dict({"neighbor_list": {"kind": "vesin", "n_thread": 4}})
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        _Run.from_dict({"neighbor_list": {"kind": "vesin", "n_threads": -1}})
+    with pytest.raises(ValidationError, match="Extra inputs"):
+        _Run.from_dict({"neighbor_list": {"kind": "matscipy", "n_threads": 2}})
+
+
+def test_an_unknown_or_missing_kind_is_refused_with_the_kinds():
+    for section in ({"kind": "cell_list_on_the_moon"}, {"n_threads": 2}):
+        with pytest.raises(ValidationError, match=r"brute_force.*matscipy.*vesin"):
+            _Run.from_dict({"neighbor_list": section})
+
+
+def test_the_resolved_config_keeps_the_fields_of_the_kind():
+    """The field is annotated with the family, whose dump alone would drop
+    ``n_threads``; the saved config has to load back to the same one."""
+    run = _Run.from_dict({"neighbor_list": {"kind": "vesin", "n_threads": 3}})
+    resolved = run.to_resolved_dict()
+    assert resolved == {"neighbor_list": {"kind": "vesin", "n_threads": 3}}
+    assert _Run.from_dict(resolved) == run
+    assert run.to_user_dict() == resolved
+    assert '"n_threads":3' in run.model_dump_json()
+
+
+@pytest.mark.filterwarnings("error")
+@pytest.mark.parametrize("mode", ["validation", "serialization"])
+def test_the_json_schema_lists_every_kind_with_its_fields(mode):
+    family = _Run.model_json_schema(mode=mode)["$defs"]["NeighborListConfig"]
+    by_title = {kind["title"]: kind for kind in family["oneOf"]}
+    assert set(by_title) >= {"BruteForceConfig", "MatscipyConfig", "VesinConfig"}
+    assert set(by_title["VesinConfig"]["properties"]) == {"kind", "n_threads"}
+    assert by_title["VesinConfig"]["additionalProperties"] is False
+
+
+def test_no_section_leaves_the_choice_to_the_framework():
+    assert _Run.from_dict({}).neighbor_list is None
+    assert DEFAULT_NEIGHBOR_BACKEND == "brute_force"
+    assert isinstance(resolve_neighbor_backend(), BruteForceBackend)
+    assert isinstance(resolve_neighbor_backend(None, "vesin"), VesinBackend)
+    assert isinstance(resolve_neighbor_backend(None, "matscipy"), MatscipyBackend)
+
+
+def test_a_named_backend_wins_over_the_default():
+    named: Any = resolve_neighbor_backend(VesinConfig(n_threads=3), "matscipy")
+    assert named.n_threads == 3
+    assert isinstance(
+        resolve_neighbor_backend(MatscipyConfig(), "vesin"), MatscipyBackend
     )
-    (info / "entry_points.txt").write_text(f"[mace.neighbor_backends]\n{entry_point}\n")
 
 
-def test_two_distributions_registering_different_backends_under_one_name_raise(
-    tmp_path, monkeypatch
-):
-    _install(tmp_path, "first_neighbors", "duplicate = first:Backend")
-    _install(tmp_path, "second_neighbors", "duplicate = second:Backend")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    with pytest.raises(DuplicateNeighborBackendError, match="duplicate"):
-        available_neighbor_backends()
-    with pytest.raises(DuplicateNeighborBackendError, match="duplicate"):
-        get_neighbor_backend("matscipy")
+def test_vesin_takes_its_thread_count_from_the_config():
+    """The thread count changes the speed and never the edges or their order."""
+    positions, cutoff, pbc, cell = CASES["triclinic"]
+    threaded: Any = _backend("vesin", n_threads=4)
+    single: Any = _backend("vesin")
+    assert (threaded.n_threads, single.n_threads) == (4, 1)
+    many = get_neighborhood(positions, cutoff, pbc, cell, backend=threaded)
+    one = get_neighborhood(positions, cutoff, pbc, cell, backend=single)
+    assert np.array_equal(many.edge_index, one.edge_index)
+    assert np.array_equal(many.unit_shifts, one.unit_shifts)
 
 
-def test_two_identical_registrations_are_one(tmp_path, monkeypatch):
-    target = "brute = mace_core.neighbors.brute_force:BruteForceBackend"
-    _install(tmp_path, "first_neighbors", target)
-    _install(tmp_path, "second_neighbors", target)
-    monkeypatch.syspath_prepend(str(tmp_path))
-    names = [backend.name for backend in available_neighbor_backends()]
-    assert names.count("brute") == 1
-    assert isinstance(get_neighbor_backend("brute"), BruteForceBackend)
+def test_validating_a_config_imports_no_backend():
+    """Checking a config that names vesin imports neither vesin nor torch, so
+    a parent process stays clean before its data-loader workers fork."""
+    import subprocess
 
-
-def test_a_backend_registered_through_an_entry_point_is_discovered(
-    tmp_path, monkeypatch
-):
-    """A distribution installed beside this one, found through its metadata
-    alone: nothing in mace_core names it."""
-    (tmp_path / "dummy_neighbors.py").write_text(
-        textwrap.dedent(
-            """
-            import numpy as np
-
-            class DummyBackend:
-                def search(self, positions, cutoff, geometry):
-                    return np.zeros((2, 0), np.int64), np.zeros((0, 3), np.int64)
-            """
-        )
+    probe = (
+        "import sys\n"
+        "from mace_core.neighbors import NeighborListConfig\n"
+        "NeighborListConfig.of('vesin', n_threads=2)\n"
+        "NeighborListConfig.of('matscipy')\n"
+        "print(*(m in sys.modules for m in ('vesin', 'torch', 'matscipy',"
+        " 'mace_core.neighbors.vesin_backend')))"
     )
-    distribution = tmp_path / "dummy_neighbors-1.0.dist-info"
-    distribution.mkdir()
-    (distribution / "METADATA").write_text(
-        "Metadata-Version: 2.1\nName: dummy-neighbors\nVersion: 1.0\n"
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
     )
-    (distribution / "entry_points.txt").write_text(
-        "[mace.neighbor_backends]\ndummy = dummy_neighbors:DummyBackend\n"
-    )
-    monkeypatch.syspath_prepend(str(tmp_path))
-    monkeypatch.delitem(sys.modules, "dummy_neighbors", raising=False)
+    assert result.stdout.split() == ["False"] * 4
 
-    assert "dummy" in {backend.name for backend in available_neighbor_backends()}
-    backend = get_neighbor_backend("dummy")
-    neighbors = get_neighborhood(_cluster(), 2.0, backend=backend)
-    assert neighbors.edge_index.shape == (2, 0)
-    # The effective cell is the graph builder's, whatever the backend did.
-    assert np.array_equal(
-        neighbors.cell, get_neighborhood(_cluster(), 2.0, backend=MATSCIPY).cell
+
+def test_importing_the_vesin_backend_module_does_not_import_vesin():
+    import subprocess
+
+    probe = (
+        "import sys; import mace_core.neighbors.vesin_backend; "
+        "print('vesin' in sys.modules, 'torch' in sys.modules)"
     )
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.split() == ["False", "False"]
+
+
+def _build_in_worker(config):
+    backend = NEIGHBOR_BACKENDS.build(config)
+    neighbors = get_neighborhood(*CASES["triclinic"], backend=backend)
+    return type(backend).__name__, _edges(neighbors)
+
+
+def test_a_config_built_in_a_spawned_worker_gives_the_same_edges():
+    """A worker receives the config, not the backend, and builds it itself:
+    the builder registers in that process the first time it is needed."""
+    import multiprocessing
+
+    expected = _edges(get_neighborhood(*CASES["triclinic"], backend=_backend("vesin")))
+    with multiprocessing.get_context("spawn").Pool(1) as pool:
+        name, edges = pool.apply(_build_in_worker, (VesinConfig(n_threads=1),))
+    assert (name, edges) == ("VesinBackend", expected)
+
+
+def test_a_built_backend_pickles():
+    import pickle
+
+    for kind in NeighborListConfig.kinds():
+        backend = pickle.loads(pickle.dumps(_backend(kind)))
+        neighbors = get_neighborhood(*CASES["triclinic"], backend=backend)
+        assert _edges(neighbors) == _edges(
+            get_neighborhood(*CASES["triclinic"], backend=BruteForceBackend())
+        ), kind
 
 
 def test_a_backend_returning_malformed_edges_is_refused():
@@ -459,142 +521,185 @@ def test_a_backend_returning_malformed_edges_is_refused():
         get_neighborhood(_cluster(), 2.0, backend=Broken())
 
 
-def _register_module(path, monkeypatch, name, source):
-    """A module and a distribution registering ``name`` as its ``Backend``."""
-    (path / f"{name}_neighbors.py").write_text(textwrap.dedent(source))
-    _install(path, f"{name}_neighbors", f"{name} = {name}_neighbors:Backend")
+# --- a backend from another distribution --------------------------------------
+
+
+def _install(path, distribution, **groups):
+    """A distribution whose metadata declares entry points, one group per
+    keyword (``neighbor_list`` and ``neighbor_backends``)."""
+    info = path / f"{distribution}-1.0.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: {distribution}\nVersion: 1.0\n"
+    )
+    sections = "".join(f"[mace.{group}]\n{line}\n" for group, line in groups.items())
+    (info / "entry_points.txt").write_text(sections)
+
+
+def _module(path, monkeypatch, name, source):
+    (path / f"{name}.py").write_text(textwrap.dedent(source))
     monkeypatch.syspath_prepend(str(path))
-    monkeypatch.delitem(sys.modules, f"{name}_neighbors", raising=False)
+    monkeypatch.delitem(sys.modules, name, raising=False)
 
 
-def test_resolving_a_name_imports_only_that_backend(tmp_path, monkeypatch):
-    """A backend that sets up a device when imported costs nothing to a run
-    that resolves another one."""
-    _register_module(
+SKIN_CONFIG = """
+    from typing import Literal
+    from pydantic import Field
+    from mace_core.neighbors import NeighborListConfig
+
+    class SkinConfig(NeighborListConfig):
+        kind: Literal["skin"] = "skin"
+        skin: float = Field(0.0, ge=0.0)
+"""
+
+SKIN_BACKEND = """
+    import numpy as np
+    from mace_core.neighbors import NEIGHBOR_BACKENDS
+    from skin_config import SkinConfig
+
+    class SkinBackend:
+        def __init__(self, config: SkinConfig) -> None:
+            self.skin = config.skin
+
+        def search(self, positions, cutoff, geometry):
+            return np.zeros((2, 0), np.int64), np.zeros((0, 3), np.int64)
+
+    NEIGHBOR_BACKENDS.register(SkinConfig, SkinBackend)
+"""
+
+
+def _install_skin(tmp_path, monkeypatch, backend_source=SKIN_BACKEND):
+    _module(tmp_path, monkeypatch, "skin_config", SKIN_CONFIG)
+    _module(tmp_path, monkeypatch, "skin_backend", backend_source)
+    _install(
         tmp_path,
-        monkeypatch,
-        "heavy",
-        """
-        raise RuntimeError("importing this backend sets up a device")
-        """,
-    )
-    assert isinstance(get_neighbor_backend("brute_force"), BruteForceBackend)
-    assert "heavy_neighbors" not in sys.modules
-    listed = {backend.name: backend for backend in available_neighbor_backends()}
-    assert not listed["heavy"].loaded
-    assert "sets up a device" in listed["heavy"].reason
-
-
-def test_the_settings_reach_the_backend_factory(tmp_path, monkeypatch):
-    _register_module(
-        tmp_path,
-        monkeypatch,
-        "skinned",
-        """
-        import numpy as np
-
-        class Backend:
-            def __init__(self, skin=0.0):
-                if skin < 0:
-                    raise ValueError("skin must not be negative")
-                self.skin = skin
-
-            def search(self, positions, cutoff, geometry):
-                return np.zeros((2, 0), np.int64), np.zeros((0, 3), np.int64)
-        """,
-    )
-    config = NeighborListConfig(kind="skinned", settings={"skin": 0.5})
-    configured: Any = resolve_neighbor_backend(config)
-    default: Any = get_neighbor_backend("skinned")
-    assert configured.skin == 0.5
-    assert default.skin == 0.0
-    with pytest.raises(NeighborBackendNotAvailableError, match=r"skinned.*rebuild"):
-        get_neighbor_backend("skinned", {"rebuild": 10})
-    with pytest.raises(NeighborBackendNotAvailableError, match="not be negative"):
-        get_neighbor_backend("skinned", {"skin": -1.0})
-
-
-def test_a_backend_without_settings_refuses_any():
-    with pytest.raises(NeighborBackendNotAvailableError, match="matscipy"):
-        get_neighbor_backend("matscipy", {"skin": 0.5})
-
-
-def test_vesin_takes_its_thread_count_from_the_settings():
-    """The thread count changes the speed and never the edges or their order."""
-    positions, cutoff, pbc, cell = CASES["triclinic"]
-    config = NeighborListConfig(kind="vesin", settings={"n_threads": 4})
-    threaded: Any = resolve_neighbor_backend(config)
-    single: Any = get_neighbor_backend("vesin")
-    assert (threaded.n_threads, single.n_threads) == (4, 1)
-    many = get_neighborhood(positions, cutoff, pbc, cell, backend=threaded)
-    one = get_neighborhood(positions, cutoff, pbc, cell, backend=single)
-    assert np.array_equal(many.edge_index, one.edge_index)
-    assert np.array_equal(many.unit_shifts, one.unit_shifts)
-
-
-@pytest.mark.parametrize("n_threads", [-1, 1.5, True, "4"])
-def test_vesin_refuses_a_thread_count_that_is_not_a_count(n_threads):
-    with pytest.raises(NeighborBackendNotAvailableError, match="n_threads"):
-        get_neighbor_backend("vesin", {"n_threads": n_threads})
-
-
-# --- choosing a backend when the config names none ---------------------------
-
-
-def test_with_no_backend_named_and_no_framework_brute_force_is_used():
-    assert DEFAULT_NEIGHBOR_BACKEND == "brute_force"
-    assert isinstance(resolve_neighbor_backend(), BruteForceBackend)
-
-
-def test_with_no_backend_named_the_framework_default_is_used():
-    assert isinstance(resolve_neighbor_backend(None, "vesin"), VesinBackend)
-    assert isinstance(
-        resolve_neighbor_backend(NeighborListConfig(), "matscipy"), MatscipyBackend
+        "skin_neighbors",
+        neighbor_list="skin = skin_config:SkinConfig",
+        neighbor_backends="skin = skin_backend",
     )
 
 
-def test_a_named_backend_wins_over_the_default():
-    config = NeighborListConfig(kind="matscipy")
-    assert isinstance(resolve_neighbor_backend(config, "vesin"), MatscipyBackend)
-    config = NeighborListConfig(kind="vesin", settings={"n_threads": 3})
-    named: Any = resolve_neighbor_backend(config, "matscipy")
-    assert named.n_threads == 3
+def test_a_kind_from_another_distribution_is_validated_and_built(tmp_path, monkeypatch):
+    """Nothing in mace_core names it. Validating imports only its config
+    module; building imports its backend module."""
+    _install_skin(tmp_path, monkeypatch)
+    assert "skin" in NeighborListConfig.kinds()
+    run = _Run.from_dict({"neighbor_list": {"kind": "skin", "skin": 0.5}})
+    assert "skin_config" in sys.modules
+    assert "skin_backend" not in sys.modules
+    with pytest.raises(ValidationError, match=r"neighbor_list\.skn"):
+        _Run.from_dict({"neighbor_list": {"kind": "skin", "skn": 0.5}})
+    assert run.neighbor_list is not None
+    backend: Any = NEIGHBOR_BACKENDS.build(run.neighbor_list)
+    assert backend.skin == 0.5
+    assert _Run.from_dict(run.to_resolved_dict()) == run
 
 
-def test_a_named_backend_that_cannot_be_built_is_not_replaced():
-    config = NeighborListConfig(kind="cell_list_on_the_moon")
-    with pytest.raises(NeighborBackendNotAvailableError, match="cell_list_on_the_moon"):
-        resolve_neighbor_backend(config, "vesin")
-
-
-def test_a_default_that_did_not_import_is_an_error_not_a_fallback(
+def test_a_backend_that_fails_to_import_is_reported_and_not_replaced(
     tmp_path, monkeypatch
 ):
-    _register_module(
+    """The reason is kept, so the second build does not import it again."""
+    _install_skin(
         tmp_path,
         monkeypatch,
-        "heavy",
-        """
-        raise RuntimeError("importing this backend sets up a device")
-        """,
+        'raise RuntimeError("importing this backend sets up a device")',
     )
-    with pytest.raises(NeighborBackendNotAvailableError, match="sets up a device"):
-        resolve_neighbor_backend(None, "heavy")
+    config = NeighborListConfig.of("skin")
+    for _ in range(2):
+        with pytest.raises(NotAvailableError, match="sets up a device"):
+            NEIGHBOR_BACKENDS.build(config)
+    listed = {entry.kind: entry for entry in NEIGHBOR_BACKENDS.available()}
+    assert not listed["skin"].loaded
+    assert "sets up a device" in listed["skin"].reason
+    assert listed["brute_force"].loaded
 
 
-def test_importing_the_vesin_backend_module_does_not_import_vesin():
-    """vesin imports torch whenever torch is installed, so it is imported when
-    the backend is built and not when the registry lists it."""
-    import subprocess
+def test_building_one_kind_imports_no_other_backend(tmp_path, monkeypatch):
+    _install_skin(
+        tmp_path,
+        monkeypatch,
+        'raise RuntimeError("importing this backend sets up a device")',
+    )
+    assert isinstance(_backend("brute_force"), BruteForceBackend)
+    assert "skin_backend" not in sys.modules
 
-    probe = (
-        "import sys; import mace_core.neighbors.vesin_backend; "
-        "print('vesin' in sys.modules, 'torch' in sys.modules)"
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
-    )
-    assert result.stdout.split() == ["False", "False"]
+
+def test_a_kind_without_a_builder_is_refused_when_built(tmp_path, monkeypatch):
+    _module(tmp_path, monkeypatch, "skin_config", SKIN_CONFIG)
+    _install(tmp_path, "skin_neighbors", neighbor_list="skin = skin_config:SkinConfig")
+    config = NeighborListConfig.of("skin")
+    with pytest.raises(NotAvailableError, match="no builder is registered for 'skin'"):
+        NEIGHBOR_BACKENDS.build(config)
+
+
+def test_a_builder_module_that_registers_nothing_is_refused(tmp_path, monkeypatch):
+    _install_skin(tmp_path, monkeypatch, "x = 1")
+    with pytest.raises(NotAvailableError, match="registered no builder"):
+        NEIGHBOR_BACKENDS.build(NeighborListConfig.of("skin"))
+
+
+def test_a_builder_whose_product_is_no_backend_is_refused(tmp_path, monkeypatch):
+    source = SKIN_BACKEND.replace("def search(", "def find(")
+    _install_skin(tmp_path, monkeypatch, source)
+    with pytest.raises(NotAvailableError, match="not a NeighborListBackend"):
+        NEIGHBOR_BACKENDS.build(NeighborListConfig.of("skin"))
+
+
+def test_two_distributions_registering_one_kind_differently_raise(
+    tmp_path, monkeypatch
+):
+    _install(tmp_path, "first", neighbor_backends="duplicate = first")
+    _install(tmp_path, "second", neighbor_backends="duplicate = second")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    with pytest.raises(DuplicateRegistrationError, match="duplicate"):
+        NEIGHBOR_BACKENDS.available()
+
+
+def test_two_identical_registrations_are_one(tmp_path, monkeypatch):
+    target = "brute_force = mace_core.neighbors.brute_force"
+    _install(tmp_path, "first", neighbor_backends=target)
+    _install(tmp_path, "second", neighbor_backends=target)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    kinds = [entry.kind for entry in NEIGHBOR_BACKENDS.available()]
+    assert kinds.count("brute_force") == 1
+
+
+def test_a_kind_defined_twice_is_refused_when_the_class_is_defined():
+    with pytest.raises(DuplicateRegistrationError, match="'vesin' is defined twice"):
+
+        class AnotherVesin(NeighborListConfig):
+            kind: Literal["vesin"] = "vesin"
+
+
+@pytest.mark.parametrize("annotation", ["str", 'Literal["a", "b"]', "Literal[1]"])
+def test_a_kind_that_is_not_one_literal_string_is_refused(annotation):
+    namespace = {"Literal": Literal, "NeighborListConfig": NeighborListConfig}
+    with pytest.raises(TypeError, match="one-string Literal"):
+        exec(
+            f"class Odd(NeighborListConfig):\n    kind: {annotation} = 'a'\n",
+            namespace,
+        )
+
+
+def test_a_builder_for_another_family_is_refused():
+    class Other(KindedSection):
+        pass
+
+    class OtherKind(Other):
+        kind: Literal["other"] = "other"
+
+    with pytest.raises(TypeError, match="not a NeighborListConfig"):
+        NEIGHBOR_BACKENDS.register(OtherKind, lambda config: BruteForceBackend())  # type: ignore[arg-type]
+
+
+def test_registering_a_second_builder_for_a_kind_is_refused():
+    NEIGHBOR_BACKENDS.register(VesinConfig, VesinBackend)
+    with pytest.raises(DuplicateRegistrationError, match="two builders"):
+        NEIGHBOR_BACKENDS.register(VesinConfig, lambda config: VesinBackend(config))
+
+
+def test_the_protocol_is_the_product():
+    assert NEIGHBOR_BACKENDS.product is NeighborListBackend
 
 
 @pytest.mark.parametrize(

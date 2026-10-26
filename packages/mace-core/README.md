@@ -22,9 +22,10 @@ What is here so far:
   form, and `format_citations()`. The schema is versioned `major.minor`;
   which records a release reads is stated at `SCHEMA_VERSION`.
 - `mace_core.neighbors` — `get_neighborhood`, the pure-function neighbour list
-  every graph builder calls, over swappable backends registered in the
-  `mace.neighbor_backends` entry point group, selected by the
-  `NeighborListConfig` section. `brute_force` needs only numpy; `vesin` and
+  every graph builder calls, over swappable backends. A `NeighborListConfig`
+  kind chooses one and holds its settings; `NEIGHBOR_BACKENDS` builds it,
+  importing the backend's module from the `mace.neighbor_backends` entry
+  point only then. `brute_force` needs only numpy; `vesin` and
   `matscipy` come with the extras of the same names. A section that names no
   backend gets the framework's default through `resolve_neighbor_backend`:
   vesin for mace-torch, matscipy for mace-jax, brute_force without a

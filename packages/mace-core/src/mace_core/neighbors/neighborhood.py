@@ -72,7 +72,7 @@ def get_neighborhood(
         pbc: Three flags, one per lattice vector; ``None`` is fully aperiodic.
         cell: ``[3, 3]`` lattice vectors as rows, in Angstrom, or ``None``.
         backend: The resolved backend, from
-            :func:`~mace_core.neighbors.backends.get_neighbor_backend`.
+            :func:`~mace_core.neighbors.backends.resolve_neighbor_backend`.
 
     Raises:
         ValueError: if an input has the wrong shape (see
