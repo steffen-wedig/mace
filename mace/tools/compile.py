@@ -1,3 +1,4 @@
+import copy
 from contextlib import contextmanager
 from functools import wraps
 from typing import Callable, Tuple
@@ -110,16 +111,37 @@ def simplify(module: nn.Module) -> nn.Module:
     return module
 
 
+def simplified_view(module: nn.Module) -> nn.Module:
+    """A view of ``module`` for torch.compile that leaves ``module`` untouched.
+
+    Like :func:`simplify`, registered modules are replaced by their
+    ``torch.fx.symbolic_trace``; but the replacement happens on shallow copies,
+    and the traced graphs hold the original parameters and buffers by reference.
+    Training through the view therefore updates the original model, which keeps
+    its own module types for checkpoints, saved models and everything that
+    inspects them (config extraction, calculators, warm starts).
+    """
+    if isinstance(module, tuple(_SIMPLIFY_REGISTRY)):
+        return symbolic_trace(module)
+    view = copy.copy(module)
+    view._modules = {  # pylint: disable=protected-access
+        name: None if child is None else simplified_view(child)
+        for name, child in module._modules.items()  # pylint: disable=protected-access
+    }
+    return view
+
+
 class CompiledTrainingModel(nn.Module):
     """Routes training forwards through torch.compile, everything else to the model.
 
     Takes the place of the distributed model in ``tools.train``: training steps
-    call it with ``training=True`` and get the compiled forward (one graph,
-    dynamic shapes); validation calls it with ``training=False`` and gets the
-    eager model. The model itself, built by :func:`prepare`'s recipe (e3nn
-    codegen off, :func:`simplify`), stays what is checkpointed and saved. A
-    compiled graph cannot turn its inputs into differentiable leaves, so the
-    positions get ``requires_grad`` here, before the compiled call.
+    call it with ``training=True`` and get the compiled forward of a
+    :func:`simplified_view` (one graph, dynamic shapes); validation calls it with
+    ``training=False`` and gets the eager model. The model is built without e3nn
+    codegen (:func:`disable_e3nn_codegen`) and stays unsimplified, so it is what
+    is checkpointed and saved. A compiled graph cannot turn its inputs into
+    differentiable leaves, so the positions get ``requires_grad`` here, before
+    the compiled call.
     """
 
     def __init__(self, model: nn.Module, backend: str = "inductor") -> None:
@@ -127,7 +149,7 @@ class CompiledTrainingModel(nn.Module):
         configure_autograd_for_compile(allow_autograd=True)
         self.model = model
         self.compiled = torch.compile(
-            model, fullgraph=True, dynamic=True, backend=backend
+            simplified_view(model), fullgraph=True, dynamic=True, backend=backend
         )
 
     def forward(self, data, training: bool = False, **kwargs):

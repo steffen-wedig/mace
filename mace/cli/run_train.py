@@ -954,11 +954,11 @@ def run(args) -> None:
 
     # Model
     if args.compile_training:
-        # mace.tools.compile.prepare's recipe: no e3nn TorchScript codegen, and
-        # the registered modules replaced by traceable fx graphs.
+        # No e3nn TorchScript codegen, which torch.compile cannot trace; the
+        # traceable fx graphs live only in CompiledTrainingModel's view, so the
+        # model keeps its own module types for saving and inspection.
         with mace_compile.disable_e3nn_codegen():
             model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
-        model = mace_compile.simplify(model)
     else:
         model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
     if args.multilevel_base_model is not None:

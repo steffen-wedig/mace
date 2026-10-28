@@ -18,6 +18,7 @@ from e3nn import o3
 from mace import data, modules, tools
 from mace.tools import compile as mace_compile
 from mace.tools import torch_geometric
+from mace.tools.scripts_utils import extract_config_mace_model
 
 TABLE = tools.AtomicNumberTable([1, 8])
 CUTOFF = 4.0
@@ -82,7 +83,8 @@ def fixture_default_dtype_float64():
 
 @pytest.mark.usefixtures("default_dtype_float64")
 def test_compiled_training_matches_eager():
-    model = mace_compile.prepare(create_mace)()
+    with mace_compile.disable_e3nn_codegen():
+        model = create_mace()
     compiled = mace_compile.CompiledTrainingModel(model, backend="aot_eager")
 
     for step, sizes in enumerate(([2, 3], [1, 4, 2], [3, 3])):
@@ -104,10 +106,27 @@ def test_compiled_training_matches_eager():
 
 @pytest.mark.usefixtures("default_dtype_float64")
 def test_evaluation_reaches_the_eager_model():
-    model = mace_compile.prepare(create_mace)()
+    with mace_compile.disable_e3nn_codegen():
+        model = create_mace()
     compiled = mace_compile.CompiledTrainingModel(model, backend="aot_eager")
     batch = water_batch([2, 2], 0)
     expected = model(water_batch([2, 2], 0), training=False, compute_force=True)
     result = compiled(batch, training=False, compute_force=True)
     torch.testing.assert_close(result["energy"], expected["energy"])
     torch.testing.assert_close(result["forces"], expected["forces"])
+
+
+@pytest.mark.usefixtures("default_dtype_float64")
+def test_the_trained_model_keeps_its_module_types():
+    # Saved models and config extraction inspect the model's own modules, so
+    # the traced graphs must live only in the compiled view.
+    with mace_compile.disable_e3nn_codegen():
+        model = create_mace()
+    contraction = model.products[0].symmetric_contractions
+    mace_compile.CompiledTrainingModel(model, backend="aot_eager")
+    assert model.products[0].symmetric_contractions is contraction
+    assert not isinstance(contraction, torch.fx.GraphModule)
+    view = mace_compile.simplified_view(model)
+    assert isinstance(view.products[0].symmetric_contractions, torch.fx.GraphModule)
+    assert {id(p) for p in view.parameters()} == {id(p) for p in model.parameters()}
+    extract_config_mace_model(model)
