@@ -123,16 +123,18 @@ def test_stage_two_alias_maps_to_swa_dest():
 
 def test_interaction_huber_loss_arguments():
     args = build_default_arg_parser().parse_args(MINIMAL_ARGV)
-    # None means "equal to the frame weight of the same stage", resolved where the loss is built
-    assert args.monomer_energy_weight is None
-    assert args.monomer_forces_weight is None
-    assert args.swa_monomer_energy_weight is None
-    assert args.swa_monomer_forces_weight is None
+    for removed in (
+        "monomer_energy_weight",
+        "monomer_forces_weight",
+        "swa_monomer_energy_weight",
+        "swa_monomer_forces_weight",
+        "huber_delta_monomer_energy",
+        "huber_delta_monomer_forces",
+    ):
+        assert not hasattr(args, removed)
     terms = (
         "frame_energy",
         "frame_forces",
-        "monomer_energy",
-        "monomer_forces",
         "interaction_energy",
         "interaction_forces",
     )
@@ -144,17 +146,17 @@ def test_interaction_huber_loss_arguments():
         + [
             "--loss",
             "interaction_huber",
-            "--monomer_energy_weight",
+            "--interaction_energy_weight",
             "0.0",
-            "--stage_two_monomer_forces_weight",
+            "--stage_two_interaction_forces_weight",
             "5.0",
             "--huber_delta_interaction_forces",
             "0.05",
         ]
     )
     assert args.loss == "interaction_huber"
-    assert args.monomer_energy_weight == 0.0
-    assert args.swa_monomer_forces_weight == 5.0
+    assert args.interaction_energy_weight == 0.0
+    assert args.swa_interaction_forces_weight == 5.0
     assert args.huber_delta_interaction_forces == 0.05
 
 

@@ -878,38 +878,6 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         dest="swa_interaction_forces_weight",
     )
     parser.add_argument(
-        "--monomer_energy_weight",
-        help="weight of the energy loss of standalone (aperiodic, sign +1) monomers "
-        "(loss interaction_huber); default: equal to --energy_weight",
-        type=float,
-        default=None,
-    )
-    parser.add_argument(
-        "--swa_monomer_energy_weight",
-        "--stage_two_monomer_energy_weight",
-        help="weight of the monomer energy loss after starting Stage Two; "
-        "default: equal to --swa_energy_weight",
-        type=float,
-        default=None,
-        dest="swa_monomer_energy_weight",
-    )
-    parser.add_argument(
-        "--monomer_forces_weight",
-        help="weight of the forces loss of standalone (aperiodic, sign +1) monomers "
-        "(loss interaction_huber); default: equal to --forces_weight",
-        type=float,
-        default=None,
-    )
-    parser.add_argument(
-        "--swa_monomer_forces_weight",
-        "--stage_two_monomer_forces_weight",
-        help="weight of the monomer forces loss after starting Stage Two; "
-        "default: equal to --swa_forces_weight",
-        type=float,
-        default=None,
-        dest="swa_monomer_forces_weight",
-    )
-    parser.add_argument(
         "--huber_delta_frame_energy",
         help="Huber threshold of the frame energy term (loss interaction_huber)",
         type=float,
@@ -918,18 +886,6 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--huber_delta_frame_forces",
         help="Huber threshold of the frame forces term (loss interaction_huber)",
-        type=float,
-        default=0.01,
-    )
-    parser.add_argument(
-        "--huber_delta_monomer_energy",
-        help="Huber threshold of the monomer energy term (loss interaction_huber)",
-        type=float,
-        default=0.01,
-    )
-    parser.add_argument(
-        "--huber_delta_monomer_forces",
-        help="Huber threshold of the monomer forces term (loss interaction_huber)",
         type=float,
         default=0.01,
     )

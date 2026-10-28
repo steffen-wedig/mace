@@ -775,35 +775,15 @@ def get_interaction_huber_loss(
     args: argparse.Namespace, stage_two: bool
 ) -> torch.nn.Module:
     """``InteractionHuberLoss`` with the weights of stage one or two (``swa_*``) and the same
-    Huber thresholds in both. Monomer weights left at None follow the frame weights of the
-    same stage."""
+    Huber thresholds in both."""
     prefix = "swa_" if stage_two else ""
-    energy_weight = getattr(args, f"{prefix}energy_weight")
-    forces_weight = getattr(args, f"{prefix}forces_weight")
-    monomer_energy_weight = getattr(args, f"{prefix}monomer_energy_weight")
-    monomer_forces_weight = getattr(args, f"{prefix}monomer_forces_weight")
-    stage = "Stage Two" if stage_two else "Stage One"
-    if monomer_energy_weight is None:
-        monomer_energy_weight = energy_weight
-        logging.info(
-            f"{stage}: --{prefix}monomer_energy_weight not set, using the frame energy weight {energy_weight}"
-        )
-    if monomer_forces_weight is None:
-        monomer_forces_weight = forces_weight
-        logging.info(
-            f"{stage}: --{prefix}monomer_forces_weight not set, using the frame forces weight {forces_weight}"
-        )
     return modules.InteractionHuberLoss(
-        energy_weight=energy_weight,
-        forces_weight=forces_weight,
-        monomer_energy_weight=monomer_energy_weight,
-        monomer_forces_weight=monomer_forces_weight,
+        energy_weight=getattr(args, f"{prefix}energy_weight"),
+        forces_weight=getattr(args, f"{prefix}forces_weight"),
         interaction_energy_weight=getattr(args, f"{prefix}interaction_energy_weight"),
         interaction_forces_weight=getattr(args, f"{prefix}interaction_forces_weight"),
         huber_delta_frame_energy=args.huber_delta_frame_energy,
         huber_delta_frame_forces=args.huber_delta_frame_forces,
-        huber_delta_monomer_energy=args.huber_delta_monomer_energy,
-        huber_delta_monomer_forces=args.huber_delta_monomer_forces,
         huber_delta_interaction_energy=args.huber_delta_interaction_energy,
         huber_delta_interaction_forces=args.huber_delta_interaction_forces,
     )
@@ -816,8 +796,8 @@ def get_selection_loss_fn(
 
     For ``interaction_huber``: the frame energy and frame forces terms only, at the stage-two
     (``swa_*``) frame weights when the run has a stage two, else at the stage-one frame
-    weights. Monomer and interaction terms get weight 0, so every loss arm is selected by the
-    same quantity. For any other loss: a copy of the stage-one loss."""
+    weights. The interaction terms get weight 0, so every loss arm is selected by the same
+    quantity. For any other loss: a copy of the stage-one loss."""
     if args.loss != "interaction_huber":
         return deepcopy(loss_fn)
     prefix = "swa_" if args.swa else ""
@@ -825,7 +805,7 @@ def get_selection_loss_fn(
     forces_weight = getattr(args, f"{prefix}forces_weight")
     logging.info(
         "Best-model criterion: frame energy (weight %s) and frame forces (weight %s), "
-        "%s weights; monomer and interaction terms excluded",
+        "%s weights; interaction terms excluded",
         energy_weight,
         forces_weight,
         "stage-two" if args.swa else "stage-one",
@@ -833,14 +813,10 @@ def get_selection_loss_fn(
     return modules.InteractionHuberLoss(
         energy_weight=energy_weight,
         forces_weight=forces_weight,
-        monomer_energy_weight=0.0,
-        monomer_forces_weight=0.0,
         interaction_energy_weight=0.0,
         interaction_forces_weight=0.0,
         huber_delta_frame_energy=args.huber_delta_frame_energy,
         huber_delta_frame_forces=args.huber_delta_frame_forces,
-        huber_delta_monomer_energy=args.huber_delta_monomer_energy,
-        huber_delta_monomer_forces=args.huber_delta_monomer_forces,
         huber_delta_interaction_energy=args.huber_delta_interaction_energy,
         huber_delta_interaction_forces=args.huber_delta_interaction_forces,
     )

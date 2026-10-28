@@ -52,8 +52,7 @@ LOSS_SETTINGS = {
     "interaction_universal": {"loss": "interaction_universal", "compute_stress": True},
     "interaction_huber": {
         "loss": "interaction_huber",
-        "monomer_energy_weight": 0.0,
-        "swa_monomer_forces_weight": 50.0,
+        "swa_interaction_forces_weight": 50.0,
         "huber_delta_interaction_energy": 0.02,
     },
 }

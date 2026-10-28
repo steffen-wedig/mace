@@ -19,6 +19,7 @@ from torch.optim.swa_utils import SWALR, AveragedModel
 from mace import data, modules, tools
 from mace.tools import torch_geometric
 from mace.tools.loss_terms import (
+    COSINE_PAIRS,
     LossTermAccumulator,
     LossTermInstrumentation,
     LossTermJsonlWriter,
@@ -30,8 +31,6 @@ from mace.tools.train import SWAContainer, evaluate, train
 TERM_NAMES = (
     "frame_energy",
     "frame_forces",
-    "monomer_energy",
-    "monomer_forces",
     "interaction_energy",
     "interaction_forces",
 )
@@ -63,8 +62,8 @@ def statistics(weight, weighted_sum, weight_sum, entry_count, linear_count):
 class FakeTermLoss(torch.nn.Module):
     """A contract-following loss on a MACE batch.
 
-    frame terms: squared errors; monomer terms: absolute errors (so their gradients
-    point elsewhere); interaction terms: no entries (value 0, no graph).
+    frame terms: squared errors; interaction forces: absolute errors (so its gradient
+    points elsewhere); interaction energy: no entries (value 0, no graph).
     """
 
     term_names = TERM_NAMES
@@ -124,20 +123,13 @@ class FakeTermLoss(torch.nn.Module):
                 force_error.abs().amax(dim=-1),
                 atom_weights,
             ),
-            "monomer_energy": self._term(
-                "monomer_energy",
-                energy_error.abs(),
-                energy_error,
-                configuration_weights,
-            ),
-            "monomer_forces": self._term(
-                "monomer_forces",
+            "interaction_energy": self._empty("interaction_energy", energy_error),
+            "interaction_forces": self._term(
+                "interaction_forces",
                 force_error.abs().mean(dim=-1),
                 force_error.abs().amax(dim=-1),
                 atom_weights,
             ),
-            "interaction_energy": self._empty("interaction_energy", energy_error),
-            "interaction_forces": self._empty("interaction_forces", energy_error),
         }
 
     def forward(self, ref, pred, ddp=None):  # pylint: disable=unused-argument
@@ -147,15 +139,12 @@ class FakeTermLoss(torch.nn.Module):
 STAGE_ONE_WEIGHTS = {
     "frame_energy": 1.0,
     "frame_forces": 100.0,
-    "monomer_energy": 1.0,
-    "monomer_forces": 100.0,
     "interaction_energy": 1.0,
     "interaction_forces": 100.0,
 }
 STAGE_TWO_WEIGHTS = {
     **STAGE_ONE_WEIGHTS,
     "frame_energy": 1000.0,
-    "monomer_energy": 1000.0,
 }
 
 
@@ -307,7 +296,7 @@ def test_per_term_gradients_sum_to_the_gradient_of_the_total():
         {
             "frame_energy": lambda output: (output[:, 0] ** 2).mean(),
             "frame_forces": lambda output: 3.0 * output[:, 1].abs().mean(),
-            "monomer_energy": lambda output: (output.sum(dim=1) ** 2).mean(),
+            "interaction_energy": lambda output: (output.sum(dim=1) ** 2).mean(),
         }
     )
     result = probe_term_gradients(model, loss_fn, batch, OUTPUT_ARGUMENTS)
@@ -336,17 +325,23 @@ def test_cosines_of_constructed_gradients():
             "interaction_energy": lambda output: 5.0 * output[:, 0].sum(),
             "frame_forces": lambda output: output[:, 0].sum(),
             "interaction_forces": lambda output: -2.0 * output[:, 0].sum(),
-            "monomer_energy": lambda output: output[:, 1].sum(),
-            "monomer_forces": lambda output: 0.0 * output[:, 1].sum(),
+            "orthogonal": lambda output: output[:, 1].sum(),
+            "zero": lambda output: 0.0 * output[:, 1].sum(),
         }
     )
-    result = probe_term_gradients(model, loss_fn, batch, OUTPUT_ARGUMENTS)
+    result = probe_term_gradients(
+        model,
+        loss_fn,
+        batch,
+        OUTPUT_ARGUMENTS,
+        cosine_pairs=COSINE_PAIRS + (("frame_energy", "orthogonal"), ("frame_forces", "zero")),
+    )
     cosines = result["cosine_similarities"]
     assert cosines["frame_energy_vs_interaction_energy"] == pytest.approx(1.0)
     assert cosines["frame_forces_vs_interaction_forces"] == pytest.approx(-1.0)
-    assert cosines["frame_energy_vs_monomer_energy"] == pytest.approx(0.0, abs=1e-12)
-    assert cosines["frame_forces_vs_monomer_forces"] is None  # zero term, zero gradient
-    assert result["gradient_norms"]["monomer_forces"] == 0.0
+    assert cosines["frame_energy_vs_orthogonal"] == pytest.approx(0.0, abs=1e-12)
+    assert cosines["frame_forces_vs_zero"] is None  # zero term, zero gradient
+    assert result["gradient_norms"]["zero"] == 0.0
 
 
 def test_pairs_with_an_absent_term_are_skipped():
@@ -476,13 +471,24 @@ def build_model():
     )
 
 
-def build_loaders():
+def build_loaders(periodic: bool = False):
+    import dataclasses as dataclass_tools
+
     table = tools.AtomicNumberTable([1, 8])
-    graphs = [
-        data.AtomicData.from_config(
-            water_configuration(shift, energy), z_table=table, cutoff=5.0
-        )
+    configurations = [
+        water_configuration(shift, energy)
         for shift, energy in [(0.0, -1.5), (0.1, -1.2), (0.2, -1.8), (0.3, -1.0)]
+    ]
+    if periodic:
+        configurations = [
+            dataclass_tools.replace(
+                configuration, pbc=(True, True, True), cell=np.eye(3) * 20.0
+            )
+            for configuration in configurations
+        ]
+    graphs = [
+        data.AtomicData.from_config(configuration, z_table=table, cutoff=5.0)
+        for configuration in configurations
     ]
     train_loader = torch_geometric.dataloader.DataLoader(
         dataset=graphs,
@@ -503,10 +509,11 @@ def run_training(
     max_num_epochs=3,
     loss_factory=FakeTermLoss,
     select_best=False,
+    periodic=False,
 ):
     """Two optimizer steps per epoch; stage two from epoch 1."""
     model = build_model()
-    train_loader, valid_loaders = build_loaders()
+    train_loader, valid_loaders = build_loaders(periodic=periodic)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
     stage_one_loss = loss_factory(STAGE_ONE_WEIGHTS)
@@ -614,7 +621,7 @@ def test_training_writes_every_record_type(tmp_path, float64):  # pylint: disabl
         assert (
             probe["cosine_similarities"]["frame_energy_vs_interaction_energy"] is None
         )
-        cosine = probe["cosine_similarities"]["frame_energy_vs_monomer_energy"]
+        cosine = probe["cosine_similarities"]["frame_forces_vs_interaction_forces"]
         assert abs(cosine) <= 1.0 + 1e-9
         assert probe["wall_time_seconds"] >= 0.0
 
@@ -671,8 +678,6 @@ def interaction_huber_loss(weights):
     return modules.InteractionHuberLoss(
         energy_weight=weights["frame_energy"],
         forces_weight=weights["frame_forces"],
-        monomer_energy_weight=weights["monomer_energy"],
-        monomer_forces_weight=weights["monomer_forces"],
         interaction_energy_weight=weights["interaction_energy"],
         interaction_forces_weight=weights["interaction_forces"],
     )
@@ -682,9 +687,12 @@ def interaction_huber_loss(weights):
     not hasattr(modules, "InteractionHuberLoss"), reason="needs InteractionHuberLoss"
 )
 def test_training_with_the_interaction_huber_loss(tmp_path, float64):  # pylint: disable=unused-argument
-    """The real contract loss on extxyz-style batches: aperiodic waters are monomers."""
+    """The real contract loss on extxyz-style batches: periodic waters are frames."""
     run_training(
-        tmp_path, instrumentation_interval=2, loss_factory=interaction_huber_loss
+        tmp_path,
+        instrumentation_interval=2,
+        loss_factory=interaction_huber_loss,
+        periodic=True,
     )
     records = read_records(tmp_path)
     assert records[0]["term_names"] == list(TERM_NAMES)
@@ -694,16 +702,16 @@ def test_training_with_the_interaction_huber_loss(tmp_path, float64):  # pylint:
         if record["record"] == "term_summary" and record["split"] == "train"
     )
     terms = train_summary["terms"]
-    assert terms["monomer_energy"]["entry_count"] == 4.0
-    assert terms["monomer_forces"]["entry_count"] == 36.0  # 12 atoms, 3 components
-    assert terms["frame_energy"]["entry_count"] == 0.0
+    assert terms["frame_energy"]["entry_count"] == 4.0
+    assert terms["frame_forces"]["entry_count"] == 36.0  # 12 atoms, 3 components
     assert terms["interaction_energy"]["pooled_unweighted_mean"] is None
+    assert terms["interaction_forces"]["pooled_unweighted_mean"] is None
     switch = next(record for record in records if record["record"] == "stage_switch")
     assert switch["new_weights"]["frame_energy"] == 1000.0
     probe = next(record for record in records if record["record"] == "gradient_probe")
-    assert probe["gradient_norms"]["monomer_forces"] > 0.0
-    assert probe["gradient_norms"]["frame_energy"] == 0.0
-    assert probe["cosine_similarities"]["frame_forces_vs_monomer_forces"] is None
+    assert probe["gradient_norms"]["frame_forces"] > 0.0
+    assert probe["gradient_norms"]["interaction_forces"] == 0.0
+    assert probe["cosine_similarities"]["frame_forces_vs_interaction_forces"] is None
 
 
 def read_results(tmp_path):

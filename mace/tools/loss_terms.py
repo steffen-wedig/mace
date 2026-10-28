@@ -54,8 +54,6 @@ STATISTIC_FIELDS: Tuple[str, ...] = (
 COSINE_PAIRS: Tuple[Tuple[str, str], ...] = (
     ("frame_energy", "interaction_energy"),
     ("frame_forces", "interaction_forces"),
-    ("frame_energy", "monomer_energy"),
-    ("frame_forces", "monomer_forces"),
 )
 
 

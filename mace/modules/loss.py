@@ -827,25 +827,24 @@ def weighted_huber_term(
 
 
 class InteractionHuberLoss(torch.nn.Module):
-    """Six Huber terms, each a weighted mean over the entries that carry it.
+    """Four Huber terms, each a weighted mean over the entries that carry it.
 
     ================== =============================================== =====================
     term               entries                                         entry weight
     ================== =============================================== =====================
     frame_energy       periodic configurations with sign +1 (per atom) weight * energy_weight
     frame_forces       force components of their atoms                 weight * forces_weight
-    monomer_energy     aperiodic configurations with sign +1           weight * energy_weight
-    monomer_forces     force components of their atoms                 weight * forces_weight
     interaction_energy records, ``E_int / cluster atoms``              interaction weight
     interaction_forces slot components of ``F_int``                    interaction weight
     ================== =============================================== =====================
 
     A term is ``sum(w_i * huber_i) / sum(w_i)`` over its entries with ``w_i > 0``, so
     zero-weight entries neither contribute nor dilute; the global term weight multiplies it.
-    In-place monomers (sign -1) get no absolute terms: they enter only through ``E_int`` and
-    ``F_int`` (``mace.tools.torch_geometric.cluster_collate``). Batches without ``sign``
-    (extxyz) count every configuration as +1 and have empty interaction terms. The force
-    terms of frames and monomers use the magnitude-dependent thresholds of
+    Aperiodic configurations get no absolute terms: in-place monomers (sign -1) and aperiodic
+    clusters enter only through ``E_int`` and ``F_int``
+    (``mace.tools.torch_geometric.cluster_collate``). Batches without ``sign`` (extxyz)
+    count every configuration as +1 and have empty interaction terms. The frame force term
+    uses the magnitude-dependent thresholds of
     :func:`conditional_huber_forces`; ``F_int`` uses a plain threshold. There is no stress
     term: neither ``ref["stress"]`` nor ``pred["stress"]`` is read.
 
@@ -855,8 +854,6 @@ class InteractionHuberLoss(torch.nn.Module):
     term_names: Tuple[str, ...] = (
         "frame_energy",
         "frame_forces",
-        "monomer_energy",
-        "monomer_forces",
         "interaction_energy",
         "interaction_forces",
     )
@@ -864,8 +861,6 @@ class InteractionHuberLoss(torch.nn.Module):
     _weight_buffer_names: Dict[str, str] = {
         "frame_energy": "energy_weight",
         "frame_forces": "forces_weight",
-        "monomer_energy": "monomer_energy_weight",
-        "monomer_forces": "monomer_forces_weight",
         "interaction_energy": "interaction_energy_weight",
         "interaction_forces": "interaction_forces_weight",
     }
@@ -874,14 +869,10 @@ class InteractionHuberLoss(torch.nn.Module):
         self,
         energy_weight=1.0,
         forces_weight=1.0,
-        monomer_energy_weight=1.0,
-        monomer_forces_weight=1.0,
         interaction_energy_weight=1.0,
         interaction_forces_weight=1.0,
         huber_delta_frame_energy=0.01,
         huber_delta_frame_forces=0.01,
-        huber_delta_monomer_energy=0.01,
-        huber_delta_monomer_forces=0.01,
         huber_delta_interaction_energy=0.01,
         huber_delta_interaction_forces=0.01,
     ) -> None:
@@ -889,8 +880,6 @@ class InteractionHuberLoss(torch.nn.Module):
         weights = {
             "energy_weight": energy_weight,
             "forces_weight": forces_weight,
-            "monomer_energy_weight": monomer_energy_weight,
-            "monomer_forces_weight": monomer_forces_weight,
             "interaction_energy_weight": interaction_energy_weight,
             "interaction_forces_weight": interaction_forces_weight,
         }
@@ -901,8 +890,6 @@ class InteractionHuberLoss(torch.nn.Module):
         self.huber_deltas: Dict[str, float] = {
             "frame_energy": float(huber_delta_frame_energy),
             "frame_forces": float(huber_delta_frame_forces),
-            "monomer_energy": float(huber_delta_monomer_energy),
-            "monomer_forces": float(huber_delta_monomer_forces),
             "interaction_energy": float(huber_delta_interaction_energy),
             "interaction_forces": float(huber_delta_interaction_forces),
         }
@@ -914,18 +901,16 @@ class InteractionHuberLoss(torch.nn.Module):
             for name, buffer_name in self._weight_buffer_names.items()
         }
 
-    def _absolute_terms(
-        self, ref: Batch, pred: TensorDict, configuration_mask: torch.Tensor, kind: str
-    ):
-        """Energy and force terms of the configurations in ``configuration_mask``."""
+    def _frame_terms(self, ref: Batch, pred: TensorDict, frame_mask: torch.Tensor):
+        """Energy and force terms of the configurations in ``frame_mask``."""
         num_atoms = (ref.ptr[1:] - ref.ptr[:-1]).to(pred["energy"].dtype)
-        selected = configuration_mask.to(pred["energy"].dtype)
+        selected = frame_mask.to(pred["energy"].dtype)
         energy_entry_weights = ref.weight * ref.energy_weight * selected
         energy_term = weighted_huber_term(
             ref["energy"] / num_atoms,
             pred["energy"] / num_atoms,
             energy_entry_weights,
-            torch.full_like(pred["energy"], self.huber_deltas[f"{kind}_energy"]),
+            torch.full_like(pred["energy"], self.huber_deltas["frame_energy"]),
         )
         atom_entry_weights = (ref.weight * ref.forces_weight * selected)[ref.batch]
         forces_term = weighted_huber_term(
@@ -933,7 +918,7 @@ class InteractionHuberLoss(torch.nn.Module):
             pred["forces"],
             atom_entry_weights.unsqueeze(-1),
             conditional_huber_force_thresholds(
-                ref["forces"], self.huber_deltas[f"{kind}_forces"]
+                ref["forces"], self.huber_deltas["frame_forces"]
             ).unsqueeze(-1),
         )
         return energy_term, forces_term
@@ -977,18 +962,13 @@ class InteractionHuberLoss(torch.nn.Module):
         return energy_term, forces_term
 
     def compute_terms(self, ref: Batch, pred: TensorDict) -> Dict[str, torch.Tensor]:
-        """The six weighted terms (with autograd graph); fills ``last_statistics``."""
+        """The four weighted terms (with autograd graph); fills ``last_statistics``."""
         periodic = ref.pbc.any(dim=-1)  # [n_graphs]
         sign = getattr(ref, "sign", None)
         positive = (
             sign > 0 if sign is not None else torch.ones_like(periodic, dtype=torch.bool)
         )
-        frame_energy, frame_forces = self._absolute_terms(
-            ref, pred, periodic & positive, "frame"
-        )
-        monomer_energy, monomer_forces = self._absolute_terms(
-            ref, pred, ~periodic & positive, "monomer"
-        )
+        frame_energy, frame_forces = self._frame_terms(ref, pred, periodic & positive)
         interaction_energy, interaction_forces = self._interaction_terms(ref, pred)
         components = dict(
             zip(
@@ -996,8 +976,6 @@ class InteractionHuberLoss(torch.nn.Module):
                 (
                     frame_energy,
                     frame_forces,
-                    monomer_energy,
-                    monomer_forces,
                     interaction_energy,
                     interaction_forces,
                 ),

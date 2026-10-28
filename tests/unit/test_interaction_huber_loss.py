@@ -37,8 +37,6 @@ CELL = 8.0 * np.eye(3)
 TERM_NAMES = (
     "frame_energy",
     "frame_forces",
-    "monomer_energy",
-    "monomer_forces",
     "interaction_energy",
     "interaction_forces",
 )
@@ -46,16 +44,12 @@ TERM_NAMES = (
 DELTAS = {
     "frame_energy": 0.01,
     "frame_forces": 0.02,
-    "monomer_energy": 0.015,
-    "monomer_forces": 0.012,
     "interaction_energy": 0.02,
     "interaction_forces": 0.03,
 }
 GLOBAL_WEIGHTS = {
     "frame_energy": 1.0,
     "frame_forces": 100.0,
-    "monomer_energy": 2.0,
-    "monomer_forces": 50.0,
     "interaction_energy": 3.0,
     "interaction_forces": 70.0,
 }
@@ -240,17 +234,16 @@ def _expected_terms(records: List[Record], cluster_batch: bool) -> Dict[str, dic
     for record in records:
         for index, subsystem in enumerate(record.subsystems):
             sign = subsystem.sign if cluster_batch else 1.0
-            if sign < 0:
-                continue  # in-place monomers carry no absolute terms
-            kind = "frame" if subsystem.periodic else "monomer"
+            if sign < 0 or not subsystem.periodic:
+                continue  # in-place monomers and aperiodic configurations: no absolute terms
             atom_count = len(subsystem.numbers)
             energy_error = (record.predicted_energies[index] - subsystem.energy) / atom_count
-            terms[f"{kind}_energy"].add(
-                energy_error, DELTAS[f"{kind}_energy"], record.weight * record.energy_weight
+            terms["frame_energy"].add(
+                energy_error, DELTAS["frame_energy"], record.weight * record.energy_weight
             )
-            terms[f"{kind}_forces"].add(
+            terms["frame_forces"].add(
                 record.predicted_forces[index] - subsystem.forces,
-                _force_thresholds(subsystem.forces, DELTAS[f"{kind}_forces"]),
+                _force_thresholds(subsystem.forces, DELTAS["frame_forces"]),
                 record.weight * record.forces_weight,
             )
         interaction_weight = record.interaction_weight
@@ -284,8 +277,6 @@ def _loss(**overrides) -> InteractionHuberLoss:
     return InteractionHuberLoss(
         energy_weight=weights["frame_energy"],
         forces_weight=weights["frame_forces"],
-        monomer_energy_weight=weights["monomer_energy"],
-        monomer_forces_weight=weights["monomer_forces"],
         interaction_energy_weight=weights["interaction_energy"],
         interaction_forces_weight=weights["interaction_forces"],
         **{f"huber_delta_{name}": delta for name, delta in DELTAS.items()},
@@ -328,14 +319,12 @@ def test_matches_hand_calculation_on_cluster_batch(tmp_path):
     expected = _expected_terms(records, cluster_batch=True)
     _assert_terms_match(loss_fn, terms, expected)
 
-    # entries: 3 frames; 18 atoms x 3; 2 standalone monomers; 6 atoms x 3; 2 records with
-    # interaction weight > 0; their 12 slots x 3
+    # entries: 3 frames; 18 atoms x 3; 2 records with interaction weight > 0; their 12 slots
+    # x 3 (the 2 standalone monomers enter no term)
     counts = {name: int(loss_fn.last_statistics[name].entry_count) for name in TERM_NAMES}
     assert counts == {
         "frame_energy": 3,
         "frame_forces": 54,
-        "monomer_energy": 2,
-        "monomer_forces": 18,
         "interaction_energy": 2,
         "interaction_forces": 36,
     }
@@ -361,15 +350,16 @@ def test_matches_hand_calculation_on_extxyz_batch():
         assert int(loss_fn.last_statistics[name].entry_count) == 0
 
 
-def test_extxyz_counts_every_configuration_as_absolute():
-    """Without ``sign``, the in-place monomers of an exported frame are ordinary monomers."""
+def test_extxyz_aperiodic_configurations_carry_no_absolute_terms():
+    """Without ``sign``, the monomers of an exported frame are aperiodic configurations with
+    sign +1: they enter no term; the periodic frame enters the frame terms."""
     records = [_frame_record(0)]
     _add_predictions(records, seed=4)
     batch = _extxyz_batch(records)
     loss_fn = _loss()
     loss_fn.compute_terms(batch, _prediction(records))
-    assert int(loss_fn.last_statistics["monomer_energy"].entry_count) == 2
     assert int(loss_fn.last_statistics["frame_energy"].entry_count) == 1
+    assert int(loss_fn.last_statistics["frame_forces"].entry_count) == 18
 
 
 def test_frame_terms_are_not_diluted_by_monomers(tmp_path):
@@ -415,12 +405,17 @@ def test_zero_weight_configurations_leave_the_terms_unchanged(tmp_path):
         assert float(padded_terms[name]) == pytest.approx(float(reference_terms[name]), rel=1e-12), name
     assert int(loss_fn.last_statistics["frame_energy"].entry_count) == 3
 
-    # switching the monomer terms off changes only the monomer terms
-    no_monomer_fn = _loss(monomer_energy=0.0, monomer_forces=0.0)
-    no_monomer_terms = no_monomer_fn.compute_terms(_cluster_batch(tmp_path, records), _prediction(records))
+
+
+def test_standalone_monomers_leave_every_term_unchanged(tmp_path):
+    """Standalone aperiodic configurations (sign +1) with nonzero weights enter no term."""
+    records = _cluster_records()
+    frames = records[:3]
+    loss_fn = _loss()
+    frame_terms = loss_fn.compute_terms(_cluster_batch(tmp_path, frames), _prediction(frames))
+    all_terms = loss_fn.compute_terms(_cluster_batch(tmp_path, records), _prediction(records))
     for name in TERM_NAMES:
-        expected = 0.0 if name.startswith("monomer") else float(reference_terms[name])
-        assert float(no_monomer_terms[name]) == pytest.approx(expected, rel=1e-12), name
+        assert float(all_terms[name]) == pytest.approx(float(frame_terms[name]), rel=1e-12), name
 
 
 def test_forward_and_statistics_are_consistent(tmp_path):
@@ -444,7 +439,8 @@ def test_forward_and_statistics_are_consistent(tmp_path):
             float(statistics.unweighted_mean), rel=1e-12
         )
     assert "huber_delta_interaction_forces=0.03" in repr(loss_fn)
-    assert "monomer_forces_weight=50.000" in repr(loss_fn)
+    assert "interaction_forces_weight=70.000" in repr(loss_fn)
+    assert "monomer" not in repr(loss_fn)
 
 
 def test_interaction_terms_match_combine_functions(tmp_path):
@@ -460,7 +456,7 @@ def test_interaction_terms_match_combine_functions(tmp_path):
     )
     loss_fn = _loss()
     terms = loss_fn.compute_terms(batch, {"energy": energy, "forces": forces})
-    for name in ("frame_energy", "frame_forces", "monomer_energy", "monomer_forces"):
+    for name in ("frame_energy", "frame_forces"):
         assert float(terms[name]) == 0.0
 
     record_weights = batch.cluster_interaction_weight
@@ -508,14 +504,14 @@ def test_gradients_flow_and_empty_terms_stay_finite(tmp_path):
     assert prediction["forces"].grad.abs().sum() > 0
     assert prediction["energy"].grad.abs().sum() > 0
 
-    # an extxyz batch of frames only: monomer and interaction terms have no entries, yet are
+    # an extxyz batch of frames only: the interaction terms have no entries, yet are
     # zero, finite, and connected to the graph (a per-term backward must work)
     frames = [_frame_record(0)]
     frames[0].subsystems = frames[0].subsystems[:1]
     _add_predictions(frames, seed=2)
     frame_prediction = _prediction(frames, requires_grad=True)
     terms = loss_fn.compute_terms(_extxyz_batch(frames), frame_prediction)
-    for name in ("monomer_energy", "monomer_forces", "interaction_energy", "interaction_forces"):
+    for name in ("interaction_energy", "interaction_forces"):
         assert float(terms[name]) == 0.0
         assert terms[name].requires_grad
         assert float(loss_fn.last_statistics[name].weight_sum) == 0.0
@@ -550,8 +546,6 @@ def test_both_stage_factories_build_the_loss():
             "1000.0",
             "--swa_forces_weight",
             "100.0",
-            "--swa_monomer_energy_weight",
-            "7.0",
             "--interaction_energy_weight",
             "2.0",
             "--swa_interaction_energy_weight",
@@ -566,9 +560,12 @@ def test_both_stage_factories_build_the_loss():
     )
     stage_one = get_loss_fn(args, dipole_only=False, compute_dipole=False)
     assert isinstance(stage_one, InteractionHuberLoss)
-    assert stage_one.term_weights()["monomer_energy"] == 1.0  # follows energy_weight
-    assert stage_one.term_weights()["monomer_forces"] == 100.0
-    assert stage_one.term_weights()["interaction_energy"] == 2.0
+    assert stage_one.term_weights() == {
+        "frame_energy": 1.0,
+        "frame_forces": 100.0,
+        "interaction_energy": 2.0,
+        "interaction_forces": args.interaction_forces_weight,
+    }
 
     model = torch.nn.Linear(1, 1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
@@ -578,8 +575,6 @@ def test_both_stage_factories_build_the_loss():
     assert stage_two.term_weights() == {
         "frame_energy": 1000.0,
         "frame_forces": 100.0,
-        "monomer_energy": 7.0,
-        "monomer_forces": 100.0,  # follows swa_forces_weight
         "interaction_energy": 20.0,
         "interaction_forces": args.swa_interaction_forces_weight,
     }
@@ -623,8 +618,6 @@ def test_selection_loss_scores_frames_at_stage_two_weights(tmp_path):
     assert selection_loss.term_weights() == {
         "frame_energy": 1000.0,
         "frame_forces": 50.0,
-        "monomer_energy": 0.0,
-        "monomer_forces": 0.0,
         "interaction_energy": 0.0,
         "interaction_forces": 0.0,
     }
