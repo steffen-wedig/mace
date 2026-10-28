@@ -649,7 +649,7 @@ def run(args) -> None:
                 raise KeyError(f"Atomic number {e} not found in atomic_energies_dict for head {head_config.head_name}, add E0s for this atomic number") from e
 
     # Cluster records (mace.data.cluster_records) need the ClusterCollater on a stock torch
-    # DataLoader; everything else uses mace's graph DataLoader. One factory, three loaders.
+    # DataLoader; everything else uses mace's graph DataLoader. Both take the same keywords.
     if args.cluster_records:
         if args.distributed:
             raise NotImplementedError("--cluster_records does not support distributed training")
@@ -658,35 +658,10 @@ def run(args) -> None:
         if args.lbfgs:
             raise NotImplementedError("--cluster_records does not support the LBFGS optimizer")
         from mace.tools.torch_geometric.cluster_collate import (  # pylint: disable=import-outside-toplevel
-            get_cluster_data_loader,
+            get_cluster_data_loader as TrainingDataLoader,
         )
-
-        def make_data_loader(dataset, batch_size, shuffle, drop_last, pin_memory, num_workers, multiprocessing_context, generator, sampler=None):
-            return get_cluster_data_loader(
-                dataset,
-                batch_size=batch_size,
-                shuffle=shuffle,
-                drop_last=drop_last,
-                pin_memory=pin_memory,
-                num_workers=num_workers,
-                multiprocessing_context=multiprocessing_context,
-                generator=generator,
-            )
-
     else:
-
-        def make_data_loader(dataset, batch_size, shuffle, drop_last, pin_memory, num_workers, multiprocessing_context, generator, sampler=None):
-            return torch_geometric.dataloader.DataLoader(
-                dataset=dataset,
-                batch_size=batch_size,
-                sampler=sampler,
-                shuffle=shuffle,
-                drop_last=drop_last,
-                pin_memory=pin_memory,
-                num_workers=num_workers,
-                multiprocessing_context=multiprocessing_context,
-                generator=generator,
-            )
+        TrainingDataLoader = torch_geometric.dataloader.DataLoader  # pylint: disable=invalid-name
 
     # Load datasets for each head, supporting multiple files per head
     valid_sets = {head: [] for head in heads}
@@ -798,7 +773,7 @@ def run(args) -> None:
             dataset_size = len(train_sets[head_config.head_name])
         logging.info(f"Head '{head_config.head_name}' training dataset size: {dataset_size}")
 
-        train_loader_head = make_data_loader(
+        train_loader_head = TrainingDataLoader(
             dataset=train_sets[head_config.head_name],
             batch_size=args.batch_size,
             shuffle=True,
@@ -834,7 +809,7 @@ def run(args) -> None:
             )
             valid_samplers[head] = valid_sampler
 
-    train_loader = make_data_loader(
+    train_loader = TrainingDataLoader(
         dataset=train_set,
         batch_size=args.batch_size,
         sampler=train_sampler,
@@ -881,7 +856,7 @@ def run(args) -> None:
     if not isinstance(valid_sets, dict):
         valid_sets = {"Default": valid_sets}
     for head, valid_set in valid_sets.items():
-        valid_loaders[head] = make_data_loader(
+        valid_loaders[head] = TrainingDataLoader(
             dataset=valid_set,
             batch_size=args.valid_batch_size,
             sampler=valid_samplers[head] if args.distributed else None,
