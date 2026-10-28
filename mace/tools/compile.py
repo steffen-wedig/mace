@@ -7,6 +7,7 @@ try:
 except ImportError:
     dynamo = None
 from e3nn import get_optimization_defaults, set_optimization_defaults
+import torch
 from torch import autograd, nn
 from torch.fx import symbolic_trace
 
@@ -107,3 +108,30 @@ def simplify(module: nn.Module) -> nn.Module:
             simplify(child)
 
     return module
+
+
+class CompiledTrainingModel(nn.Module):
+    """Routes training forwards through torch.compile, everything else to the model.
+
+    Takes the place of the distributed model in ``tools.train``: training steps
+    call it with ``training=True`` and get the compiled forward (one graph,
+    dynamic shapes); validation calls it with ``training=False`` and gets the
+    eager model. The model itself, built by :func:`prepare`'s recipe (e3nn
+    codegen off, :func:`simplify`), stays what is checkpointed and saved. A
+    compiled graph cannot turn its inputs into differentiable leaves, so the
+    positions get ``requires_grad`` here, before the compiled call.
+    """
+
+    def __init__(self, model: nn.Module, backend: str = "inductor") -> None:
+        super().__init__()
+        configure_autograd_for_compile(allow_autograd=True)
+        self.model = model
+        self.compiled = torch.compile(
+            model, fullgraph=True, dynamic=True, backend=backend
+        )
+
+    def forward(self, data, training: bool = False, **kwargs):
+        if not training:
+            return self.model(data, training=False, **kwargs)
+        data["positions"].requires_grad_(True)
+        return self.compiled(data, training=True, **kwargs)

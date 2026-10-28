@@ -37,6 +37,7 @@ from mace.cli.convert_oeq_e3nn import run as run_oeq_to_e3nn
 from mace.cli.visualise_train import TrainingPlotter
 from mace.data import KeySpecification, update_keyspec_from_kwargs
 from mace.modules.lora import inject_LoRAs, merge_lora_weights
+from mace.tools import compile as mace_compile
 from mace.tools import deprecation, torch_geometric
 from mace.tools.distributed_tools import init_distributed, xpu_device_index
 from mace.tools.model_script_utils import configure_model
@@ -952,7 +953,14 @@ def run(args) -> None:
     args.avg_num_neighbors = get_avg_num_neighbors(head_configs, args, train_loader, device)
 
     # Model
-    model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
+    if args.compile_training:
+        # mace.tools.compile.prepare's recipe: no e3nn TorchScript codegen, and
+        # the registered modules replaced by traceable fx graphs.
+        with mace_compile.disable_e3nn_codegen():
+            model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
+        model = mace_compile.simplify(model)
+    else:
+        model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
     if args.multilevel_base_model is not None:
         from mace.tools.multilevel_init import initialise_from_base_model
 
@@ -1122,6 +1130,10 @@ def run(args) -> None:
         distributed_model = DDP(model, device_ids=device_ids)
     else:
         distributed_model = None
+    if args.compile_training:
+        if args.distributed:
+            raise ValueError("--compile_training does not support distributed training")
+        distributed_model = mace_compile.CompiledTrainingModel(model)
 
 
     train_valid_data_loader = {}

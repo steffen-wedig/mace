@@ -1199,6 +1199,15 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=False,
     )
     parser.add_argument(
+        "--compile_training",
+        help=(
+            "Run training forwards through torch.compile (one graph, dynamic "
+            "shapes); validation and saved models stay eager"
+        ),
+        type=str2bool,
+        default=False,
+    )
+    parser.add_argument(
         "--only_cueq",
         help="Only use cuequivariance acceleration",
         type=str2bool,
