@@ -58,6 +58,8 @@ def make_model(
     zero_init_delta_readouts=False,
     num_interactions=2,
     independent_levels=False,
+    stop_base_gradient_in_training=False,
+    force_carrying_levels=None,
 ):
     if atomic_energies is None:
         atomic_energies = np.zeros((len(LEVELS), len(TABLE)))
@@ -96,6 +98,8 @@ def make_model(
         detach_base_for_deltas=detach_base_for_deltas,
         zero_init_delta_readouts=zero_init_delta_readouts,
         independent_levels=independent_levels,
+        stop_base_gradient_in_training=stop_base_gradient_in_training,
+        force_carrying_levels=force_carrying_levels,
     )
 
 
@@ -1200,3 +1204,115 @@ def test_compiled_training_matches_eager(tmp_path, independent_levels):
         torch.testing.assert_close(
             compiled_gradient, eager_gradient, rtol=1e-10, atol=1e-12
         )
+
+
+def trunk_parameters(model):
+    return [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if name.startswith(("node_embedding.", "interactions.", "products."))
+    ]
+
+
+@pytest.mark.parametrize("stop_base_gradient", [False, True])
+def test_base_stop_gradient_keeps_correction_loss_off_the_base_path(
+    stop_base_gradient,
+):
+    """With zero correction readouts the correction energy is the base energy
+    plus a constant: only the base path can carry trunk gradient, and the
+    training stop-gradient cuts exactly that path."""
+    model = make_model(
+        zero_init_delta_readouts=True,
+        stop_base_gradient_in_training=stop_base_gradient,
+        force_carrying_levels=[BASE_LEVEL],
+    )
+    batch = make_batch([make_configuration(POSITIONS, head="revpbe")])
+    output = model(batch.to_dict(), training=True, compute_force=False)
+    output["energy_all_levels"][:, 1].sum().backward()
+    trunk_gradients = [
+        parameter.grad
+        for _, parameter in trunk_parameters(model)
+        if parameter.grad is not None
+    ]
+    reaches_trunk = any(bool(torch.any(gradient != 0)) for gradient in trunk_gradients)
+    assert reaches_trunk is not stop_base_gradient
+    delta_gradients = [
+        parameter.grad
+        for name, parameter in model.named_parameters()
+        if "delta" in name and parameter.grad is not None
+    ]
+    assert any(bool(torch.any(gradient != 0)) for gradient in delta_gradients)
+
+
+def test_base_stop_gradient_still_lets_the_correction_shape_the_trunk():
+    """Through its own readouts the correction loss still reaches the trunk."""
+    model = make_model(
+        stop_base_gradient_in_training=True, force_carrying_levels=[BASE_LEVEL]
+    )
+    batch = make_batch([make_configuration(POSITIONS, head="revpbe")])
+    output = model(batch.to_dict(), training=True, compute_force=False)
+    output["energy_all_levels"][:, 1].sum().backward()
+    assert any(
+        parameter.grad is not None and bool(torch.any(parameter.grad != 0))
+        for _, parameter in trunk_parameters(model)
+    )
+
+
+def test_base_stop_gradient_changes_no_prediction():
+    """Training and inference energies match the plain model, and at inference
+    every level's forces keep the base contribution."""
+    plain = make_model(
+        atomic_inter_scale=(1.3, 0.01),
+        atomic_inter_shift=(-3.0, -0.08),
+        force_carrying_levels=[BASE_LEVEL],
+    )
+    stopped = make_model(
+        atomic_inter_scale=(1.3, 0.01),
+        atomic_inter_shift=(-3.0, -0.08),
+        force_carrying_levels=[BASE_LEVEL],
+        stop_base_gradient_in_training=True,
+    )
+    stopped.load_state_dict(plain.state_dict())
+    for training in (True, False):
+        batch = make_batch([make_configuration(POSITIONS, head="delta_cc")])
+        output_plain = plain(batch.to_dict(), training=training, compute_force=False)
+        batch = make_batch([make_configuration(POSITIONS, head="delta_cc")])
+        output_stopped = stopped(
+            batch.to_dict(), training=training, compute_force=False
+        )
+        torch.testing.assert_close(
+            output_plain["energy_all_levels"], output_stopped["energy_all_levels"]
+        )
+    batch = make_batch([make_configuration(POSITIONS, head="delta_cc")])
+    forces_plain = plain(batch.to_dict(), training=False)["forces"]
+    batch = make_batch([make_configuration(POSITIONS, head="delta_cc")])
+    forces_stopped = stopped(batch.to_dict(), training=False)["forces"]
+    torch.testing.assert_close(forces_plain, forces_stopped)
+
+
+def test_base_stop_gradient_rejects_force_trained_corrections_and_independent_levels():
+    with pytest.raises(ValueError, match="trained forces"):
+        make_model(stop_base_gradient_in_training=True, force_carrying_levels=[0, 1])
+    with pytest.raises(ValueError, match="independent_levels"):
+        make_model(stop_base_gradient_in_training=True, independent_levels=True)
+
+
+def test_base_stop_gradient_defaults_off_for_old_pickles():
+    model = make_model()
+    state = model.__dict__.copy()
+    del state["stop_base_gradient_in_training"]
+    restored = modules.MultiLevelScaleShiftMACE.__new__(modules.MultiLevelScaleShiftMACE)
+    restored.__setstate__(state)
+    assert restored.stop_base_gradient_in_training is False
+
+
+def test_base_stop_gradient_cli_flag():
+    parser = tools.build_default_arg_parser()
+    base = ["--name", "unit", "--train_file", "train.xyz"]
+    assert parser.parse_args(base).multilevel_stop_base_gradient is False
+    assert (
+        parser.parse_args(
+            [*base, "--multilevel_stop_base_gradient"]
+        ).multilevel_stop_base_gradient
+        is True
+    )

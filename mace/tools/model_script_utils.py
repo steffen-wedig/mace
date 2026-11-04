@@ -383,6 +383,14 @@ def _build_model(
                     f"multilevel_force_heads {unknown_heads} are not in heads {heads}"
                 )
             force_carrying_levels = [heads.index(name) for name in force_head_names]
+        if args.multilevel_stop_base_gradient and not getattr(
+            args, "multilevel_train_file", None
+        ):
+            raise ValueError(
+                "--multilevel_stop_base_gradient needs fused multi-level training "
+                "(--multilevel_train_file): on per-head batches a non-base head's "
+                "training forces would lose the base contribution"
+            )
         return modules.MultiLevelScaleShiftMACE(
             force_carrying_levels=force_carrying_levels,
             **model_config,
@@ -403,6 +411,7 @@ def _build_model(
             detach_base_for_deltas=args.detach_base_for_deltas,
             zero_init_delta_readouts=args.zero_init_delta_readouts,
             independent_levels=args.multilevel_independent_heads,
+            stop_base_gradient_in_training=args.multilevel_stop_base_gradient,
         )
     if args.model == "PolarMACE" and model_config_foundation is not None:
         return modules.PolarMACE(**model_config_foundation)

@@ -173,6 +173,15 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=False,
     )
     parser.add_argument(
+        "--multilevel_stop_base_gradient",
+        help="MultiLevelScaleShiftMACE only: during training, every non-base "
+        "level reads the base energy as a constant (stop-gradient), so its loss "
+        "reaches the trunk only through its own readouts. Inference is "
+        "unchanged (forces stay exact). Requires energy-only non-base levels",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
         "--multilevel_independent_heads",
         help="MultiLevelScaleShiftMACE only: every level predicts its own "
         "ABSOLUTE energy (E_k = scale_k * head_k + shift_k + E0s) with no base "

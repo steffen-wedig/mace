@@ -685,6 +685,7 @@ class MultiLevelScaleShiftMACE(MACE):
         zero_init_delta_readouts: bool = False,
         independent_levels: bool = False,
         force_carrying_levels: Optional[List[int]] = None,
+        stop_base_gradient_in_training: bool = False,
         **kwargs,
     ):
         if kwargs.get("embedding_specs") is not None:
@@ -695,6 +696,11 @@ class MultiLevelScaleShiftMACE(MACE):
             raise ValueError(
                 "detach_base_for_deltas has no meaning with independent_levels: "
                 "independent levels do not read the base readout"
+            )
+        if independent_levels and stop_base_gradient_in_training:
+            raise ValueError(
+                "stop_base_gradient_in_training has no meaning with "
+                "independent_levels: independent levels have no base term"
             )
         if independent_levels and zero_init_delta_readouts:
             raise ValueError(
@@ -733,6 +739,23 @@ class MultiLevelScaleShiftMACE(MACE):
                 f"force_carrying_levels={force_carrying_levels}"
             )
         self.force_carrying_levels = list(force_carrying_levels)
+        # Stop-gradient on the base energy inside every other level's energy,
+        # during training only: a correction level's loss then reaches the
+        # trunk only through its own readouts, at the correction's scale,
+        # instead of through the base readout (whose scale is ~200x larger,
+        # so the correction loss would otherwise bend the trunk and wreck the
+        # base fit). The detach removes position gradients too, so a level
+        # trained on forces cannot use it; at inference (training=False)
+        # nothing is detached and every level's forces stay exact.
+        if stop_base_gradient_in_training and any(
+            level != base_level for level in self.force_carrying_levels
+        ):
+            raise ValueError(
+                "stop_base_gradient_in_training would strip the base contribution "
+                "from the trained forces of a non-base level; force-carrying "
+                f"levels: {self.force_carrying_levels}"
+            )
+        self.stop_base_gradient_in_training = stop_base_gradient_in_training
         self.base_force_column = (
             self.force_carrying_levels.index(base_level)
             if force_carrying_levels
@@ -784,6 +807,12 @@ class MultiLevelScaleShiftMACE(MACE):
             detach_base_for_deltas=detach_base_for_deltas,
             independent_levels=independent_levels,
         )
+
+    def __setstate__(self, state):
+        # Models pickled before the stop-gradient option train and predict
+        # exactly as before.
+        super().__setstate__(state)
+        self.__dict__.setdefault("stop_base_gradient_in_training", False)
 
     @staticmethod
     def _as_per_level_list(value, num_levels: int, name: str) -> List[float]:
@@ -943,6 +972,13 @@ class MultiLevelScaleShiftMACE(MACE):
                 base_component_for_deltas = (
                     base_component_for_deltas + pair_node_energy.unsqueeze(-1)
                 )
+
+        if self.stop_base_gradient_in_training and training:
+            if base_component_for_deltas is None:
+                base_component_for_deltas = node_components[
+                    :, self.base_level : self.base_level + 1
+                ]
+            base_component_for_deltas = base_component_for_deltas.detach()
 
         node_es_all = self.scale_shift(
             node_components, base_component_for_deltas
