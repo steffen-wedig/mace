@@ -2167,6 +2167,14 @@ class MultiLevelScaleShiftBlock(torch.nn.Module):
     so ``scale[k]``/``shift[k]`` for a non-base level are the statistics of
     that level's *correction* (delta), not of its absolute energies.
 
+    With ``independent_levels`` every column is instead an absolute energy
+    of its own level (classic multihead), with no base term:
+
+        E_k    = scale[k] * c_k + shift[k]            for every k
+
+    so ``scale[k]``/``shift[k]`` are then statistics of absolute (E0-removed)
+    energies. ``detach_base_for_deltas`` has no meaning in that mode.
+
     ``detach_base_for_deltas`` is stored here as the run's configuration but
     acted on by the MODEL: a naive tensor detach of the base component would
     sever position gradients along with parameter gradients, silently
@@ -2184,8 +2192,14 @@ class MultiLevelScaleShiftBlock(torch.nn.Module):
         shift: List[float],
         base_level: int = 0,
         detach_base_for_deltas: bool = False,
+        independent_levels: bool = False,
     ):
         super().__init__()
+        if independent_levels and detach_base_for_deltas:
+            raise ValueError(
+                "detach_base_for_deltas has no meaning with independent_levels: "
+                "independent levels do not read the base readout"
+            )
         if len(scale) != len(shift):
             raise ValueError(
                 f"scale and shift must have one entry per level, got {len(scale)} and {len(shift)}"
@@ -2201,6 +2215,7 @@ class MultiLevelScaleShiftBlock(torch.nn.Module):
             )
         self.base_level = base_level
         self.detach_base_for_deltas = detach_base_for_deltas
+        self.independent_levels = independent_levels
         self.register_buffer(
             "scale", torch.tensor(scale, dtype=torch.get_default_dtype())
         )
@@ -2222,6 +2237,8 @@ class MultiLevelScaleShiftBlock(torch.nn.Module):
         # base column, [n_nodes, 1]), the non-base levels are composed from
         # it instead of the components' base column; the block itself never
         # detaches anything.
+        if self.independent_levels:
+            return self.scale.view(1, -1) * components + self.shift.view(1, -1)
         base_column = components[:, self.base_level : self.base_level + 1]
         base_energy = (
             self.scale[self.base_level] * base_column + self.shift[self.base_level]
@@ -2247,8 +2264,14 @@ class MultiLevelScaleShiftBlock(torch.nn.Module):
         return (
             f"{self.__class__.__name__}(scale=[{formatted_scale}], "
             f"shift=[{formatted_shift}], base_level={self.base_level}, "
-            f"detach_base_for_deltas={self.detach_base_for_deltas})"
+            f"detach_base_for_deltas={self.detach_base_for_deltas}, "
+            f"independent_levels={self.independent_levels})"
         )
+
+    def __setstate__(self, state):
+        # Models pickled before independent_levels existed are residual.
+        state.setdefault("independent_levels", False)
+        super().__setstate__(state)
 
 
 # LES-specific readout blocks

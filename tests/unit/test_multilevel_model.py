@@ -57,6 +57,7 @@ def make_model(
     detach_base_for_deltas=False,
     zero_init_delta_readouts=False,
     num_interactions=2,
+    independent_levels=False,
 ):
     if atomic_energies is None:
         atomic_energies = np.zeros((len(LEVELS), len(TABLE)))
@@ -94,6 +95,7 @@ def make_model(
         base_level=BASE_LEVEL,
         detach_base_for_deltas=detach_base_for_deltas,
         zero_init_delta_readouts=zero_init_delta_readouts,
+        independent_levels=independent_levels,
     )
 
 
@@ -857,3 +859,344 @@ def test_quota_batches_carry_the_sparse_level_at_a_fixed_rate(tmp_path):
         # Exactly two structures per batch carry the CC label, instead of the
         # 0.5 a random draw at this coverage would average.
         assert int((batch.energy_levels_weight[:, 1] != 0).sum()) == 2
+
+
+# ---------------------------------------------------------------------------
+# independent levels (classic multihead): E_k = scale_k * head_k + shift_k
+# ---------------------------------------------------------------------------
+
+E0_TABLE = np.array([[1.0, 3.0], [1.5, 3.5]])
+
+
+def make_two_level_batch():
+    return make_batch(
+        [
+            make_configuration(POSITIONS, head="revpbe"),
+            make_configuration(POSITIONS + 0.1, head="delta_cc"),
+        ]
+    )
+
+
+def test_scale_shift_block_default_is_the_residual_composition():
+    scale = [1.3, 0.2, 0.05]
+    shift = [-3.0, -0.08, 0.4]
+    components = torch.randn(7, 3)
+    block = modules.MultiLevelScaleShiftBlock(scale=scale, shift=shift)
+    base_energy = scale[0] * components[:, 0] + shift[0]
+    expected = torch.stack(
+        [base_energy]
+        + [
+            base_energy + scale[k] * components[:, k] + shift[k]
+            for k in (1, 2)
+        ],
+        dim=-1,
+    )
+    torch.testing.assert_close(block(components), expected, rtol=0, atol=1e-14)
+
+
+def test_scale_shift_block_independent_levels_is_absolute_per_level():
+    scale = [1.3, 0.2, 0.05]
+    shift = [-3.0, -0.08, 0.4]
+    components = torch.randn(7, 3)
+    block = modules.MultiLevelScaleShiftBlock(
+        scale=scale, shift=shift, independent_levels=True
+    )
+    expected = torch.tensor(scale) * components + torch.tensor(shift)
+    torch.testing.assert_close(block(components), expected, rtol=0, atol=1e-14)
+
+
+def test_independent_levels_differ_from_residual_by_the_base_interaction_energy():
+    # Same parameters, same scale/shift: the residual level energy is the
+    # independent level energy plus the base interaction energy.
+    torch.manual_seed(0)
+    residual = make_model(
+        atomic_energies=E0_TABLE,
+        atomic_inter_scale=(1.3, 0.2),
+        atomic_inter_shift=(-3.0, -0.08),
+    )
+    independent = make_model(
+        atomic_energies=E0_TABLE,
+        atomic_inter_scale=(1.3, 0.2),
+        atomic_inter_shift=(-3.0, -0.08),
+        independent_levels=True,
+    )
+    independent.load_state_dict(residual.state_dict())
+    batch = make_two_level_batch()
+    residual_energies = residual(batch.to_dict(), training=True)["energy_all_levels"]
+    independent_output = independent(batch.to_dict(), training=True)
+    independent_energies = independent_output["energy_all_levels"]
+    e0_all_levels = torch.tensor(
+        [2 * E0_TABLE[level, 0] + E0_TABLE[level, 1] for level in range(2)]
+    )  # columns are (H, O); 2 H + O per graph
+    base_interaction = independent_energies[:, 0] - e0_all_levels[0]
+    torch.testing.assert_close(residual_energies[:, 0], independent_energies[:, 0])
+    torch.testing.assert_close(
+        residual_energies[:, 1], independent_energies[:, 1] + base_interaction
+    )
+    # The gathered head energy stays consistent with its own column.
+    assert torch.equal(independent_output["energy"][0], independent_energies[0, 0])
+    assert torch.equal(independent_output["energy"][1], independent_energies[1, 1])
+
+
+def base_readout_parameters(model):
+    for name, parameter in model.named_parameters():
+        if name.startswith("readouts.") and "delta" not in name:
+            yield name, parameter
+
+
+@pytest.mark.parametrize("independent_levels", [False, True])
+def test_non_base_levels_depend_on_the_base_readout_only_when_residual(
+    independent_levels,
+):
+    model = make_model(
+        atomic_energies=E0_TABLE,
+        atomic_inter_scale=(1.3, 0.2),
+        atomic_inter_shift=(-3.0, -0.08),
+        independent_levels=independent_levels,
+    )
+    batch = make_two_level_batch()
+    model.force_carrying_levels = [0, 1]
+    model.base_force_column = 0
+    before = model(batch.to_dict(), training=True)
+    with torch.no_grad():
+        for _, parameter in base_readout_parameters(model):
+            parameter.add_(0.5 * torch.randn_like(parameter))
+    after = model(batch.to_dict(), training=True)
+    # The base level always moves.
+    assert not torch.allclose(
+        before["energy_all_levels"][:, 0], after["energy_all_levels"][:, 0]
+    )
+    non_base_energy_unchanged = torch.allclose(
+        before["energy_all_levels"][:, 1], after["energy_all_levels"][:, 1]
+    )
+    non_base_forces_unchanged = torch.allclose(
+        before["forces_all_levels"][:, 1], after["forces_all_levels"][:, 1]
+    )
+    assert non_base_energy_unchanged == independent_levels
+    assert non_base_forces_unchanged == independent_levels
+
+
+def test_independent_levels_receive_no_base_readout_gradient():
+    model = make_model(
+        atomic_inter_scale=(1.3, 0.2),
+        atomic_inter_shift=(-3.0, -0.08),
+        independent_levels=True,
+    )
+    batch = make_two_level_batch()
+    output = model(batch.to_dict(), training=True)
+    output["energy_all_levels"][:, 1].sum().backward()
+    for name, parameter in base_readout_parameters(model):
+        assert parameter.grad is None or torch.all(parameter.grad == 0), name
+    trunk_gradients = [
+        parameter.grad
+        for name, parameter in model.named_parameters()
+        if name.startswith("interactions.")
+    ]
+    assert any(
+        gradient is not None and gradient.abs().sum() > 0
+        for gradient in trunk_gradients
+    )
+
+
+def test_independent_levels_reject_detach_base_for_deltas():
+    with pytest.raises(ValueError, match="detach_base_for_deltas"):
+        make_model(independent_levels=True, detach_base_for_deltas=True)
+    with pytest.raises(ValueError, match="detach_base_for_deltas"):
+        modules.MultiLevelScaleShiftBlock(
+            scale=[1.0, 1.0],
+            shift=[0.0, 0.0],
+            detach_base_for_deltas=True,
+            independent_levels=True,
+        )
+
+
+def test_independent_levels_reject_zero_init_delta_readouts():
+    with pytest.raises(ValueError, match="zero_init_delta_readouts"):
+        make_model(independent_levels=True, zero_init_delta_readouts=True)
+
+
+def test_independent_warm_start_starts_every_level_at_the_base_model(tmp_path):
+    from mace.tools.multilevel_init import initialise_from_base_model
+
+    base_e0s = np.array([[-13.7, -2042.8]])
+    level_e0s = np.array([[-13.5, -2040.95]])
+    base_model = make_single_head_base_model(base_e0s, scale=1.3, shift=-3.0)
+    base_model_path = tmp_path / "base.model"
+    torch.save(base_model, base_model_path)
+
+    model = make_model(
+        atomic_energies=np.vstack([base_e0s, level_e0s]),
+        atomic_inter_scale=(1.3, 1.3),
+        atomic_inter_shift=(-3.0, -3.0),
+        independent_levels=True,
+    )
+    initialise_from_base_model(model, base_model_path)
+
+    batch = make_batch(
+        [
+            make_configuration(POSITIONS, head=LEVELS[BASE_LEVEL]),
+            make_configuration(POSITIONS + 0.05, head=LEVELS[BASE_LEVEL]),
+        ]
+    )
+    base_output = base_model(batch.to_dict(), training=False, compute_force=True)
+    model.force_carrying_levels = [0, 1]
+    model.base_force_column = 0
+    warm_output = model(batch.to_dict(), training=True, compute_force=True)
+    # O + 2 H per graph.
+    e0_difference = (level_e0s - base_e0s)[0, 1] + 2 * (level_e0s - base_e0s)[0, 0]
+    energies = warm_output["energy_all_levels"].detach()
+    torch.testing.assert_close(
+        energies[:, 0], base_output["energy"], rtol=0, atol=1e-10
+    )
+    torch.testing.assert_close(
+        energies[:, 1], base_output["energy"] + e0_difference, rtol=0, atol=1e-10
+    )
+    for column in range(2):
+        torch.testing.assert_close(
+            warm_output["forces_all_levels"][:, column].detach(),
+            base_output["forces"],
+            rtol=0,
+            atol=1e-10,
+        )
+
+
+def test_independent_warm_start_rejects_a_level_scale_differing_from_the_base(
+    tmp_path,
+):
+    from mace.tools.multilevel_init import WarmStartError, initialise_from_base_model
+
+    base_e0s = np.array([[-13.7, -2042.8]])
+    base_model = make_single_head_base_model(base_e0s, scale=1.3, shift=-3.0)
+    base_model_path = tmp_path / "base.model"
+    torch.save(base_model, base_model_path)
+    for scale, shift, label in (
+        ((1.3, 0.9), (-3.0, -3.0), "scale"),
+        ((1.3, 1.3), (-3.0, -2.0), "shift"),
+    ):
+        model = make_model(
+            atomic_energies=np.vstack([base_e0s, base_e0s]),
+            atomic_inter_scale=scale,
+            atomic_inter_shift=shift,
+            independent_levels=True,
+        )
+        with pytest.raises(WarmStartError, match=label):
+            initialise_from_base_model(model, base_model_path)
+
+
+def build_from_command_line(extra_arguments):
+    from mace.tools import build_default_arg_parser
+    from mace.tools.model_script_utils import _build_model
+
+    argv = [
+        "--name", "independent",
+        "--train_file", "train.xyz",
+        "--model", "MultiLevelScaleShiftMACE",
+        "--MLP_irreps", "8x0e",
+        "--radial_MLP", "[16]",
+    ] + extra_arguments
+    args = build_default_arg_parser().parse_args(argv)
+    args.std, args.mean = [1.0, 1.0], [0.0, 0.0]
+    model_config = dict(
+        r_max=4.0,
+        num_bessel=4,
+        num_polynomial_cutoff=3,
+        max_ell=2,
+        interaction_cls=modules.interaction_classes[args.interaction],
+        num_interactions=2,
+        num_elements=len(TABLE),
+        hidden_irreps=o3.Irreps("4x0e + 4x1o"),
+        edge_irreps=None,
+        atomic_energies=np.zeros((len(LEVELS), len(TABLE))),
+        apply_cutoff=args.apply_cutoff,
+        avg_num_neighbors=3.0,
+        atomic_numbers=TABLE.zs,
+        use_reduced_cg=args.use_reduced_cg,
+        use_so3=args.use_so3,
+        use_edge_irreps_first=args.use_edge_irreps_first,
+        cueq_config=None,
+    )
+    return _build_model(args, model_config, None, list(LEVELS))
+
+
+def test_independent_heads_flag_reaches_the_model():
+    assert not build_from_command_line([]).scale_shift.independent_levels
+    model = build_from_command_line(["--multilevel_independent_heads"])
+    assert model.scale_shift.independent_levels
+    with pytest.raises(ValueError, match="zero_init_delta_readouts"):
+        build_from_command_line(
+            ["--multilevel_independent_heads", "--zero_init_delta_readouts"]
+        )
+
+
+def test_independent_levels_survive_a_save_load_round_trip(tmp_path):
+    model = make_model(
+        atomic_energies=E0_TABLE,
+        atomic_inter_scale=(1.3, 0.2),
+        atomic_inter_shift=(-3.0, -0.08),
+        independent_levels=True,
+    )
+    model_path = tmp_path / "independent.model"
+    torch.save(model, model_path)
+    loaded = torch.load(model_path, weights_only=False)
+    assert loaded.scale_shift.independent_levels
+    batch = make_two_level_batch()
+    expected = model(batch.to_dict(), training=True)["energy_all_levels"]
+    result = loaded(batch.to_dict(), training=True)["energy_all_levels"]
+    assert torch.equal(result, expected)
+
+
+def test_a_model_saved_before_independent_levels_loads_as_residual(tmp_path):
+    model = make_model(atomic_inter_scale=(1.3, 0.2), atomic_inter_shift=(-3.0, -0.08))
+    del model.scale_shift.independent_levels  # as pickled by the older code
+    model_path = tmp_path / "residual.model"
+    torch.save(model, model_path)
+    loaded = torch.load(model_path, weights_only=False)
+    assert loaded.scale_shift.independent_levels is False
+    batch = make_two_level_batch()
+    assert torch.isfinite(loaded(batch.to_dict(), training=True)["energy"]).all()
+
+
+@pytest.mark.parametrize("independent_levels", [False, True])
+def test_compiled_training_matches_eager(tmp_path, independent_levels):
+    from mace.tools import compile as mace_compile
+
+    with mace_compile.disable_e3nn_codegen():
+        model = make_model(
+            atomic_energies=E0_TABLE,
+            atomic_inter_scale=(1.3, 0.2),
+            atomic_inter_shift=(-3.0, -0.08),
+            independent_levels=independent_levels,
+        )
+    model.force_carrying_levels = [0, 1]
+    model.base_force_column = 0
+    compiled = mace_compile.CompiledTrainingModel(model, backend="aot_eager")
+    parameters = list(model.parameters())
+
+    def loss_and_gradients(call, batch):
+        output = call(batch, training=True, compute_force=True)
+        loss = (
+            output["energy_all_levels"].pow(2).sum()
+            + output["forces_all_levels"].pow(2).sum()
+        )
+        return loss, torch.autograd.grad(loss, parameters, allow_unused=True)
+
+    entries = [
+        (POSITIONS, -1.5, FORCES, -1.6),
+        (POSITIONS + 0.05, -1.4, FORCES, None),
+    ]
+    compiled_batch, _ = make_fused_batch(tmp_path, entries)
+    eager_batch, _ = make_fused_batch(tmp_path, entries)
+    eager_batch = eager_batch.to_dict()
+    eager_batch["positions"].requires_grad_(True)
+    compiled_loss, compiled_gradients = loss_and_gradients(
+        compiled, compiled_batch.to_dict()
+    )
+    eager_loss, eager_gradients = loss_and_gradients(model, eager_batch)
+    torch.testing.assert_close(compiled_loss, eager_loss, rtol=1e-12, atol=1e-12)
+    for compiled_gradient, eager_gradient in zip(compiled_gradients, eager_gradients):
+        if eager_gradient is None:
+            assert compiled_gradient is None
+            continue
+        torch.testing.assert_close(
+            compiled_gradient, eager_gradient, rtol=1e-10, atol=1e-12
+        )

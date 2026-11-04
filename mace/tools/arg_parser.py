@@ -173,6 +173,18 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=False,
     )
     parser.add_argument(
+        "--multilevel_independent_heads",
+        help="MultiLevelScaleShiftMACE only: every level predicts its own "
+        "ABSOLUTE energy (E_k = scale_k * head_k + shift_k + E0s) with no base "
+        "term -- the classic multihead comparison on the same trunk and data "
+        "path. Incompatible with --detach_base_for_deltas and "
+        "--zero_init_delta_readouts; with --multilevel_base_model every head "
+        "is warm-started from the base readout and must share the base "
+        "head's scale/shift",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
         "--multilevel_train_file",
         help="MultiLevelScaleShiftMACE only: extended-xyz file with per-level "
         "suffixed keys (<energy_key>_<head>, <forces_key>_<head>) that replaces "

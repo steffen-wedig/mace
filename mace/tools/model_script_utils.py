@@ -402,6 +402,7 @@ def _build_model(
             base_level=0,
             detach_base_for_deltas=args.detach_base_for_deltas,
             zero_init_delta_readouts=args.zero_init_delta_readouts,
+            independent_levels=args.multilevel_independent_heads,
         )
     if args.model == "PolarMACE" and model_config_foundation is not None:
         return modules.PolarMACE(**model_config_foundation)

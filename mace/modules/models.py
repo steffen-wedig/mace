@@ -659,6 +659,21 @@ class MultiLevelScaleShiftMACE(MACE):
     expensive levels cannot move the base readout parameters -- through
     energy or force losses -- while every level's forces stay exact. This
     trades away TorchScript compatibility of the detached path.
+
+    ``independent_levels`` turns the model into the classic multihead
+    comparison on the same trunk, readouts and data path: no level adds the
+    base term, every level reads out its own ABSOLUTE energy with its own
+    readouts and scale/shift,
+
+        E_k = scale_k * head_k + shift_k   (+ per-level E0s)   for every k,
+
+    so ``atomic_inter_scale[k]``/``atomic_inter_shift[k]`` are then
+    statistics of absolute energies. The base level is unchanged; the
+    readout modules keep their residual names (``delta_linear`` /
+    ``delta_readouts`` hold the non-base heads). Pair repulsion, when
+    enabled, enters every level. Neither ``detach_base_for_deltas`` nor
+    ``zero_init_delta_readouts`` (an absolute head at zero predicts only its
+    E0s) is meaningful here; both raise.
     """
 
     def __init__(
@@ -668,12 +683,24 @@ class MultiLevelScaleShiftMACE(MACE):
         base_level: int = 0,
         detach_base_for_deltas: bool = False,
         zero_init_delta_readouts: bool = False,
+        independent_levels: bool = False,
         force_carrying_levels: Optional[List[int]] = None,
         **kwargs,
     ):
         if kwargs.get("embedding_specs") is not None:
             raise ValueError(
                 "MultiLevelScaleShiftMACE does not support embedding_specs"
+            )
+        if independent_levels and detach_base_for_deltas:
+            raise ValueError(
+                "detach_base_for_deltas has no meaning with independent_levels: "
+                "independent levels do not read the base readout"
+            )
+        if independent_levels and zero_init_delta_readouts:
+            raise ValueError(
+                "zero_init_delta_readouts cannot be combined with "
+                "independent_levels: a zero-initialised absolute head predicts "
+                "only its E0s; warm-start the heads from a base model instead"
             )
         super().__init__(**kwargs)
         heads = kwargs.get("heads")
@@ -755,6 +782,7 @@ class MultiLevelScaleShiftMACE(MACE):
             shift=shift,
             base_level=base_level,
             detach_base_for_deltas=detach_base_for_deltas,
+            independent_levels=independent_levels,
         )
 
     @staticmethod
@@ -877,9 +905,13 @@ class MultiLevelScaleShiftMACE(MACE):
             torch.stack(node_components_list, dim=0), dim=0
         )  # [n_nodes, n_levels]
         if hasattr(self, "pair_repulsion"):
-            pair_components = torch.zeros_like(node_components)
-            pair_components[:, self.base_level] = pair_node_energy
-            node_components = node_components + pair_components
+            if self.scale_shift.independent_levels:
+                # Every level is absolute, so each carries the repulsion.
+                node_components = node_components + pair_node_energy.unsqueeze(-1)
+            else:
+                pair_components = torch.zeros_like(node_components)
+                pair_components[:, self.base_level] = pair_node_energy
+                node_components = node_components + pair_components
 
         # Parameter detach (ablation A): recompute the base column with the
         # readout parameters detached, so the expensive levels cannot move
