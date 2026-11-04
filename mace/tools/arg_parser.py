@@ -1018,6 +1018,14 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
     )
+    parser.add_argument(
+        "--lr_warmup_steps",
+        help="Number of optimizer steps over which every parameter group's learning "
+        "rate rises linearly to its set value (adam/adamw; 0 disables). Keeps the "
+        "first steps of a warm-started model small",
+        type=int,
+        default=0,
+    )
     parser.add_argument("--batch_size", help="batch size", type=int, default=10)
     parser.add_argument(
         "--valid_batch_size", help="Validation batch size", type=int, default=10

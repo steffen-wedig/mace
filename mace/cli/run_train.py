@@ -1197,6 +1197,7 @@ def run(args) -> None:
         data_aug_magmom=args.data_aug_magmom,
         data_aug_magmom_mode=getattr(args, "data_aug_magmom_mode", "non-soc"),
         log_gradient_diagnostics=args.log_gradient_diagnostics,
+        lr_warmup_steps=args.lr_warmup_steps,
     )
 
     logging.info("")

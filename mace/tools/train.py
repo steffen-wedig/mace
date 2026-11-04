@@ -293,6 +293,46 @@ def _log_gradient_diagnostics(
             )
 
 
+class LinearLRWarmup:
+    """Scale every parameter group's learning rate linearly up over the first steps.
+
+    Step ``i`` (counted from 0) trains at ``(i + 1) / warmup_steps`` of each
+    group's learning rate; from step ``warmup_steps`` on the groups are left
+    to the epoch-level scheduler. Adam's first steps move every parameter by
+    about the learning rate whatever its gradient, which can throw a
+    warm-started model far from its starting point before the second-moment
+    estimates settle; the warm-up keeps those steps small.
+    """
+
+    def __init__(self, warmup_steps: int, start_step: int = 0) -> None:
+        if warmup_steps < 0:
+            raise ValueError(f"warmup_steps must be >= 0, got {warmup_steps}")
+        self.warmup_steps = warmup_steps
+        self.step_count = start_step
+        self.target_lrs: Optional[List[float]] = None
+
+    @property
+    def active(self) -> bool:
+        return self.step_count < self.warmup_steps
+
+    def before_step(self, optimizer: torch.optim.Optimizer) -> None:
+        if not self.active:
+            return
+        if self.target_lrs is None:
+            self.target_lrs = [group["lr"] for group in optimizer.param_groups]
+        factor = (self.step_count + 1) / self.warmup_steps
+        for group, target_lr in zip(optimizer.param_groups, self.target_lrs):
+            group["lr"] = target_lr * factor
+
+    def after_step(self, optimizer: torch.optim.Optimizer) -> None:
+        if not self.active:
+            return
+        self.step_count += 1
+        if not self.active and self.target_lrs is not None:
+            for group, target_lr in zip(optimizer.param_groups, self.target_lrs):
+                group["lr"] = target_lr
+
+
 def train(
     model: torch.nn.Module,
     loss_fn: torch.nn.Module,
@@ -322,7 +362,12 @@ def train(
     data_aug_magmom: Optional[bool] = False,
     data_aug_magmom_mode: str = "non-soc",
     log_gradient_diagnostics: bool = False,
+    lr_warmup_steps: int = 0,
 ):
+    # A restarted run resumes the warm-up where it stopped.
+    lr_warmup = LinearLRWarmup(
+        lr_warmup_steps, start_step=start_epoch * len(train_loader)
+    )
     lowest_loss = np.inf
     valid_loss = np.inf
     patience_counter = 0
@@ -403,6 +448,7 @@ def train(
             distributed=distributed,
             distributed_model=distributed_model,
             rank=rank,
+            lr_warmup=lr_warmup,
         )
         if distributed:
             torch.distributed.barrier()
@@ -531,6 +577,7 @@ def train_one_epoch(
     distributed: bool,
     distributed_model: Optional[DistributedDataParallel] = None,
     rank: Optional[int] = 0,
+    lr_warmup: Optional[LinearLRWarmup] = None,
 ) -> None:
     model_to_train = model if distributed_model is None else distributed_model
 
@@ -562,6 +609,7 @@ def train_one_epoch(
                 output_args=output_args,
                 max_grad_norm=max_grad_norm,
                 device=device,
+                lr_warmup=lr_warmup,
             )
             opt_metrics["mode"] = "opt"
             opt_metrics["epoch"] = epoch
@@ -578,6 +626,7 @@ def take_step(
     output_args: Dict[str, bool],
     max_grad_norm: Optional[float],
     device: torch.device,
+    lr_warmup: Optional[LinearLRWarmup] = None,
 ) -> Tuple[float, Dict[str, Any]]:
     start_time = time.time()
     batch = batch.to(device)
@@ -602,7 +651,11 @@ def take_step(
         return loss
 
     loss = closure()
+    if lr_warmup is not None:
+        lr_warmup.before_step(optimizer)
     optimizer.step()
+    if lr_warmup is not None:
+        lr_warmup.after_step(optimizer)
 
     if ema is not None:
         ema.update()
