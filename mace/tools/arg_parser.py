@@ -195,6 +195,17 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=False,
     )
     parser.add_argument(
+        "--readout_block",
+        help=(
+            "readout block of the last layer of a model built from scratch "
+            "(MACE, ScaleShiftMACE, PolarMACE); default: the model's own "
+            "(NonLinearReadoutBlock). A foundation model brings its own readout, "
+            "so this cannot be combined with --foundation_model."
+        ),
+        default=None,
+        choices=["NonLinearReadoutBlock", "NonLinearBiasReadoutBlock"],
+    )
+    parser.add_argument(
         "--use_embedding_readout",
         help="use embedding readout for the final output",
         type=str2bool,

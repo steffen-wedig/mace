@@ -256,10 +256,39 @@ def _parse_literal_or_none(value):
     return value
 
 
+# Models built from scratch whose last-layer readout `--readout_block` can choose
+# (their constructors take `readout_cls`).
+READOUT_BLOCK_MODELS = ("MACE", "ScaleShiftMACE", "PolarMACE")
+
+
+def _with_readout_block(args, model_config, model_config_foundation):
+    """``model_config`` with the ``readout_cls`` that ``--readout_block`` names.
+
+    Unset, the model keeps its own default. A foundation model fixes its own readout
+    (``extract_config_mace_model`` carries it), so asking for one alongside it is an
+    error rather than silently ignored, as is a model whose constructor takes none.
+    """
+    readout_block = getattr(args, "readout_block", None)
+    if readout_block is None:
+        return model_config
+    if model_config_foundation is not None:
+        raise ValueError(
+            "--readout_block applies to models built from scratch; the foundation "
+            "model brings its own readout"
+        )
+    if args.model not in READOUT_BLOCK_MODELS:
+        raise ValueError(
+            f"--readout_block is not supported for --model {args.model}; "
+            f"supported: {', '.join(READOUT_BLOCK_MODELS)}"
+        )
+    return {**model_config, "readout_cls": modules.readout_classes[readout_block]}
+
+
 def _build_model(
     args, model_config, model_config_foundation, heads
 ):  # pylint: disable=too-many-return-statements
 
+    model_config = _with_readout_block(args, model_config, model_config_foundation)
     if args.model == "MagneticScaleShiftMACE":
         m_max = resolve_m_max(args.m_max, list(model_config["atomic_numbers"]))
         return modules.MagneticScaleShiftMACE(
