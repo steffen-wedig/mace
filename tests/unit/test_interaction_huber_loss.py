@@ -614,7 +614,7 @@ def test_selection_loss_scores_frames_at_stage_two_weights(tmp_path):
 
     args = _selection_args("--loss", "interaction_huber", "--swa")
     training_loss = get_loss_fn(args, dipole_only=False, compute_dipole=False)
-    selection_loss = get_selection_loss_fn(args, training_loss)
+    selection_loss = get_selection_loss_fn(args, dipole_only=False, compute_dipole=False)
     assert selection_loss.term_weights() == {
         "frame_energy": 1000.0,
         "frame_forces": 50.0,
@@ -638,18 +638,20 @@ def test_selection_loss_without_stage_two_uses_the_stage_one_frame_weights():
     from mace.tools.scripts_utils import get_loss_fn, get_selection_loss_fn  # pylint: disable=import-outside-toplevel
 
     args = _selection_args("--loss", "interaction_huber")
-    selection_loss = get_selection_loss_fn(args, get_loss_fn(args, dipole_only=False, compute_dipole=False))
+    selection_loss = get_selection_loss_fn(args, dipole_only=False, compute_dipole=False)
     weights = selection_loss.term_weights()
     assert (weights["frame_energy"], weights["frame_forces"]) == (1.0, 100.0)
     assert weights["interaction_forces"] == 0.0
 
 
-def test_selection_loss_of_other_losses_is_a_copy_of_the_stage_one_loss():
+def test_selection_loss_of_other_losses_is_the_loss_at_stage_two_weights():
     from mace.tools.scripts_utils import get_loss_fn, get_selection_loss_fn  # pylint: disable=import-outside-toplevel
 
-    args = _selection_args("--loss", "weighted", "--swa")
+    args = _selection_args("--loss", "huber", "--swa")
     training_loss = get_loss_fn(args, dipole_only=False, compute_dipole=False)
-    selection_loss = get_selection_loss_fn(args, training_loss)
+    selection_loss = get_selection_loss_fn(args, dipole_only=False, compute_dipole=False)
     assert selection_loss is not training_loss
     assert type(selection_loss) is type(training_loss)
-    assert float(selection_loss.energy_weight) == float(training_loss.energy_weight) == 1.0
+    assert float(training_loss.energy_weight) == 1.0
+    assert float(selection_loss.energy_weight) == 1000.0
+    assert float(selection_loss.forces_weight) == 50.0

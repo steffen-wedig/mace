@@ -136,10 +136,12 @@ class FakeTermLoss(torch.nn.Module):
         return sum(self.compute_terms(ref, pred).values())
 
 
+# FakeTermLoss leaves interaction_energy without entries, so it has weight 0 (a positive
+# weight on a term without entries is refused, `require_entries_for_weighted_terms`).
 STAGE_ONE_WEIGHTS = {
     "frame_energy": 1.0,
     "frame_forces": 100.0,
-    "interaction_energy": 1.0,
+    "interaction_energy": 0.0,
     "interaction_forces": 100.0,
 }
 STAGE_TWO_WEIGHTS = {
@@ -675,11 +677,13 @@ def test_evaluate_fills_a_term_accumulator(float64):  # pylint: disable=unused-a
 
 
 def interaction_huber_loss(weights):
+    """The frame weights of ``weights``; the interaction terms get weight 0, since
+    extxyz-style batches carry no interaction entries."""
     return modules.InteractionHuberLoss(
         energy_weight=weights["frame_energy"],
         forces_weight=weights["frame_forces"],
-        interaction_energy_weight=weights["interaction_energy"],
-        interaction_forces_weight=weights["interaction_forces"],
+        interaction_energy_weight=0.0,
+        interaction_forces_weight=0.0,
     )
 
 

@@ -349,12 +349,18 @@ class WeightedEnergyForcesStressLoss(torch.nn.Module):
 
 
 class WeightedHuberEnergyForcesStressLoss(torch.nn.Module):
+    """Huber loss on energies per atom, forces and (when ``stress_weight`` is nonzero)
+    stresses. With ``stress_weight == 0`` the stress term is skipped entirely, so models
+    that predict no stress (``compute_stress`` off, aperiodic data) train on energies and
+    forces alone; a nonzero weight without a stress prediction is an error."""
+
     def __init__(
         self, energy_weight=1.0, forces_weight=1.0, stress_weight=1.0, huber_delta=0.01
     ) -> None:
         super().__init__()
         # We store the huber_delta rather than a loss with fixed reduction.
         self.huber_delta = huber_delta
+        self.uses_stress = float(stress_weight) != 0.0
         self.register_buffer(
             "energy_weight",
             torch.tensor(energy_weight, dtype=torch.get_default_dtype()),
@@ -368,44 +374,37 @@ class WeightedHuberEnergyForcesStressLoss(torch.nn.Module):
             torch.tensor(stress_weight, dtype=torch.get_default_dtype()),
         )
 
+    def _huber(
+        self, reference: torch.Tensor, prediction: torch.Tensor, ddp: Optional[bool]
+    ) -> torch.Tensor:
+        if ddp:
+            return reduce_loss(
+                torch.nn.functional.huber_loss(
+                    reference, prediction, reduction="none", delta=self.huber_delta
+                ),
+                ddp,
+            )
+        return torch.nn.functional.huber_loss(
+            reference, prediction, reduction="mean", delta=self.huber_delta
+        )
+
     def forward(
         self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
     ) -> torch.Tensor:
         num_atoms = ref.ptr[1:] - ref.ptr[:-1]
-        if ddp:
-            loss_energy = torch.nn.functional.huber_loss(
-                ref["energy"] / num_atoms,
-                pred["energy"] / num_atoms,
-                reduction="none",
-                delta=self.huber_delta,
-            )
-            loss_energy = reduce_loss(loss_energy, ddp)
-            loss_forces = torch.nn.functional.huber_loss(
-                ref["forces"], pred["forces"], reduction="none", delta=self.huber_delta
-            )
-            loss_forces = reduce_loss(loss_forces, ddp)
-            loss_stress = torch.nn.functional.huber_loss(
-                ref["stress"], pred["stress"], reduction="none", delta=self.huber_delta
-            )
-            loss_stress = reduce_loss(loss_stress, ddp)
-        else:
-            loss_energy = torch.nn.functional.huber_loss(
-                ref["energy"] / num_atoms,
-                pred["energy"] / num_atoms,
-                reduction="mean",
-                delta=self.huber_delta,
-            )
-            loss_forces = torch.nn.functional.huber_loss(
-                ref["forces"], pred["forces"], reduction="mean", delta=self.huber_delta
-            )
-            loss_stress = torch.nn.functional.huber_loss(
-                ref["stress"], pred["stress"], reduction="mean", delta=self.huber_delta
-            )
-        return (
-            self.energy_weight * loss_energy
-            + self.forces_weight * loss_forces
-            + self.stress_weight * loss_stress
+        loss_energy = self._huber(
+            ref["energy"] / num_atoms, pred["energy"] / num_atoms, ddp
         )
+        loss_forces = self._huber(ref["forces"], pred["forces"], ddp)
+        total = self.energy_weight * loss_energy + self.forces_weight * loss_forces
+        if not self.uses_stress:
+            return total
+        if pred.get("stress") is None:
+            raise ValueError(
+                "huber loss: stress_weight is nonzero but the model predicts no stress "
+                "(set stress_weight and swa_stress_weight to 0, or compute_stress)"
+            )
+        return total + self.stress_weight * self._huber(ref["stress"], pred["stress"], ddp)
 
     def __repr__(self):
         return (

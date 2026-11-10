@@ -10,7 +10,6 @@ import dataclasses
 import json
 import logging
 import os
-from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -771,17 +770,22 @@ def get_avg_num_neighbors(head_configs, args, train_loader, device):
     return avg_num_neighbors_out
 
 
+def stage_weight(args: argparse.Namespace, name: str, stage_two: bool) -> float:
+    """The weight ``name`` (``energy_weight``, ``forces_weight``, ...) of stage one, or of
+    stage two (its ``swa_`` twin)."""
+    return getattr(args, f"swa_{name}" if stage_two else name)
+
+
 def get_interaction_huber_loss(
     args: argparse.Namespace, stage_two: bool
 ) -> torch.nn.Module:
     """``InteractionHuberLoss`` with the weights of stage one or two (``swa_*``) and the same
     Huber thresholds in both."""
-    prefix = "swa_" if stage_two else ""
     return modules.InteractionHuberLoss(
-        energy_weight=getattr(args, f"{prefix}energy_weight"),
-        forces_weight=getattr(args, f"{prefix}forces_weight"),
-        interaction_energy_weight=getattr(args, f"{prefix}interaction_energy_weight"),
-        interaction_forces_weight=getattr(args, f"{prefix}interaction_forces_weight"),
+        energy_weight=stage_weight(args, "energy_weight", stage_two),
+        forces_weight=stage_weight(args, "forces_weight", stage_two),
+        interaction_energy_weight=stage_weight(args, "interaction_energy_weight", stage_two),
+        interaction_forces_weight=stage_weight(args, "interaction_forces_weight", stage_two),
         huber_delta_frame_energy=args.huber_delta_frame_energy,
         huber_delta_frame_forces=args.huber_delta_frame_forces,
         huber_delta_interaction_energy=args.huber_delta_interaction_energy,
@@ -790,25 +794,26 @@ def get_interaction_huber_loss(
 
 
 def get_selection_loss_fn(
-    args: argparse.Namespace, loss_fn: torch.nn.Module
+    args: argparse.Namespace, dipole_only: bool, compute_dipole: bool
 ) -> torch.nn.Module:
-    """The fixed criterion for the best model of the whole run.
-
-    For ``interaction_huber``: the frame energy and frame forces terms only, at the stage-two
-    (``swa_*``) frame weights when the run has a stage two, else at the stage-one frame
-    weights. The interaction terms get weight 0, so every loss arm is selected by the same
-    quantity. For any other loss: a copy of the stage-one loss."""
+    """The fixed criterion for the best model of the whole run, the same for every loss:
+    the configured loss at the stage-two (``swa_*``) weights when the run has a stage two,
+    else at the stage-one weights. For ``interaction_huber`` only the frame energy and frame
+    forces terms count (interaction weights 0), so every loss arm is selected by the same
+    quantity."""
+    stage_two = bool(args.swa)
+    stage = "stage-two" if stage_two else "stage-one"
     if args.loss != "interaction_huber":
-        return deepcopy(loss_fn)
-    prefix = "swa_" if args.swa else ""
-    energy_weight = getattr(args, f"{prefix}energy_weight")
-    forces_weight = getattr(args, f"{prefix}forces_weight")
+        logging.info("Best-model criterion: the %s loss at %s weights", args.loss, stage)
+        return get_loss_fn(args, dipole_only, compute_dipole, stage_two=stage_two)
+    energy_weight = stage_weight(args, "energy_weight", stage_two)
+    forces_weight = stage_weight(args, "forces_weight", stage_two)
     logging.info(
         "Best-model criterion: frame energy (weight %s) and frame forces (weight %s), "
         "%s weights; interaction terms excluded",
         energy_weight,
         forces_weight,
-        "stage-two" if args.swa else "stage-one",
+        stage,
     )
     return modules.InteractionHuberLoss(
         energy_weight=energy_weight,
@@ -826,79 +831,85 @@ def get_loss_fn(
     args: argparse.Namespace,
     dipole_only: bool,
     compute_dipole: bool,
+    stage_two: bool = False,
 ) -> torch.nn.Module:
-    if args.loss == "weighted":
-        loss_fn = modules.WeightedEnergyForcesLoss(
-            energy_weight=args.energy_weight, forces_weight=args.forces_weight
+    """The loss ``--loss`` names, with the weights of stage one or of stage two (``swa_*``).
+    Both stages come from this one function, so every loss has the same stage two: the same
+    class with the stage-two weights. An unknown name is an error."""
+
+    def weight(name: str) -> float:
+        return stage_weight(args, name, stage_two)
+
+    if args.loss in ("weighted", "ef"):
+        return modules.WeightedEnergyForcesLoss(
+            energy_weight=weight("energy_weight"), forces_weight=weight("forces_weight")
         )
-    elif args.loss == "forces_only":
-        loss_fn = modules.WeightedForcesLoss(forces_weight=args.forces_weight)
-    elif args.loss == "virials":
-        loss_fn = modules.WeightedEnergyForcesVirialsLoss(
-            energy_weight=args.energy_weight,
-            forces_weight=args.forces_weight,
-            virials_weight=args.virials_weight,
+    if args.loss == "forces_only":
+        if stage_two:
+            raise ValueError("Can not select Stage Two with forces only loss.")
+        return modules.WeightedForcesLoss(forces_weight=weight("forces_weight"))
+    if args.loss == "virials":
+        return modules.WeightedEnergyForcesVirialsLoss(
+            energy_weight=weight("energy_weight"),
+            forces_weight=weight("forces_weight"),
+            virials_weight=weight("virials_weight"),
         )
-    elif args.loss == "stress":
-        loss_fn = modules.WeightedEnergyForcesStressLoss(
-            energy_weight=args.energy_weight,
-            forces_weight=args.forces_weight,
-            stress_weight=args.stress_weight,
+    if args.loss == "stress":
+        return modules.WeightedEnergyForcesStressLoss(
+            energy_weight=weight("energy_weight"),
+            forces_weight=weight("forces_weight"),
+            stress_weight=weight("stress_weight"),
         )
-    elif args.loss == "huber":
-        loss_fn = modules.WeightedHuberEnergyForcesStressLoss(
-            energy_weight=args.energy_weight,
-            forces_weight=args.forces_weight,
-            stress_weight=args.stress_weight,
+    if args.loss == "huber":
+        return modules.WeightedHuberEnergyForcesStressLoss(
+            energy_weight=weight("energy_weight"),
+            forces_weight=weight("forces_weight"),
+            stress_weight=weight("stress_weight"),
             huber_delta=args.huber_delta,
         )
-    elif args.loss == "universal":
-        loss_fn = modules.UniversalLoss(
-            energy_weight=args.energy_weight,
-            forces_weight=args.forces_weight,
-            stress_weight=args.stress_weight,
-            magforces_weight=args.magforces_weight,
+    if args.loss == "universal":
+        return modules.UniversalLoss(
+            energy_weight=weight("energy_weight"),
+            forces_weight=weight("forces_weight"),
+            stress_weight=weight("stress_weight"),
+            magforces_weight=weight("magforces_weight"),
             huber_delta=args.huber_delta,
         )
-    elif args.loss == "interaction_universal":
-        loss_fn = modules.InteractionUniversalLoss(
-            energy_weight=args.energy_weight,
-            forces_weight=args.forces_weight,
-            stress_weight=args.stress_weight,
-            magforces_weight=args.magforces_weight,
+    if args.loss == "interaction_universal":
+        return modules.InteractionUniversalLoss(
+            energy_weight=weight("energy_weight"),
+            forces_weight=weight("forces_weight"),
+            stress_weight=weight("stress_weight"),
+            magforces_weight=weight("magforces_weight"),
             huber_delta=args.huber_delta,
-            interaction_energy_weight=args.interaction_energy_weight,
-            interaction_forces_weight=args.interaction_forces_weight,
+            interaction_energy_weight=weight("interaction_energy_weight"),
+            interaction_forces_weight=weight("interaction_forces_weight"),
         )
-    elif args.loss == "interaction_huber":
-        loss_fn = get_interaction_huber_loss(args, stage_two=False)
-    elif args.loss == "l1l2energyforces":
-        loss_fn = modules.WeightedEnergyForcesL1L2Loss(
-            energy_weight=args.energy_weight,
-            forces_weight=args.forces_weight,
+    if args.loss == "interaction_huber":
+        return get_interaction_huber_loss(args, stage_two=stage_two)
+    if args.loss == "l1l2energyforces":
+        return modules.WeightedEnergyForcesL1L2Loss(
+            energy_weight=weight("energy_weight"),
+            forces_weight=weight("forces_weight"),
         )
-    elif args.loss == "dipole":
+    if args.loss == "dipole":
         assert (
             dipole_only is True
         ), "dipole loss can only be used with AtomicDipolesMACE model"
-        loss_fn = modules.DipoleSingleLoss(
-            dipole_weight=args.dipole_weight,
+        return modules.DipoleSingleLoss(dipole_weight=weight("dipole_weight"))
+    if args.loss == "dipole_polar":
+        return modules.DipolePolarLoss(
+            dipole_weight=weight("dipole_weight"),
+            polarizability_weight=weight("polarizability_weight"),
         )
-    elif args.loss == "dipole_polar":
-        loss_fn = modules.DipolePolarLoss(
-            dipole_weight=args.dipole_weight,
-            polarizability_weight=args.polarizability_weight,
-        )
-    elif args.loss == "energy_forces_dipole":
+    if args.loss == "energy_forces_dipole":
         assert dipole_only is False and compute_dipole is True
-        loss_fn = modules.WeightedEnergyForcesDipoleLoss(
-            energy_weight=args.energy_weight,
-            forces_weight=args.forces_weight,
-            dipole_weight=args.dipole_weight,
+        return modules.WeightedEnergyForcesDipoleLoss(
+            energy_weight=weight("energy_weight"),
+            forces_weight=weight("forces_weight"),
+            dipole_weight=weight("dipole_weight"),
         )
-    else:
-        loss_fn = modules.WeightedEnergyForcesLoss(energy_weight=1.0, forces_weight=1.0)
-    return loss_fn
+    raise ValueError(f"unknown loss {args.loss!r}")
 
 
 def get_swa(
@@ -908,90 +919,27 @@ def get_swa(
     swas: List[bool],
     dipole_only: bool = False,
 ):
+    """Stage two: the configured loss at the ``swa_*`` weights (`get_loss_fn`), a lower
+    learning rate and weight averaging from ``start_swa``."""
     assert dipole_only is False, "Stage Two for dipole fitting not implemented"
     swas.append(True)
     if args.start_swa is None:
         args.start_swa = max(1, args.max_num_epochs // 4 * 3)
-    else:
-        if args.start_swa >= args.max_num_epochs:
-            logging.warning(
-                f"Start Stage Two must be less than max_num_epochs, got {args.start_swa} > {args.max_num_epochs}"
-            )
-            swas[-1] = False
-    if args.loss == "forces_only":
-        raise ValueError("Can not select Stage Two with forces only loss.")
-    if args.loss == "virials":
-        loss_fn_energy = modules.WeightedEnergyForcesVirialsLoss(
-            energy_weight=args.swa_energy_weight,
-            forces_weight=args.swa_forces_weight,
-            virials_weight=args.swa_virials_weight,
+    elif args.start_swa >= args.max_num_epochs:
+        logging.warning(
+            f"Start Stage Two must be less than max_num_epochs, got {args.start_swa} > {args.max_num_epochs}"
         )
-        logging.info(
-            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight},  virials_weight: {args.swa_virials_weight} and learning rate : {args.swa_lr}"
-        )
-    elif args.loss == "stress":
-        loss_fn_energy = modules.WeightedEnergyForcesStressLoss(
-            energy_weight=args.swa_energy_weight,
-            forces_weight=args.swa_forces_weight,
-            stress_weight=args.swa_stress_weight,
-        )
-        logging.info(
-            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight}, stress weight : {args.swa_stress_weight} and learning rate : {args.swa_lr}"
-        )
-    elif args.loss == "dipole_polar":
-        loss_fn_energy = modules.DipolePolarLoss(
-            dipole_weight=args.swa_dipole_weight,
-            polarizability_weight=args.swa_polarizability_weight,
-        )
-        logging.info(
-            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, dipole weight : {args.swa_dipole_weight}, polarizability weight : {args.swa_polarizability_weight}, and learning rate : {args.swa_lr}"
-        )
-    elif args.loss == "energy_forces_dipole":
-        loss_fn_energy = modules.WeightedEnergyForcesDipoleLoss(
-            args.swa_energy_weight,
-            forces_weight=args.swa_forces_weight,
-            dipole_weight=args.swa_dipole_weight,
-        )
-        logging.info(
-            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight}, dipole weight : {args.swa_dipole_weight} and learning rate : {args.swa_lr}"
-        )
-    elif args.loss == "interaction_universal":
-        loss_fn_energy = modules.InteractionUniversalLoss(
-            energy_weight=args.swa_energy_weight,
-            forces_weight=args.swa_forces_weight,
-            stress_weight=args.swa_stress_weight,
-            magforces_weight=args.swa_magforces_weight,
-            huber_delta=args.huber_delta,
-            interaction_energy_weight=args.swa_interaction_energy_weight,
-            interaction_forces_weight=args.swa_interaction_forces_weight,
-        )
-        logging.info(
-            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy} and learning rate : {args.swa_lr}"
-        )
-    elif args.loss == "interaction_huber":
-        loss_fn_energy = get_interaction_huber_loss(args, stage_two=True)
-        logging.info(
-            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy} and learning rate : {args.swa_lr}"
-        )
-    elif args.loss == "universal":
-        loss_fn_energy = modules.UniversalLoss(
-            energy_weight=args.swa_energy_weight,
-            forces_weight=args.swa_forces_weight,
-            stress_weight=args.swa_stress_weight,
-            magforces_weight=args.swa_magforces_weight,
-            huber_delta=args.huber_delta,
-        )
-        logging.info(
-            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight}, stress weight : {args.swa_stress_weight}, magforces weight : {args.swa_magforces_weight} and learning rate : {args.swa_lr}"
-        )
-    else:
-        loss_fn_energy = modules.WeightedEnergyForcesLoss(
-            energy_weight=args.swa_energy_weight,
-            forces_weight=args.swa_forces_weight,
-        )
-        logging.info(
-            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight} and learning rate : {args.swa_lr}"
-        )
+        swas[-1] = False
+    loss_fn_energy = get_loss_fn(
+        args,
+        dipole_only=dipole_only,
+        compute_dipole=getattr(args, "compute_dipole", False),
+        stage_two=True,
+    )
+    logging.info(
+        f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy} "
+        f"and learning rate : {args.swa_lr}"
+    )
     swa = SWAContainer(
         model=AveragedModel(model),
         scheduler=SWALR(

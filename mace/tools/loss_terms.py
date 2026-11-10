@@ -409,9 +409,10 @@ class LossTermInstrumentation:
         self.step += 1
 
     def finish_train_epoch(self, epoch: int) -> None:
-        self._write_summary(
+        summary = self._write_summary(
             self.train_accumulator, split="train", head=None, epoch=epoch
         )
+        require_entries_for_weighted_terms(summary, epoch)
 
     # Validation split -----------------------------------------------------------------
 
@@ -453,7 +454,8 @@ class LossTermInstrumentation:
         split: str,
         head: Optional[str],
         epoch: Optional[int],
-    ) -> None:
+    ) -> Dict[str, Dict[str, Optional[float]]]:
+        summary = accumulator.summary()
         self.writer.write(
             {
                 "record": "term_summary",
@@ -462,8 +464,27 @@ class LossTermInstrumentation:
                 "epoch": epoch,
                 "stage": self.stage,
                 "step": self.step,
-                "terms": accumulator.summary(),
+                "terms": summary,
             }
+        )
+        return summary
+
+
+def require_entries_for_weighted_terms(
+    summary: Dict[str, Dict[str, Optional[float]]], epoch: int
+) -> None:
+    """Refuse a training epoch in which a term with a positive weight had no entry at all:
+    the term the configuration asks for never sees data (for example the frame terms of
+    ``interaction_huber`` on an aperiodic dataset, or interaction terms on extxyz data)."""
+    empty = [
+        name
+        for name, term in summary.items()
+        if (term["weight"] or 0.0) > 0.0 and not term["entry_count"]
+    ]
+    if empty:
+        raise RuntimeError(
+            f"epoch {epoch}: the loss terms {empty} have a positive weight but no entry in "
+            "the whole training epoch; the data never reaches them"
         )
 
 

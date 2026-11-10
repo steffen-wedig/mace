@@ -152,7 +152,7 @@ def test_the_dipole_weight_also_reaches_the_energy_forces_dipole_loss(model):
     """The same flag, a different branch. `energy_forces_dipole` takes the energy
     and forces weights positionally and the dipole one by keyword, which is
     exactly the shape a reordering breaks quietly."""
-    swa, _ = build(model, loss="energy_forces_dipole")
+    swa, _ = build(model, loss="energy_forces_dipole", compute_dipole=True)
 
     assert swa.loss_fn.energy_weight == pytest.approx(ENERGY)
     assert swa.loss_fn.forces_weight == pytest.approx(FORCES)
@@ -177,3 +177,29 @@ def test_every_stage_two_weight_is_distinct_in_these_tests(model):
 
     assert len(set(values)) == len(values)
     assert model is not None
+
+
+def test_the_huber_loss_keeps_its_class_and_takes_the_stage_two_weights(model):
+    """Stage two used to fall back to the MSE `WeightedEnergyForcesLoss` for `huber`."""
+    swa, _ = build(model, loss="huber")
+
+    assert isinstance(swa.loss_fn, modules.WeightedHuberEnergyForcesStressLoss)
+    assert swa.loss_fn.energy_weight == pytest.approx(ENERGY)
+    assert swa.loss_fn.forces_weight == pytest.approx(FORCES)
+    assert swa.loss_fn.stress_weight == pytest.approx(STRESS)
+    assert swa.loss_fn.huber_delta == pytest.approx(0.02)
+
+
+@pytest.mark.parametrize("loss", ["universal", "l1l2energyforces"])
+def test_every_loss_keeps_its_class_in_stage_two(model, loss):
+    from mace.tools.scripts_utils import get_loss_fn  # noqa: PLC0415
+
+    args = settings(
+        loss=loss, energy_weight=1.0, forces_weight=1.0, stress_weight=1.0, magforces_weight=1.0
+    )
+    stage_one = get_loss_fn(args, dipole_only=False, compute_dipole=False)
+    swa, _ = get_swa(args, model, torch.optim.Adam(model.parameters(), lr=1e-3), [])
+
+    assert type(swa.loss_fn) is type(stage_one)
+    assert swa.loss_fn.energy_weight == pytest.approx(ENERGY)
+

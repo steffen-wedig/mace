@@ -540,6 +540,9 @@ def train_one_epoch(
     else:
         if loss_term_instrumentation is not None:
             loss_term_instrumentation.start_train_epoch()
+        # Sum of |loss| over the epoch, on the device: an epoch whose every batch has an
+        # exactly zero loss trains nothing (no entry reaches a weighted term) and is refused.
+        epoch_loss_magnitude: Optional[torch.Tensor] = None
         for batch in data_loader:
             if loss_term_instrumentation is not None:
                 loss_term_instrumentation.before_train_step(
@@ -549,7 +552,7 @@ def train_one_epoch(
                     output_args=output_args,
                     epoch=epoch,
                 )
-            _, opt_metrics = take_step(
+            loss, opt_metrics = take_step(
                 model=model_to_train,
                 loss_fn=loss_fn,
                 batch=batch,
@@ -558,6 +561,12 @@ def train_one_epoch(
                 output_args=output_args,
                 max_grad_norm=max_grad_norm,
                 device=device,
+            )
+            magnitude = loss.detach().abs()
+            epoch_loss_magnitude = (
+                magnitude
+                if epoch_loss_magnitude is None
+                else epoch_loss_magnitude + magnitude
             )
             if loss_term_instrumentation is not None:
                 # The loss call inside `take_step` left its term statistics behind.
@@ -568,6 +577,23 @@ def train_one_epoch(
                 logger.log(opt_metrics)
         if loss_term_instrumentation is not None:
             loss_term_instrumentation.finish_train_epoch(epoch)
+        require_nonzero_epoch_loss(epoch_loss_magnitude, epoch, loss_fn)
+
+
+def require_nonzero_epoch_loss(
+    epoch_loss_magnitude: Optional[torch.Tensor], epoch: int, loss_fn: torch.nn.Module
+) -> None:
+    """Refuse an epoch whose training loss was exactly zero on every batch: no entry of the
+    training set reaches a weighted loss term (for example ``interaction_huber`` frame terms
+    on aperiodic data), so the gradients are zero and only weight decay moves the model."""
+    if epoch_loss_magnitude is None:
+        raise RuntimeError(f"epoch {epoch}: the training loader yielded no batch")
+    if float(epoch_loss_magnitude) == 0.0:
+        raise RuntimeError(
+            f"epoch {epoch}: the training loss {loss_fn} was exactly zero on every batch; "
+            "no training entry reaches a weighted loss term (check the loss against the "
+            "data: periodicity, record format, term weights)"
+        )
 
 
 def take_step(

@@ -875,10 +875,12 @@ def run(args) -> None:
     model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
     model.to(device)
     loss_fn.to(device)  # the term weights are buffers
-    # The fixed criterion for the best model of the whole run (frame energy and forces at the
-    # stage-two weights for interaction_huber), a separate module so stage two's reweighting
+    # The fixed criterion for the best model of the whole run (the loss at the stage-two
+    # weights; frame energy and forces only for interaction_huber), a separate module so stage two's reweighting
     # and the loss-term instrumentation of `loss_fn` never touch it.
-    selection_loss_fn = get_selection_loss_fn(args, loss_fn).to(device)
+    selection_loss_fn = get_selection_loss_fn(
+        args, dipole_only, args.compute_dipole
+    ).to(device)
 
     if args.lora:
         lora_rank = args.lora_rank

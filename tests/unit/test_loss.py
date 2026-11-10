@@ -860,17 +860,11 @@ def test_every_cli_loss_name_reaches_its_class_with_its_weights(name, cls):
         assert loss.huber_delta == 0.5
 
 
-def test_an_unknown_cli_loss_name_falls_back_instead_of_failing():
-    """Characterization, not endorsement: a typo silently trains `weighted`."""
+def test_an_unknown_cli_loss_name_is_an_error():
     from mace.tools.scripts_utils import get_loss_fn  # noqa: PLC0415
 
-    loss = get_loss_fn(
-        _loss_args("universl"), dipole_only=False, compute_dipole=False
-    )
-    assert isinstance(loss, WeightedEnergyForcesLoss)
-    # and with the *default* weights, not the ones on the command line
-    assert float(loss.energy_weight) == 1.0
-    assert float(loss.forces_weight) == 1.0
+    with pytest.raises(ValueError, match="unknown loss"):
+        get_loss_fn(_loss_args("universl"), dipole_only=False, compute_dipole=False)
 
 
 def test_a_zero_config_weight_dilutes_rather_than_renormalizing():
