@@ -388,7 +388,8 @@ def test_padding_buckets_need_compiled_training(tmp_path):
 
     args = build_default_arg_parser().parse_args(
         ["--name", "x", "--train_file", "unused.xyz", "--padding_buckets", "2",
-         "--model", "PolarMACE", "--pbc_handling", "realspace"]
+         "--model", "PolarMACE", "--pbc_handling", "realspace",
+         "--log_dir", str(tmp_path), "--results_dir", str(tmp_path)]
     )
     with pytest.raises(ValueError, match="padding_buckets"):
         run(args)

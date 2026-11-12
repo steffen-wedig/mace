@@ -1151,6 +1151,8 @@ def _base_train_params(tmp_path, train_file, name):
         "name": name,
         "train_file": train_file,
         "checkpoints_dir": str(tmp_path),
+        "log_dir": str(tmp_path),
+        "results_dir": str(tmp_path),
         "model_dir": str(tmp_path),
         "valid_fraction": 0.2,
         "model": "PolarMACE",
