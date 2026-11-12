@@ -86,6 +86,16 @@ def convert_polar_model(model, pbc_handling: str = "auto"):
     # a returned value); pickles from before carry the last batch's cache and its
     # autograd graph. Nothing reads it: drop it.
     descriptor.static_quantities = None
+    # Integer sizes the forwards read (models built before they existed).
+    model.charges_dimension = model.charges_irreps.dim
+    model.potential_dimension = model.potential_irreps.dim
+    from mace.modules.field_blocks import (  # noqa: PLC0415  # import cycle at module level
+        SparseUvuTensorProduct,
+    )
+
+    for module in model.modules():
+        if isinstance(module, SparseUvuTensorProduct):
+            module.output_dimension = module.irreps_out.dim
     # Field blocks of models built before their linears followed the cueq layout: same
     # parameters, transplanted into cueq-layout linears; the layout transposes go.
     for module in model.modules():

@@ -410,6 +410,19 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument(
+        "--pbc_handling",
+        help=(
+            "PolarMACE electrostatics during training: 'auto' picks reciprocal space as soon "
+            "as a batch holds a periodic structure (reads pbc on the host every forward); "
+            "'realspace' trains open structures only, with the atom pairs built when batches "
+            "are collated (no host reads; needed for torch.compile). The saved model is "
+            "always set back to 'auto'."
+        ),
+        type=str,
+        choices=["auto", "realspace"],
+        default="auto",
+    )
+    parser.add_argument(
         "--scaling",
         help="type of scaling to the output",
         type=str,

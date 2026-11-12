@@ -702,7 +702,7 @@ def compute_total_charge_dipole_permuted(
         dipole = dipole + dipole_p[..., [2, 0, 1]]  # CS phase convention
 
     total_charge = scatter_sum(
-        src=density_coefficients[:, 0], index=batch, dim=-1  # , dim_size=num_graphs
+        src=density_coefficients[:, 0], index=batch, dim=-1, dim_size=num_graphs
     )
 
     return total_charge, dipole

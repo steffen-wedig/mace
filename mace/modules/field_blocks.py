@@ -348,6 +348,8 @@ class SparseUvuTensorProduct(torch.nn.Module):
         self.irreps_in1 = o3.Irreps(irreps_in1)
         self.irreps_in2 = o3.Irreps(irreps_in2)
         self.irreps_out = o3.Irreps(irreps_out)
+        # The forward uses integers only (torch.compile cannot guard on e3nn Irreps).
+        self.output_dimension = self.irreps_out.dim
         if layout not in ("mul_ir", "ir_mul"):
             raise ValueError(
                 f"Unsupported layout '{layout}' for SparseUvuTensorProduct; expected 'mul_ir' or 'ir_mul'"
@@ -444,7 +446,7 @@ class SparseUvuTensorProduct(torch.nn.Module):
             )
 
         batch = x1.shape[0]
-        out = x1.new_zeros((batch, self.irreps_out.dim))
+        out = x1.new_zeros((batch, self.output_dimension))
 
         def to_mul_ir(block: torch.Tensor, mul: int, dim: int) -> torch.Tensor:
             if self.layout == "mul_ir":

@@ -663,6 +663,17 @@ def run(args) -> None:
     else:
         TrainingDataLoader = torch_geometric.dataloader.DataLoader  # pylint: disable=invalid-name
 
+    # PolarMACE trained with open-boundary electrostatics only: every batch carries its
+    # atom pairs, built on the host at collation (mace.data.real_space_pairs).
+    real_space_pairs = args.pbc_handling == "realspace"
+    if real_space_pairs:
+        if args.model != "PolarMACE":
+            raise ValueError("--pbc_handling applies to PolarMACE only")
+        if args.cluster_records:
+            raise NotImplementedError(
+                "--pbc_handling realspace does not support --cluster_records yet"
+            )
+
     # Load datasets for each head, supporting multiple files per head
     valid_sets = {head: [] for head in heads}
     train_sets = {head: [] for head in heads}
@@ -779,6 +790,7 @@ def run(args) -> None:
             shuffle=True,
             drop_last=(not args.lbfgs),
             pin_memory=args.pin_memory,
+            real_space_pairs=real_space_pairs,
             num_workers=args.num_workers,
             multiprocessing_context=tools.worker_start_method(args.num_workers),
             generator=torch.Generator().manual_seed(args.seed),
@@ -816,6 +828,7 @@ def run(args) -> None:
         shuffle=(train_sampler is None),
         drop_last=(train_sampler is None and not args.lbfgs),
         pin_memory=args.pin_memory,
+        real_space_pairs=real_space_pairs,
         num_workers=args.num_workers,
         multiprocessing_context=tools.worker_start_method(args.num_workers),
         generator=torch.Generator().manual_seed(args.seed),
@@ -863,6 +876,7 @@ def run(args) -> None:
             shuffle=False,
             drop_last=False,
             pin_memory=args.pin_memory,
+            real_space_pairs=real_space_pairs,
             num_workers=args.num_workers,
             multiprocessing_context=tools.worker_start_method(args.num_workers),
             generator=torch.Generator().manual_seed(args.seed),
@@ -874,6 +888,8 @@ def run(args) -> None:
     # Model
     model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
     model.to(device)
+    if real_space_pairs:
+        model.set_electrostatic_pbcs("realspace")
     loss_fn.to(device)  # the term weights are buffers
     # The fixed criterion for the best model of the whole run (the loss at the stage-two
     # weights; frame energy and forces only for interaction_huber), a separate module so stage two's reweighting
@@ -1195,6 +1211,7 @@ def run(args) -> None:
                 num_workers=args.num_workers,
                 multiprocessing_context=tools.worker_start_method(args.num_workers),
                 pin_memory=args.pin_memory,
+                real_space_pairs=real_space_pairs,
             )
             test_data_loader[test_name] = test_loader
         if stop_first_test:
@@ -1263,6 +1280,10 @@ def run(args) -> None:
                 model_to_save = run_oeq_to_e3nn(deepcopy(model), device=device)
             if args.save_cpu:
                 model_to_save = model_to_save.to("cpu")
+            if real_space_pairs:
+                # The training-time evaluator is not a property of the model: the saved
+                # model picks its electrostatics from the structures again.
+                model_to_save.set_electrostatic_pbcs("auto")
             torch.save(model_to_save, model_path)
             extra_files = {
                 "commit.txt": commit.encode("utf-8") if commit is not None else b"",

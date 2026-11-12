@@ -826,6 +826,10 @@ class PolarMACE(ScaleShiftMACE):
         self.potential_irreps = (
             self.field_irreps * 2
         )  # 2 spin channels for the potential irreps
+        # Sizes the forward needs, as integers: the forward must not touch e3nn Irreps
+        # (Dynamo cannot guard on them, so torch.compile fails).
+        self.charges_dimension = self.charges_irreps.dim
+        self.potential_dimension = self.potential_irreps.dim
 
         self.electric_potential_descriptor = GTOElectrostaticFeatures(
             density_max_l=atomic_multipoles_max_l,
@@ -1149,7 +1153,7 @@ class PolarMACE(ScaleShiftMACE):
         node_es_list: List[torch.Tensor] = []
         node_feats_list: List[torch.Tensor] = []
         spin_charge_density = torch.zeros(
-            (data["batch"].size(-1), self.charges_irreps.dim),
+            (data["batch"].size(-1), self.charges_dimension),
             device=data["batch"].device,
             dtype=vectors.dtype,
         )
@@ -1267,7 +1271,7 @@ class PolarMACE(ScaleShiftMACE):
         # print("spin_charge_density", spin_charge_density)
 
         potential_features = torch.zeros(
-            (data["batch"].size(-1), self.potential_irreps.dim),
+            (data["batch"].size(-1), self.potential_dimension),
             device=data["batch"].device,
             dtype=vectors.dtype,
         )

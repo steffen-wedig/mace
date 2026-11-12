@@ -10,18 +10,28 @@ from .dataset import Dataset
 
 
 class Collater:
-    def __init__(self, follow_batch, exclude_keys):
+    def __init__(self, follow_batch, exclude_keys, real_space_pairs: bool = False):
         self.follow_batch = follow_batch
         self.exclude_keys = exclude_keys
+        # Add the directed pairs of every (open) structure for PolarMACE's real-space
+        # electrostatics (mace.data.real_space_pairs), built here on the host.
+        self.real_space_pairs = real_space_pairs
 
     def __call__(self, batch):
         elem = batch[0]
         if isinstance(elem, Data):
-            return Batch.from_data_list(
+            collated = Batch.from_data_list(
                 batch,
                 follow_batch=self.follow_batch,
                 exclude_keys=self.exclude_keys,
             )
+            if self.real_space_pairs:
+                from mace.data.real_space_pairs import (  # noqa: PLC0415
+                    attach_real_space_pair_index,
+                )
+
+                attach_real_space_pair_index(collated)
+            return collated
         elif isinstance(elem, torch.Tensor):
             return default_collate(batch)
         elif isinstance(elem, float):
@@ -58,6 +68,10 @@ class DataLoader(torch.utils.data.DataLoader):
             vectors for each key in the list. (default: :obj:`None`)
         exclude_keys (List[str], optional): Will exclude each key in the
             list. (default: :obj:`None`)
+        real_space_pairs (bool, optional): Add ``real_space_pair_index``, the directed
+            atom pairs within each structure, to every batch (PolarMACE trained with
+            ``pbc_handling: realspace``; periodic structures are refused).
+            (default: :obj:`False`)
         **kwargs (optional): Additional arguments of
             :class:`torch.utils.data.DataLoader`.
     """
@@ -69,6 +83,7 @@ class DataLoader(torch.utils.data.DataLoader):
         shuffle: bool = False,
         follow_batch: Optional[List[str]] = [None],
         exclude_keys: Optional[List[str]] = [None],
+        real_space_pairs: bool = False,
         **kwargs,
     ):
         if "collate_fn" in kwargs:
@@ -82,6 +97,6 @@ class DataLoader(torch.utils.data.DataLoader):
             dataset,
             batch_size,
             shuffle,
-            collate_fn=Collater(follow_batch, exclude_keys),
+            collate_fn=Collater(follow_batch, exclude_keys, real_space_pairs),
             **kwargs,
         )
