@@ -18,6 +18,13 @@ try:
         gto_basis_kspace_cutoff,
     )
     from graph_longrange.kspace import compute_k_vectors_flat
+    from graph_longrange.realspace_electrostatics import (
+        RealSpaceAnalyticalElectrostaticFeatures,
+        RealSpaceAnalyticalEnergy,
+        RealSpaceGeometry,
+        merge_kernel_widths,
+        prepare_real_space_geometry,
+    )
 
     GRAPH_LONGRANGE_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):
@@ -975,7 +982,41 @@ class PolarMACE(ScaleShiftMACE):
         self.electric_potential_descriptor.set_pbc_handling(pbc_handling)
         self.coulomb_energy.set_pbc_handling(pbc_handling)
         self.pbc_handling = pbc_handling
-        self.electric_potential_descriptor.static_quantities = None
+
+    def prepare_real_space_geometry(
+        self,
+        positions: torch.Tensor,
+        batch: torch.Tensor,
+        pair_index: Optional[torch.Tensor] = None,
+    ) -> Optional["RealSpaceGeometry"]:
+        """One real-space geometry for the field features and the Coulomb energy.
+
+        The pair kernels depend only on the positions: they are evaluated once per
+        forward for the union of the combined widths of both blocks, and every feature
+        evaluation (each recursion step, both spin channels) and the energy read them.
+        Autograd then differentiates the kernels once for the forces and once more in
+        the backward through the forces, instead of once per evaluation.
+
+        pair_index: directed pairs [2, n_pairs] within each open structure, built on
+        the host by the data pipeline ("real_space_pair_index"); without it the pairs
+        are built on the device (with host syncs).
+
+        None when either block uses the finite-difference evaluator, which has no
+        prepared form; both blocks then evaluate on their own.
+        """
+        features = self.electric_potential_descriptor.realspace_features
+        energy = self.coulomb_energy.realspace_energy
+        if not isinstance(
+            features, RealSpaceAnalyticalElectrostaticFeatures
+        ) or not isinstance(energy, RealSpaceAnalyticalEnergy):
+            return None
+        return prepare_real_space_geometry(
+            positions,
+            merge_kernel_widths(features.kernel_widths, energy.kernel_widths),
+            max(features.highest_order, energy.highest_order),
+            batch=batch,
+            pair_index=pair_index,
+        )
 
     def forward(
         self,
@@ -1155,11 +1196,17 @@ class PolarMACE(ScaleShiftMACE):
         realspace = self.pbc_handling == "realspace"
         if self.pbc_handling == "auto":
             realspace = not bool(torch.any(pbc))
+        realspace_geometry: Optional[RealSpaceGeometry] = None
         if realspace:
             k_vectors = positions.new_empty((0, 3))
             kv_norms_squared = positions.new_empty((0,))
             k_vectors_batch = data["batch"].new_empty((0,))
             k_vectors_0mask = positions.new_empty((0,))
+            realspace_geometry = self.prepare_real_space_geometry(
+                long_range_positions,
+                data["batch"],
+                pair_index=data.get("real_space_pair_index"),
+            )
         else:
             (
                 k_vectors,
@@ -1179,8 +1226,8 @@ class PolarMACE(ScaleShiftMACE):
             batch=data["batch"],
             volume=long_range_volume,
             pbc=data["pbc"].view(-1, 3),
+            realspace_geometry=realspace_geometry,
         )
-        self.electric_potential_descriptor.static_quantities = None
 
         # SCF fixed point
         features_mixed = self.layer_feature_mixer(torch.stack(node_feats_list, dim=0))
@@ -1228,48 +1275,43 @@ class PolarMACE(ScaleShiftMACE):
         esps: Optional[torch.Tensor] = None
 
         final_fukui_sources = fukui_sources
+        field_from_mul_ir = getattr(self, "_field_from_mul_ir", None)
+        # External field potential relative to the barycenter (gauge invariance). It
+        # depends on the positions only: the same in every recursion step. Added once
+        # per spin channel, hence the half.
+        barycenter = scatter_mean(
+            src=safe_double(long_range_positions),
+            index=data["batch"],
+            dim=0,
+            dim_size=num_graphs,
+        ).to(positions.dtype)
+        half_external_field = 0.5 * self.external_field_contribution(
+            data["batch"],
+            long_range_positions - barycenter[data["batch"], :],
+            external_potential,
+        )
+        num_nodes = spin_charge_density.shape[0]
         for i in range(self.num_recursion_steps):
-            source_feats_alpha = spin_charge_density[:, 0, :].clone()
-            source_feats_beta = spin_charge_density[:, 1, :].clone()
+            # Both spin channels [n_nodes, 2, C] as one source set axis: one evaluation.
+            source_feats = spin_charge_density
             if charges_to_mul_ir is not None:
-                source_feats_alpha = charges_to_mul_ir(source_feats_alpha)
-                source_feats_beta = charges_to_mul_ir(source_feats_beta)
-            field_feats_alpha = self.electric_potential_descriptor.forward_dynamic(
+                source_feats = charges_to_mul_ir(
+                    source_feats.reshape(num_nodes * 2, -1)
+                ).reshape(num_nodes, 2, -1)
+            field_feats = self.electric_potential_descriptor.forward_dynamic(
                 cache=field_feature_cache,
-                source_feats=source_feats_alpha,
+                source_feats=source_feats,
             )
-            field_feats_beta = self.electric_potential_descriptor.forward_dynamic(
-                cache=field_feature_cache,
-                source_feats=source_feats_beta,
-            )
-            field_from_mul_ir = getattr(self, "_field_from_mul_ir", None)
             if field_from_mul_ir is not None:
-                field_feats_alpha = field_from_mul_ir(field_feats_alpha)
-                field_feats_beta = field_from_mul_ir(field_feats_beta)
+                field_feats = field_from_mul_ir(
+                    field_feats.reshape(num_nodes * 2, -1)
+                ).reshape(num_nodes, 2, -1)
             esps = None
-
-            # Add external field contribution and subtract barycenter for gauge invariance
-            barycenter = scatter_mean(
-                src=safe_double(long_range_positions),
-                index=data["batch"],
-                dim=0,
-                dim_size=num_graphs,
-            ).to(positions.dtype)
-            half_external_field = 0.5 * self.external_field_contribution(
-                data["batch"],
-                long_range_positions - barycenter[data["batch"], :],
-                external_potential,
-            )
-            field_feats_alpha = (
-                field_feats_alpha + half_external_field
+            field_feats = (
+                field_feats + half_external_field.unsqueeze(1)
             ) / self.field_feature_norms
-            field_feats_beta = (
-                field_feats_beta + half_external_field
-            ) / self.field_feature_norms
-
-            potential_features = torch.cat(
-                (field_feats_alpha, field_feats_beta), dim=-1
-            )
+            # [alpha features, beta features] along the last axis.
+            potential_features = field_feats.reshape(num_nodes, -1)
             charge_sources_out = self.field_dependent_charges_maps[i](
                 node_attrs=data["node_attrs"],
                 node_feats=features_mixed,
@@ -1373,6 +1415,7 @@ class PolarMACE(ScaleShiftMACE):
             batch=data["batch"],
             volume=long_range_volume,
             pbc=data["pbc"].view(-1, 3),
+            realspace_geometry=realspace_geometry,
         )
         total_energy = (
             total_energy

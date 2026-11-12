@@ -82,5 +82,9 @@ def convert_polar_model(model, pbc_handling: str = "auto"):
         raise ValueError("Unsupported electrostatic output_permutation buffer schema")
     for module, dimension in repairs:
         module.features_dim = dimension
+    # graph_longrange no longer keeps a geometry cache on the block (the geometry is
+    # a returned value); pickles from before carry the last batch's cache and its
+    # autograd graph. Nothing reads it: drop it.
+    descriptor.static_quantities = None
     model.set_electrostatic_pbcs(pbc_handling)
     return model

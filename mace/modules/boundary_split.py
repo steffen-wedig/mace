@@ -66,6 +66,9 @@ PER_NODE_KEYS = frozenset(
     }
 )
 PER_EDGE_KEYS = frozenset({"shifts", "unit_shifts"})
+# Node-pair lists [2, n_pairs] other than the local graph: kept for the pairs inside the
+# selected graphs and renumbered like edge_index (their leading 2 is not a graph count).
+PAIR_INDEX_KEYS = frozenset({"real_space_pair_index"})
 # 3x3 blocks stacked along the first dimension, one per graph.
 STACKED_CELL_KEYS = frozenset({"cell", "rcell"})
 # Model outputs with one row per graph (the rest is per node or per edge).
@@ -132,7 +135,10 @@ def select_graphs(
         if not isinstance(value, torch.Tensor):
             sub[key] = value
             continue
-        if key in STACKED_CELL_KEYS:
+        if key in PAIR_INDEX_KEYS:
+            pair_mask = node_mask[value[0]]
+            sub[key] = new_node_of_old[value[:, pair_mask]]
+        elif key in STACKED_CELL_KEYS:
             sub[key] = value.view(-1, 3, 3)[graph_indices].reshape(-1, 3)
         elif key in PER_GRAPH_KEYS or (
             key not in PER_NODE_KEYS
@@ -219,6 +225,7 @@ __all__ = [
     "PER_GRAPH_KEYS",
     "PER_NODE_KEYS",
     "PER_EDGE_KEYS",
+    "PAIR_INDEX_KEYS",
     "PER_GRAPH_OUTPUT_KEYS",
     "graph_periodicity",
     "select_graphs",
