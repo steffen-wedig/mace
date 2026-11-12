@@ -86,5 +86,11 @@ def convert_polar_model(model, pbc_handling: str = "auto"):
     # a returned value); pickles from before carry the last batch's cache and its
     # autograd graph. Nothing reads it: drop it.
     descriptor.static_quantities = None
+    # Field blocks of models built before their linears followed the cueq layout: same
+    # parameters, transplanted into cueq-layout linears; the layout transposes go.
+    for module in model.modules():
+        upgrade = getattr(module, "use_layout_native_linears", None)
+        if upgrade is not None:
+            upgrade()
     model.set_electrostatic_pbcs(pbc_handling)
     return model

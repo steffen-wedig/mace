@@ -23,7 +23,30 @@ from .wrapper_ops import (
     Linear,
     OEQConfig,
     TransposeIrrepsLayoutWrapper,
+    cueq_handles_linears,
+    field_linear,
 )
+
+
+def _use_layout_native_linears(
+    block: torch.nn.Module, linear_names: Tuple[str, ...], transpose_names: Tuple[str, ...]
+) -> None:
+    """Replace a block's e3nn linears by linears in the cueq layout, with the same
+    parameters (transplanted), and drop the layout transposes that surrounded them.
+
+    For blocks built (or unpickled) with o3.Linear under a cueq config. A no-op when cueq
+    does not handle linears or the linears are already in the cueq layout.
+    """
+    from .wrapper_ops import LayoutNativeLinear  # noqa: PLC0415  # needs cuequivariance
+
+    if not cueq_handles_linears(block.cueq_config):
+        return
+    for name in linear_names:
+        linear = getattr(block, name)
+        if isinstance(linear, o3.Linear):
+            setattr(block, name, LayoutNativeLinear.from_e3nn(linear, block.cueq_config))
+    for name in transpose_names:
+        setattr(block, name, None)
 
 
 @compile_mode("script")
@@ -121,25 +144,24 @@ class AgnosticChargeBiasedLinearPotentialEmbedding(
     def _setup(
         self, charges_irreps: o3.Irreps
     ) -> None:  # pylint: disable=arguments-differ
-        self.potential_linear = o3.Linear(
-            irreps_in=self.potential_irreps,
-            irreps_out=self.node_feats_irreps,
-            internal_weights=True,
-            shared_weights=True,
+        # In the cueq layout when cueq handles linears (no transposes around them),
+        # else e3nn linears in mul_ir between layout transposes.
+        self.potential_linear = field_linear(
+            self.potential_irreps, self.node_feats_irreps, self.cueq_config
         )
-        self.node_feats_linear = o3.Linear(
-            self.node_feats_irreps,
-            self.node_feats_irreps,
-            internal_weights=True,
-            shared_weights=True,
+        self.node_feats_linear = field_linear(
+            self.node_feats_irreps, self.node_feats_irreps, self.cueq_config
         )
         self.charges_irreps = charges_irreps
-        self.charge_embedding = o3.Linear(
-            self.charges_irreps,
-            self.node_feats_irreps,
-            internal_weights=True,
-            shared_weights=True,
+        self.charge_embedding = field_linear(
+            self.charges_irreps, self.node_feats_irreps, self.cueq_config
         )
+        if cueq_handles_linears(self.cueq_config):
+            self._potential_to_mul_ir = None
+            self._node_feats_to_mul_ir = None
+            self._charges_to_mul_ir = None
+            self._node_feats_from_mul_ir = None
+            return
         layout_str = (
             self.cueq_config.layout_str
             if (self.cueq_config is not None and self.cueq_config.enabled)
@@ -201,6 +223,19 @@ class AgnosticChargeBiasedLinearPotentialEmbedding(
             charges_emb = node_feats_from_mul_ir(charges_emb)
 
         return potential_emb + node_feats_emb + charges_emb
+
+    def use_layout_native_linears(self) -> None:
+        """Upgrade a block built with e3nn linears under cueq (older models)."""
+        _use_layout_native_linears(
+            self,
+            ("potential_linear", "node_feats_linear", "charge_embedding"),
+            (
+                "_potential_to_mul_ir",
+                "_node_feats_to_mul_ir",
+                "_charges_to_mul_ir",
+                "_node_feats_from_mul_ir",
+            ),
+        )
 
 
 @compile_mode("script")
@@ -658,35 +693,40 @@ class OneBodyMLPFieldReadout(PostScfReadout):
     def _setup(self, **kwargs) -> None:
         _ = kwargs
         invar_irreps = o3.Irreps(f"{self.node_feats_irreps.count(o3.Irrep(0, 1))}x0e")
-        self.linear_up_q = o3.Linear(
-            self.charges_irreps, self.node_feats_irreps, biases=True
+        self.linear_up_q = field_linear(
+            self.charges_irreps, self.node_feats_irreps, self.cueq_config, biases=True
         )
-        self.linear_up_v = o3.Linear(
-            self.potential_irreps, self.node_feats_irreps, biases=True
+        self.linear_up_v = field_linear(
+            self.potential_irreps, self.node_feats_irreps, self.cueq_config, biases=True
         )
-        layout_str = (
-            self.cueq_config.layout_str
-            if (self.cueq_config is not None and self.cueq_config.enabled)
-            else "mul_ir"
-        )
-        self._q_to_mul_ir = TransposeIrrepsLayoutWrapper(
-            irreps=self.charges_irreps,
-            source=layout_str,
-            target="mul_ir",
-            cueq_config=self.cueq_config,
-        )
-        self._v_to_mul_ir = TransposeIrrepsLayoutWrapper(
-            irreps=self.potential_irreps,
-            source=layout_str,
-            target="mul_ir",
-            cueq_config=self.cueq_config,
-        )
-        self._up_from_mul_ir = TransposeIrrepsLayoutWrapper(
-            irreps=self.node_feats_irreps,
-            source="mul_ir",
-            target=layout_str,
-            cueq_config=self.cueq_config,
-        )
+        if cueq_handles_linears(self.cueq_config):
+            self._q_to_mul_ir = None
+            self._v_to_mul_ir = None
+            self._up_from_mul_ir = None
+        else:
+            layout_str = (
+                self.cueq_config.layout_str
+                if (self.cueq_config is not None and self.cueq_config.enabled)
+                else "mul_ir"
+            )
+            self._q_to_mul_ir = TransposeIrrepsLayoutWrapper(
+                irreps=self.charges_irreps,
+                source=layout_str,
+                target="mul_ir",
+                cueq_config=self.cueq_config,
+            )
+            self._v_to_mul_ir = TransposeIrrepsLayoutWrapper(
+                irreps=self.potential_irreps,
+                source=layout_str,
+                target="mul_ir",
+                cueq_config=self.cueq_config,
+            )
+            self._up_from_mul_ir = TransposeIrrepsLayoutWrapper(
+                irreps=self.node_feats_irreps,
+                source="mul_ir",
+                target=layout_str,
+                cueq_config=self.cueq_config,
+            )
         new_instructions = instructions_for_sparse_tp(
             self.node_feats_irreps, self.node_feats_irreps, invar_irreps
         )
@@ -755,6 +795,14 @@ class OneBodyMLPFieldReadout(PostScfReadout):
             dim=-1,
         )
         return self.mlp(invar_feats).squeeze(-1)
+
+    def use_layout_native_linears(self) -> None:
+        """Upgrade a block built with e3nn linears under cueq (older models)."""
+        _use_layout_native_linears(
+            self,
+            ("linear_up_q", "linear_up_v"),
+            ("_q_to_mul_ir", "_v_to_mul_ir", "_up_from_mul_ir"),
+        )
 
 
 # Registries used by config files that pass strings

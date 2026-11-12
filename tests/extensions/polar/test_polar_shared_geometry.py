@@ -32,7 +32,7 @@ pytestmark = [
 ATOMIC_NUMBERS = [1, 6, 8]
 
 
-def _polar_model(dtype=torch.float64):
+def _polar_model(dtype=torch.float64, cueq_config=None):
     from mace.modules.extensions import PolarMACE  # noqa: PLC0415
 
     torch.manual_seed(3)
@@ -79,6 +79,7 @@ def _polar_model(dtype=torch.float64):
             "nonlinearity_cls": "MLPNonLinearity",
         },
         field_readout_config={"type": "OneBodyMLPFieldReadout"},
+        cueq_config=cueq_config,
     ).to(dtype=dtype)
 
 
