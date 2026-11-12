@@ -1124,8 +1124,14 @@ def get_params_options(
 def get_optimizer(
     args: argparse.Namespace, param_options: Dict[str, Any]
 ) -> torch.optim.Optimizer:
+    # Adam and AdamW on CUDA as one fused kernel over all parameters: the default foreach
+    # path launches per parameter group and reads its CPU step counters on the host
+    # (~1.5 ms per step for POLAR-M with AMSGrad). Same update; the step counters live on
+    # the device (checkpoints load either way).
+    device = str(getattr(args, "device", "cpu"))
+    fused = {"fused": True} if device.startswith("cuda") else {}
     if args.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(**param_options)
+        optimizer = torch.optim.AdamW(**param_options, **fused)
     elif args.optimizer == "schedulefree":
         try:
             from schedulefree import adamw_schedulefree
@@ -1141,7 +1147,7 @@ def get_optimizer(
             warmup_steps=args.warmup_steps_schedulefree,
         )
     else:
-        optimizer = torch.optim.Adam(**param_options)
+        optimizer = torch.optim.Adam(**param_options, **fused)
     return optimizer
 
 

@@ -388,10 +388,37 @@ class WeightedHuberEnergyForcesStressLoss(torch.nn.Module):
             reference, prediction, reduction="mean", delta=self.huber_delta
         )
 
+    def _masked_huber(
+        self, reference: torch.Tensor, prediction: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Mean of the Huber loss over the entries where ``mask`` (broadcast) is 1."""
+        elementwise = torch.nn.functional.huber_loss(
+            reference, prediction, reduction="none", delta=self.huber_delta
+        )
+        mask = mask.expand_as(elementwise)
+        return (elementwise * mask).sum() / mask.sum()
+
     def forward(
         self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
     ) -> torch.Tensor:
         num_atoms = ref.ptr[1:] - ref.ptr[:-1]
+        # Only padded Batch objects carry masks (a plain dict reference has none).
+        real_graph_mask = getattr(ref, "real_graph_mask", None)
+        if real_graph_mask is not None:
+            # A padded batch (mace.data.padding): means over the real entries only.
+            # Padding structures beyond the first are empty, hence the clamp.
+            if ddp:
+                raise NotImplementedError("padded batches do not support DDP yet")
+            if self.uses_stress:
+                raise NotImplementedError("padded batches do not support stress yet")
+            num_atoms = num_atoms.clamp(min=1)
+            loss_energy = self._masked_huber(
+                ref["energy"] / num_atoms, pred["energy"] / num_atoms, real_graph_mask
+            )
+            loss_forces = self._masked_huber(
+                ref["forces"], pred["forces"], ref.real_node_mask.unsqueeze(-1)
+            )
+            return self.energy_weight * loss_energy + self.forces_weight * loss_forces
         loss_energy = self._huber(
             ref["energy"] / num_atoms, pred["energy"] / num_atoms, ddp
         )

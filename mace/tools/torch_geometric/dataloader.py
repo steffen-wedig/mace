@@ -10,15 +10,29 @@ from .dataset import Dataset
 
 
 class Collater:
-    def __init__(self, follow_batch, exclude_keys, real_space_pairs: bool = False):
+    def __init__(
+        self, follow_batch, exclude_keys, real_space_pairs: bool = False, padding=None
+    ):
         self.follow_batch = follow_batch
         self.exclude_keys = exclude_keys
         # Add the directed pairs of every (open) structure for PolarMACE's real-space
         # electrostatics (mace.data.real_space_pairs), built here on the host.
         self.real_space_pairs = real_space_pairs
+        # mace.data.padding.PaddingPlan: pad every batch to one of fixed sizes.
+        self.padding = padding
 
     def __call__(self, batch):
         elem = batch[0]
+        if isinstance(elem, Data) and self.padding is not None:
+            from mace.data.padding import collate_padded  # noqa: PLC0415
+
+            return collate_padded(
+                batch,
+                self.padding,
+                real_space_pairs=self.real_space_pairs,
+                follow_batch=self.follow_batch,
+                exclude_keys=self.exclude_keys,
+            )
         if isinstance(elem, Data):
             collated = Batch.from_data_list(
                 batch,
@@ -72,6 +86,9 @@ class DataLoader(torch.utils.data.DataLoader):
             atom pairs within each structure, to every batch (PolarMACE trained with
             ``pbc_handling: realspace``; periodic structures are refused).
             (default: :obj:`False`)
+        padding (mace.data.padding.PaddingPlan, optional): Pad every batch to the
+            first budget of the plan it fits (fixed shapes for CUDA graphs).
+            (default: :obj:`None`)
         **kwargs (optional): Additional arguments of
             :class:`torch.utils.data.DataLoader`.
     """
@@ -84,6 +101,7 @@ class DataLoader(torch.utils.data.DataLoader):
         follow_batch: Optional[List[str]] = [None],
         exclude_keys: Optional[List[str]] = [None],
         real_space_pairs: bool = False,
+        padding=None,
         **kwargs,
     ):
         if "collate_fn" in kwargs:
@@ -97,6 +115,6 @@ class DataLoader(torch.utils.data.DataLoader):
             dataset,
             batch_size,
             shuffle,
-            collate_fn=Collater(follow_batch, exclude_keys, real_space_pairs),
+            collate_fn=Collater(follow_batch, exclude_keys, real_space_pairs, padding),
             **kwargs,
         )

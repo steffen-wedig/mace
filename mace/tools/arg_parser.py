@@ -420,6 +420,27 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=False,
     )
     parser.add_argument(
+        "--padding_buckets",
+        help=(
+            "with --compile_training: pad every training batch to one of this many fixed "
+            "sizes (plus a bound for the largest possible batch), chosen from the training "
+            "set, and replay each as a CUDA graph (static shapes). 0: no padding, dynamic "
+            "shapes"
+        ),
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--padding_cost_weights",
+        help=(
+            "relative step cost per node, per edge and per real-space pair, used to choose "
+            "the padding budgets (--padding_buckets)"
+        ),
+        type=float,
+        nargs=3,
+        default=[1.0, 0.03, 0.002],
+    )
+    parser.add_argument(
         "--pbc_handling",
         help=(
             "PolarMACE electrostatics during training: 'auto' picks reciprocal space as soon "

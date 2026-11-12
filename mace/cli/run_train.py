@@ -41,6 +41,7 @@ from mace.modules.lora import inject_LoRAs, merge_lora_weights
 from mace.tools import compile as mace_compile
 from mace.tools import deprecation, torch_geometric
 from mace.tools.distributed_tools import init_distributed, xpu_device_index
+from mace.tools.ema import ForeachExponentialMovingAverage
 from mace.tools.loss_terms import LossTermInstrumentation, supports_loss_terms
 from mace.tools.model_script_utils import configure_model
 from mace.tools.multihead_tools import (
@@ -103,6 +104,57 @@ def _warn_about_v1_removals(parser, args) -> None:
             deprecation.warn_choice("reg", getattr(args, dest, None))
 
 
+
+def padded_training_loader(args, train_set, real_space_pairs: bool):
+    """The training loader padding every batch to one of --padding_buckets budgets.
+
+    Budgets from the training set's structure sizes (mace.data.padding); Dynamo may
+    compile one graph per budget and loss (the SWA loss is a second one).
+    """
+    from mace.data.padding import (  # pylint: disable=import-outside-toplevel
+        StepCostModel,
+        plan_padding_budgets,
+    )
+    from mace.tools.compiled_training import (  # pylint: disable=import-outside-toplevel
+        RECOMPILE_LIMIT,
+        configure_dynamo_for_training,
+    )
+
+    structure_nodes = []
+    structure_edges = []
+    for structure in train_set:
+        structure_nodes.append(int(structure.num_nodes))
+        structure_edges.append(int(structure.edge_index.shape[1]))
+    per_node, per_edge, per_pair = args.padding_cost_weights
+    plan = plan_padding_budgets(
+        structure_nodes,
+        structure_edges,
+        batch_size=args.batch_size,
+        bucket_count=args.padding_buckets,
+        cost_model=StepCostModel(per_node, per_edge, per_pair),
+        real_space_pairs=real_space_pairs,
+        seed=args.seed,
+    )
+    for budget in plan.budgets:
+        logging.info(f"Padding budget: {budget}")
+    configure_dynamo_for_training(
+        recompile_limit=max(RECOMPILE_LIMIT, 2 * len(plan.budgets) + 2)
+    )
+    return torch_geometric.dataloader.DataLoader(
+        dataset=train_set,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        pin_memory=args.pin_memory,
+        real_space_pairs=real_space_pairs,
+        padding=plan,
+        num_workers=args.num_workers,
+        persistent_workers=args.num_workers > 0,
+        multiprocessing_context=tools.worker_start_method(args.num_workers),
+        generator=torch.Generator().manual_seed(args.seed),
+    )
+
+
 def run(args) -> None:
     """
     This script runs the training/fine tuning for mace
@@ -136,6 +188,19 @@ def run(args) -> None:
     except AttributeError:
         logging.info("Cannot find MACE version, please install MACE via pip")
     logging.debug(f"Configuration: {args}")
+
+    # Padding for CUDA graphs: checked before any data is loaded.
+    if args.padding_buckets < 0:
+        raise ValueError("--padding_buckets must be 0 (off) or positive")
+    if args.padding_buckets > 0:
+        if not args.compile_training:
+            raise ValueError(
+                "--padding_buckets pads batches for CUDA graphs of --compile_training"
+            )
+        if args.loss != "huber":
+            raise NotImplementedError(
+                f"--padding_buckets needs a loss with padding masks (huber), not {args.loss}"
+            )
 
     tools.set_default_dtype(args.default_dtype)
     device = tools.init_device(args.device)
@@ -668,6 +733,12 @@ def run(args) -> None:
     # PolarMACE trained with open-boundary electrostatics only: every batch carries its
     # atom pairs, built on the host at collation (mace.data.real_space_pairs).
     real_space_pairs = args.pbc_handling == "realspace"
+    # Options of the training and validation loaders. Loader workers persist across
+    # epochs (re-creating them cost 0.5-0.8 s per epoch on cluster data); the pair option
+    # only when set: the cluster-record loader passes its keywords on to torch's DataLoader.
+    loader_options = {"persistent_workers": args.num_workers > 0}
+    if real_space_pairs:
+        loader_options["real_space_pairs"] = True
     if real_space_pairs:
         if args.model != "PolarMACE":
             raise ValueError("--pbc_handling applies to PolarMACE only")
@@ -811,8 +882,8 @@ def run(args) -> None:
             shuffle=True,
             drop_last=(not args.lbfgs),
             pin_memory=args.pin_memory,
-            real_space_pairs=real_space_pairs,
             num_workers=args.num_workers,
+            **loader_options,
             multiprocessing_context=tools.worker_start_method(args.num_workers),
             generator=torch.Generator().manual_seed(args.seed),
         )
@@ -849,8 +920,8 @@ def run(args) -> None:
         shuffle=(train_sampler is None),
         drop_last=(train_sampler is None and not args.lbfgs),
         pin_memory=args.pin_memory,
-        real_space_pairs=real_space_pairs,
         num_workers=args.num_workers,
+        **loader_options,
         multiprocessing_context=tools.worker_start_method(args.num_workers),
         generator=torch.Generator().manual_seed(args.seed),
     )
@@ -897,8 +968,8 @@ def run(args) -> None:
             shuffle=False,
             drop_last=False,
             pin_memory=args.pin_memory,
-            real_space_pairs=real_space_pairs,
             num_workers=args.num_workers,
+            **loader_options,
             multiprocessing_context=tools.worker_start_method(args.num_workers),
             generator=torch.Generator().manual_seed(args.seed),
         )
@@ -1068,7 +1139,7 @@ def run(args) -> None:
 
     ema: Optional[ExponentialMovingAverage] = None
     if args.ema:
-        ema = ExponentialMovingAverage(model.parameters(), decay=args.ema_decay)
+        ema = ForeachExponentialMovingAverage(model.parameters(), decay=args.ema_decay)
 
     if args.lbfgs:
         logging.info("Switching optimizer to LBFGS")
@@ -1129,6 +1200,11 @@ def run(args) -> None:
     loss_term_instrumentation = create_loss_term_instrumentation(
         args, loss_fn, tag, rank, device
     )
+    # Padded batches (CUDA graphs): only the batches of training steps; statistics,
+    # evaluation and the final error tables use the unpadded loaders.
+    training_loader = train_loader
+    if args.padding_buckets > 0:
+        training_loader = padded_training_loader(args, train_set, real_space_pairs)
     compiled_loss = None
     if args.compile_training:
         if loss_term_instrumentation is not None:
@@ -1144,13 +1220,15 @@ def run(args) -> None:
         )
 
         compiled_loss = CompiledForceTrainingLoss(
-            model, training_forward_kwargs(output_args)
+            model,
+            training_forward_kwargs(output_args),
+            static_shapes=args.padding_buckets > 0,
         )
 
     tools.train(
         model=model,
         loss_fn=loss_fn,
-        train_loader=train_loader,
+        train_loader=training_loader,
         valid_loaders=valid_loaders,
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,

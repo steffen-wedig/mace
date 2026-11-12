@@ -24,6 +24,30 @@ class CheckpointState:
     lr_scheduler: torch.optim.lr_scheduler.ExponentialLR
 
 
+# How an optimizer executes, not what it has learnt: taken from the optimizer being
+# restored, never from the checkpoint (a checkpoint written by a foreach run restores
+# into a fused one and the reverse, e.g. on another device).
+OPTIMIZER_EXECUTION_KEYS = ("fused", "foreach", "capturable", "differentiable")
+
+
+def optimizer_state_for(
+    optimizer: torch.optim.Optimizer, saved_state: Dict
+) -> Dict:
+    """``saved_state`` with the execution keys of ``optimizer``'s parameter groups."""
+    if len(saved_state["param_groups"]) != len(optimizer.param_groups):
+        return saved_state  # load_state_dict reports the mismatch
+    param_groups = []
+    for saved_group, current_group in zip(
+        saved_state["param_groups"], optimizer.param_groups
+    ):
+        group = dict(saved_group)
+        for key in OPTIMIZER_EXECUTION_KEYS:
+            if key in current_group:
+                group[key] = current_group[key]
+        param_groups.append(group)
+    return {**saved_state, "param_groups": param_groups}
+
+
 class CheckpointBuilder:
     @staticmethod
     def create_checkpoint(state: CheckpointState) -> Checkpoint:
@@ -39,7 +63,9 @@ class CheckpointBuilder:
     ) -> None:
         state.model.load_state_dict(checkpoint["model"], strict=strict)  # type: ignore
         try:
-            state.optimizer.load_state_dict(checkpoint["optimizer"])
+            state.optimizer.load_state_dict(
+                optimizer_state_for(state.optimizer, checkpoint["optimizer"])
+            )
             state.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
         except ValueError as exc:
             logging.warning(

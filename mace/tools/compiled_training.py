@@ -11,8 +11,15 @@ What stays outside the compiled region: the position leaf (``requires_grad_`` on
 created inside the region breaks the graph), ``loss.backward()`` itself (it runs the
 compiled backward), gradient clipping, the optimizer and the EMA.
 
-Shapes are dynamic: cluster batches nearly always have a new number of atoms, edges and
-pairs, and one graph with symbolic sizes serves them all without recompiling.
+Two shape modes:
+
+- dynamic (default): cluster batches nearly always have a new number of atoms, edges and
+  pairs, and one graph with symbolic sizes serves them all without recompiling;
+- static (``static_shapes=True``): batches padded to a few fixed budgets
+  (``mace.data.padding``), one graph per budget, replayed as CUDA graphs
+  (``mode="reduce-overhead"``). CUDA graphs with dynamic shapes are unsupported (reforge
+  experiment 06: segfaults). The rare batch larger than every budget arrives unpadded
+  and runs eagerly.
 """
 
 from __future__ import annotations
@@ -28,19 +35,20 @@ from mace.tools import compile as mace_compile
 RECOMPILE_LIMIT = 8
 
 
-def configure_dynamo_for_training() -> None:
+def configure_dynamo_for_training(recompile_limit: int = RECOMPILE_LIMIT) -> None:
     """Dynamo settings for compiled force training; set once by the trainer.
 
     - ``autograd.grad`` traced into the graph (``trace_autograd_ops``);
     - Python floats specialised: model hyperparameters (smearing widths, cutoffs) stay
       constants under dynamic shapes instead of becoming symbolic;
-    - a recompile beyond the limit raises instead of running eagerly.
+    - a recompile beyond the limit raises instead of running eagerly (static shapes:
+      at least one graph per padding budget and loss, the SWA loss being a second one).
     """
     import torch._dynamo  # noqa: PLC0415
 
     mace_compile.configure_autograd_for_compile(allow_autograd=True)
     torch._dynamo.config.specialize_float = True
-    torch._dynamo.config.recompile_limit = RECOMPILE_LIMIT
+    torch._dynamo.config.recompile_limit = recompile_limit
     torch._dynamo.config.fail_on_recompile_limit_hit = True
 
 
@@ -55,7 +63,12 @@ class CompiledForceTrainingLoss:
     shares its parameters; the model itself is not modified.
     """
 
-    def __init__(self, model: torch.nn.Module, forward_kwargs: Dict[str, bool]):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        forward_kwargs: Dict[str, bool],
+        static_shapes: bool = False,
+    ):
         if not forward_kwargs.get("compute_force", False):
             raise ValueError("compiled force training needs compute_force")
         for unsupported in ("compute_stress", "compute_virials"):
@@ -67,7 +80,15 @@ class CompiledForceTrainingLoss:
         self.forward_kwargs = dict(forward_kwargs)
         self.model = model
         self.view = mace_compile.simplified_view(model)
-        self._compiled = torch.compile(self._loss, fullgraph=True, dynamic=True)
+        self.static_shapes = static_shapes
+        # Unpadded batches run eagerly under static shapes (counted for the logs).
+        self.eager_batches = 0
+        if static_shapes:
+            self._compiled = torch.compile(
+                self._loss, fullgraph=True, dynamic=False, mode="reduce-overhead"
+            )
+        else:
+            self._compiled = torch.compile(self._loss, fullgraph=True, dynamic=True)
 
     def _loss(
         self,
@@ -86,6 +107,20 @@ class CompiledForceTrainingLoss:
         if model is not self.model:
             raise ValueError("compiled loss called with a model other than its own")
         batch_dict = batch.to_dict()
+        if self.static_shapes:
+            if batch_dict.get("real_graph_mask") is None:
+                # A batch larger than every padding budget (mace.data.padding): eager,
+                # rather than a new graph for a shape that may never come back.
+                self.eager_batches += 1
+                positions = batch_dict["positions"].detach().requires_grad_(True)
+                output = model(
+                    {**batch_dict, "positions": positions}, **self.forward_kwargs
+                )
+                return loss_fn(pred=output, ref=batch)
+            positions = batch_dict["positions"].detach().requires_grad_(True)
+            # A new training step: outputs of the previous replay may be overwritten.
+            torch.compiler.cudagraph_mark_step_begin()
+            return self._compiled(self.view, loss_fn, batch, batch_dict, positions)
         # Every per-graph, per-node, per-edge and per-pair size varies between batches.
         # The tensors also reach the graph through the Batch object (the loss
         # reference), where Dynamo would otherwise specialise them on the first batch.
