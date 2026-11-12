@@ -119,13 +119,6 @@ def cueq_handles_linears(cueq_config: Optional[CuEquivarianceConfig]) -> bool:
     )
 
 
-# Largest input multiplicity for which cuet.Linear's fused_tp method beats naive.
-# Measured (RTX 5080, cuequivariance 0.10, forward + force gradient + backward through it,
-# 350 nodes): 2x0e+2x1o+2x0e+2x1o -> 512x0e+512x1o takes 24 instead of 126 kernel launches
-# and 0.7 instead of 1.3 ms; 512x0e+512x1o -> 512x0e+512x1o is 18x slower with fused_tp.
-FUSED_LINEAR_MAX_INPUT_MULTIPLICITY = 4
-
-
 if CUET_AVAILABLE:
 
     class LayoutNativeLinear(cuet.Linear):
@@ -134,8 +127,9 @@ if CUET_AVAILABLE:
         Same parameters as o3.Linear(irreps_in, irreps_out, biases=biases): "weight" in
         e3nn's flat order (stored [1, n] instead of [n]; e3nn-shaped weights load by
         reshaping) and "bias" over the scalar output channels, added with weight 1 as in
-        e3nn. Inputs with few channels per irrep use the fused kernel (one launch per
-        pass instead of one per segment); see FUSED_LINEAR_MAX_INPUT_MULTIPLICITY.
+        e3nn. Always cueq's naive method: for the few-channel field inputs, the fused_tp
+        kernel saves launches but is 4-8x slower in GPU time through the double backward
+        (measured under CUDA graphs: ~20 % of a POLAR-M training step on fused_tp).
         """
 
         def __init__(
@@ -147,25 +141,13 @@ if CUET_AVAILABLE:
         ):
             irreps_in = o3.Irreps(irreps_in)
             irreps_out = o3.Irreps(irreps_out)
-            largest_input_multiplicity = max((mul for mul, _ in irreps_in), default=0)
             super().__init__(
                 cue.Irreps(cueq_config.group, irreps_in),
                 cue.Irreps(cueq_config.group, irreps_out),
                 layout=cueq_config.layout,
                 shared_weights=True,
-                method=(
-                    "fused_tp"
-                    if largest_input_multiplicity <= FUSED_LINEAR_MAX_INPUT_MULTIPLICITY
-                    else "naive"
-                ),
+                method="naive",
             )
-            # The fused kernel fixes its math dtype when built; _apply rebuilds it when
-            # the parameters change dtype (float64 inputs need float64 math).
-            self.linear_polynomial = cue.descriptors.linear(
-                cue.Irreps(cueq_config.group, irreps_in),
-                cue.Irreps(cueq_config.group, irreps_out),
-            ).polynomial
-            self.math_dtype = torch.get_default_dtype()
             self.output_dimension = irreps_out.dim
             bias_positions: List[int] = []
             if biases:
@@ -197,18 +179,13 @@ if CUET_AVAILABLE:
             )
             return output + full_bias
 
-        def _apply(self, fn, recurse=True):
-            super()._apply(fn, recurse)
-            if self.method == "fused_tp" and self.weight.dtype != self.math_dtype:
-                self.math_dtype = self.weight.dtype
-                self.f = cuet.SegmentedPolynomial(
-                    self.linear_polynomial, method="fused_tp", math_dtype=self.math_dtype
-                ).to(self.weight.device)
-            return self
-
         def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
             # o3.Linear's mask of output channels without a path: not a parameter here.
             state_dict.pop(prefix + "output_mask", None)
+            # The naive method's path coefficients ("f.…c0", …) are constants built from the
+            # irreps, not learnt state: an e3nn-shaped state dict has none, keep our own.
+            for name, value in self.f.state_dict(prefix=prefix + "f.").items():
+                state_dict.setdefault(name, value)
             key = prefix + "weight"
             weight = state_dict.get(key)
             if (
