@@ -26,6 +26,10 @@ def configure_model(
     # Selecting outputs
     compute_virials = args.loss == "virials"
     compute_stress = args.loss in ("stress", "huber", "universal", "interaction_universal")
+    if args.loss == "huber" and args.stress_weight == 0.0 and args.swa_stress_weight == 0.0:
+        # The Huber loss skips its stress term at zero weight (open structures): computing
+        # stresses would only add a displacement leaf and a virial gradient to every step.
+        compute_stress = False
 
     if compute_virials:
         args.compute_virials = True

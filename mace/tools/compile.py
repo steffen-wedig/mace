@@ -1,3 +1,5 @@
+import copy
+import logging
 from contextlib import contextmanager
 from functools import wraps
 from typing import Callable, Tuple
@@ -7,8 +9,10 @@ try:
 except ImportError:
     dynamo = None
 from e3nn import get_optimization_defaults, set_optimization_defaults
+from e3nn import nn as e3nn_nn
 from torch import autograd, nn
 from torch.fx import symbolic_trace
+from torch.fx.proxy import TraceError
 
 ModuleFactory = Callable[..., nn.Module]
 TypeTuple = Tuple[type, ...]
@@ -83,6 +87,48 @@ def simplify_if_compile(module: nn.Module) -> nn.Module:
     """
     _SIMPLIFY_REGISTRY.add(module)
     return module
+
+
+# e3nn's Activation loops over its Irreps in Python, which Dynamo cannot guard on. It was
+# registered only as a side effect of building a NonLinearReadoutBlock, so models without
+# one (PolarMACE with bias readouts) kept it unsimplified.
+simplify_if_compile(e3nn_nn.Activation)
+
+
+def simplified_view(module: nn.Module) -> nn.Module:
+    """A copy of the module tree for Dynamo that shares every parameter and buffer with
+    ``module``, with the registered modules replaced by their fx-traced graphs.
+
+    Unlike :func:`simplify`, ``module`` itself is left unchanged: optimizers, EMA, config
+    extraction, conversion and saving keep working on it, and the view sees every update
+    of its parameters (same objects; fx's GraphModule references its root's parameters).
+    Only the containers on the path to a registered module are copied, shallowly (their
+    parameter and buffer dictionaries are the original's); every other subtree is the
+    original module object. Build the view after moving the model to its device and
+    dtype.
+    """
+    simplify_types = tuple(_SIMPLIFY_REGISTRY)
+    if not any(isinstance(inner, simplify_types) for inner in module.modules()):
+        return module
+    if isinstance(module, simplify_types):
+        try:
+            return symbolic_trace(module)
+        except TraceError as error:
+            # Python control flow on the inputs, e.g. a cueq linear inside a readout
+            # (cueq forwards check their inputs): simplify its children instead. Dynamo
+            # traces the cueq modules itself; the e3nn activation is what it needs traced.
+            logging.info(
+                "simplified_view: %s not traceable as a whole (%s); simplifying its "
+                "children",
+                type(module).__name__,
+                error,
+            )
+    view = copy.copy(module)
+    view._modules = {  # pylint: disable=protected-access
+        name: None if child is None else simplified_view(child)
+        for name, child in module._modules.items()  # pylint: disable=protected-access
+    }
+    return view
 
 
 def simplify(module: nn.Module) -> nn.Module:

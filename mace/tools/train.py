@@ -11,7 +11,7 @@ import os
 import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -247,8 +247,12 @@ def train(
     selection_loss_fn: Optional[torch.nn.Module] = None,
     best_checkpoint_handler: Optional[CheckpointHandler] = None,
     lowest_selection_loss: float = np.inf,
+    compiled_loss: Optional[Callable[..., torch.Tensor]] = None,
 ):
     """Train `model`; with `best_checkpoint_handler`, also keep the best model of the run.
+
+    With `compiled_loss` (mace.tools.compiled_training.CompiledForceTrainingLoss), every
+    training step evaluates forward, forces and loss as one compiled graph.
 
     The per-stage checkpoints are selected by each stage's own validation loss, which is not
     comparable across the stage switch (the loss weights change). The best model of the whole
@@ -357,6 +361,7 @@ def train(
             distributed_model=distributed_model,
             rank=rank,
             loss_term_instrumentation=loss_term_instrumentation,
+            compiled_loss=compiled_loss,
         )
         if distributed:
             torch.distributed.barrier()
@@ -513,6 +518,7 @@ def train_one_epoch(
     distributed_model: Optional[DistributedDataParallel] = None,
     rank: Optional[int] = 0,
     loss_term_instrumentation: Optional[LossTermInstrumentation] = None,
+    compiled_loss: Optional[Callable[..., torch.Tensor]] = None,
 ) -> None:
     model_to_train = model if distributed_model is None else distributed_model
 
@@ -561,6 +567,7 @@ def train_one_epoch(
                 output_args=output_args,
                 max_grad_norm=max_grad_norm,
                 device=device,
+                compiled_loss=compiled_loss,
             )
             magnitude = loss.detach().abs()
             epoch_loss_magnitude = (
@@ -605,6 +612,7 @@ def take_step(
     output_args: Dict[str, bool],
     max_grad_norm: Optional[float],
     device: torch.device,
+    compiled_loss: Optional[Callable[..., torch.Tensor]] = None,
 ) -> Tuple[float, Dict[str, Any]]:
     start_time = time.time()
     batch = batch.to(device)
@@ -612,8 +620,13 @@ def take_step(
 
     def closure():
         optimizer.zero_grad(set_to_none=True)
-        output = model(batch_dict, **training_forward_kwargs(output_args))
-        loss = loss_fn(pred=output, ref=batch)
+        if compiled_loss is not None:
+            # Forward, force gradient and loss in one compiled graph; the backward
+            # below runs its compiled backward (through the forces).
+            loss = compiled_loss(model, loss_fn, batch)
+        else:
+            output = model(batch_dict, **training_forward_kwargs(output_args))
+            loss = loss_fn(pred=output, ref=batch)
         loss.backward()
         if max_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)

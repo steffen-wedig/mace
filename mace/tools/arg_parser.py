@@ -410,6 +410,16 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument(
+        "--compile_training",
+        help=(
+            "compile forward, forces and loss of every training step as one torch.compile "
+            "graph (dynamic shapes); the loss backward through the forces runs compiled. "
+            "PolarMACE with --pbc_handling realspace only, for now"
+        ),
+        type=str2bool,
+        default=False,
+    )
+    parser.add_argument(
         "--pbc_handling",
         help=(
             "PolarMACE electrostatics during training: 'auto' picks reciprocal space as soon "

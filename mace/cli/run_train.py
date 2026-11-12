@@ -5,6 +5,7 @@
 ###########################################################################################
 
 import ast
+import contextlib
 import json
 import logging
 import os
@@ -37,6 +38,7 @@ from mace.cli.convert_oeq_e3nn import run as run_oeq_to_e3nn
 from mace.cli.visualise_train import TrainingPlotter
 from mace.data import KeySpecification, update_keyspec_from_kwargs
 from mace.modules.lora import inject_LoRAs, merge_lora_weights
+from mace.tools import compile as mace_compile
 from mace.tools import deprecation, torch_geometric
 from mace.tools.distributed_tools import init_distributed, xpu_device_index
 from mace.tools.loss_terms import LossTermInstrumentation, supports_loss_terms
@@ -673,6 +675,25 @@ def run(args) -> None:
             raise NotImplementedError(
                 "--pbc_handling realspace does not support --cluster_records yet"
             )
+    if args.compile_training:
+        if args.model != "PolarMACE" or not real_space_pairs:
+            raise NotImplementedError(
+                "--compile_training is supported for PolarMACE with --pbc_handling "
+                "realspace only (its forward then reads no host values)"
+            )
+        if args.distributed or args.lbfgs:
+            raise NotImplementedError(
+                "--compile_training does not support distributed training or LBFGS yet"
+            )
+        if len(heads) != 1:
+            raise NotImplementedError(
+                f"--compile_training trains a single head only (heads: {heads})"
+            )
+        from mace.tools.compiled_training import (  # pylint: disable=import-outside-toplevel
+            configure_dynamo_for_training,
+        )
+
+        configure_dynamo_for_training()
 
     # Load datasets for each head, supporting multiple files per head
     valid_sets = {head: [] for head in heads}
@@ -886,7 +907,13 @@ def run(args) -> None:
     args.avg_num_neighbors = get_avg_num_neighbors(head_configs, args, train_loader, device)
 
     # Model
-    model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
+    if args.compile_training:
+        # Without e3nn's code generation (Dynamo cannot trace it); the compiled step
+        # runs on a simplified view of the model (mace.tools.compile.simplified_view).
+        with mace_compile.disable_e3nn_codegen():
+            model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
+    else:
+        model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
     model.to(device)
     if real_space_pairs:
         model.set_electrostatic_pbcs("realspace")
@@ -948,9 +975,16 @@ def run(args) -> None:
             "MagneticScaleShiftMACE",
             "AtomicDielectricMACE",
         ]
-        model = run_e3nn_to_cueq(
-            deepcopy(model), device=device, conv_fusion=args.cueq_conv_fusion
-        )
+        # The conversion rebuilds the model: for compiled training, again without e3nn's
+        # code generation.
+        with (
+            mace_compile.disable_e3nn_codegen()
+            if args.compile_training
+            else contextlib.nullcontext()
+        ):
+            model = run_e3nn_to_cueq(
+                deepcopy(model), device=device, conv_fusion=args.cueq_conv_fusion
+            )
     if args.enable_oeq:
         logging.info("Converting model to OEQ for accelerated training")
         assert model.__class__.__name__ in [
@@ -1095,6 +1129,23 @@ def run(args) -> None:
     loss_term_instrumentation = create_loss_term_instrumentation(
         args, loss_fn, tag, rank, device
     )
+    compiled_loss = None
+    if args.compile_training:
+        if loss_term_instrumentation is not None:
+            raise NotImplementedError(
+                "--compile_training does not support per-term loss logging yet "
+                f"(loss {args.loss})"
+            )
+        from mace.tools.compiled_training import (  # pylint: disable=import-outside-toplevel
+            CompiledForceTrainingLoss,
+        )
+        from mace.tools.loss_terms import (  # pylint: disable=import-outside-toplevel
+            training_forward_kwargs,
+        )
+
+        compiled_loss = CompiledForceTrainingLoss(
+            model, training_forward_kwargs(output_args)
+        )
 
     tools.train(
         model=model,
@@ -1127,6 +1178,7 @@ def run(args) -> None:
         loss_term_instrumentation=loss_term_instrumentation,
         selection_loss_fn=selection_loss_fn,
         best_checkpoint_handler=best_checkpoint_handler,
+        compiled_loss=compiled_loss,
         # Resume the run-level best only when a checkpoint was actually restored: a fresh
         # start under --restart_latest must not inherit a stale results file's best value.
         lowest_selection_loss=(
