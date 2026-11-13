@@ -19,7 +19,6 @@ import torch
 import torch.distributed
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import LBFGS
-from torch.optim.swa_utils import SWALR, AveragedModel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch_ema import ExponentialMovingAverage
@@ -29,6 +28,10 @@ from mace.cli.visualise_train import TrainingPlotter
 
 from . import torch_geometric
 from .checkpoint import CheckpointHandler, CheckpointState
+from .learning_rate_schedule import (
+    StageTwoOptimizerChange,
+    TwoStageLearningRateSchedule,
+)
 from .loss_terms import (
     LossTermAccumulator,
     LossTermInstrumentation,
@@ -55,10 +58,13 @@ from .utils import (
 
 @dataclasses.dataclass
 class SWAContainer:
-    model: AveragedModel
-    scheduler: SWALR
+    """Stage two ("swa" for historical reasons; there is no weight averaging)."""
+
     start: int
     loss_fn: torch.nn.Module
+    optimizer_change: StageTwoOptimizerChange = dataclasses.field(
+        default_factory=StageTwoOptimizerChange
+    )
 
 
 def logged_best_selection_loss(results_path: str) -> float:
@@ -249,8 +255,19 @@ def train(
     best_checkpoint_handler: Optional[CheckpointHandler] = None,
     lowest_selection_loss: float = np.inf,
     compiled_loss: Optional[Callable[..., torch.Tensor]] = None,
+    learning_rate_schedule: Optional[TwoStageLearningRateSchedule] = None,
 ):
     """Train `model`; with `best_checkpoint_handler`, also keep the best model of the run.
+
+    `learning_rate_schedule` sets the learning rate before every optimizer step wherever
+    it owns it (stage two always, stage one with --scheduler Piecewise); the epoch
+    scheduler `lr_scheduler` runs in stage one otherwise. At the first stage-two epoch the
+    loss changes to the stage-two loss and `swa.optimizer_change` is applied to the
+    optimizer, unless the run resumed inside stage two (`start_epoch > swa.start`: the
+    checkpoint holds the optimizer after the change).
+
+    Checkpoints hold the raw weights, the EMA weights and the optimizer state
+    (`CheckpointState`); the exported models are the EMA weights.
 
     With `compiled_loss` (mace.tools.compiled.training.CompiledForceTrainingLoss), every
     training step evaluates forward, forces and loss as one compiled graph.
@@ -258,7 +275,8 @@ def train(
     The per-stage checkpoints are selected by each stage's own validation loss, which is not
     comparable across the stage switch (the loss weights change). The best model of the whole
     run is selected by `selection_loss_fn` instead: one fixed loss evaluated at every
-    validation of both stages (run_train passes a copy of the stage-one loss). Its checkpoint
+    validation of both stages (run_train passes `get_selection_loss_fn`: the loss at the
+    stage-two weights). Its checkpoint
     is saved through `best_checkpoint_handler`, and each new best writes a `mode: "best"`
     entry to the results log, so the last such entry describes the best model. A resumed
     run passes the best value logged so far as `lowest_selection_loss`.
@@ -332,14 +350,13 @@ def train(
                 lowest_loss = np.inf
                 swa_start = False
                 keep_last = True
+                if start_epoch <= swa.start:
+                    swa.optimizer_change.apply(optimizer)
                 if loss_term_instrumentation is not None:
                     loss_term_instrumentation.stage_switch(
                         epoch=epoch, old_loss_fn=loss_fn, new_loss_fn=swa.loss_fn
                     )
             loss_fn = swa.loss_fn
-            swa.model.update_parameters(model)
-            if epoch > start_epoch:
-                swa.scheduler.step()
 
         # Train
         if distributed:
@@ -363,12 +380,14 @@ def train(
             rank=rank,
             loss_term_instrumentation=loss_term_instrumentation,
             compiled_loss=compiled_loss,
+            learning_rate_schedule=learning_rate_schedule,
         )
         if distributed:
             torch.distributed.barrier()
 
         # Validate
         if epoch % eval_interval == 0:
+            save_best = False
             model_to_evaluate = (
                 model if distributed_model is None else distributed_model
             )
@@ -440,11 +459,7 @@ def train(
                         f"New best model of the run at epoch {epoch}: fixed-weight "
                         f"validation loss {lowest_selection_loss:.8f}"
                     )
-                    best_checkpoint_handler.save(
-                        state=CheckpointState(model, optimizer, lr_scheduler),
-                        epochs=epoch,
-                        keep_last=save_all_checkpoints,
-                    )
+                    save_best = True
                     logger.log(
                         {
                             **selection_metrics,
@@ -453,6 +468,15 @@ def train(
                             "head": valid_loader_name,
                         }
                     )
+            # Saved with the raw weights in the model (outside the EMA context): the
+            # checkpoint holds both (CheckpointBuilder).
+            if save_best:
+                best_checkpoint_handler.save(
+                    state=CheckpointState(model, optimizer, lr_scheduler, ema),
+                    epochs=epoch,
+                    keep_last=save_all_checkpoints,
+                )
+                save_best = False
             if log_wandb:
                 wandb.log(wandb_log_dict)
             if rank == 0:
@@ -471,30 +495,20 @@ def train(
                             if exit_now is not None:
                                 exit_now.fill_(1)
                     if save_all_checkpoints:
-                        param_context = (
-                            ema.average_parameters()
-                            if ema is not None
-                            else nullcontext()
+                        checkpoint_handler.save(
+                            state=CheckpointState(model, optimizer, lr_scheduler, ema),
+                            epochs=epoch,
+                            keep_last=True,
                         )
-                        with param_context:
-                            checkpoint_handler.save(
-                                state=CheckpointState(model, optimizer, lr_scheduler),
-                                epochs=epoch,
-                                keep_last=True,
-                            )
                 else:
                     lowest_loss = valid_loss
                     patience_counter = 0
-                    param_context = (
-                        ema.average_parameters() if ema is not None else nullcontext()
+                    checkpoint_handler.save(
+                        state=CheckpointState(model, optimizer, lr_scheduler, ema),
+                        epochs=epoch,
+                        keep_last=keep_last,
                     )
-                    with param_context:
-                        checkpoint_handler.save(
-                            state=CheckpointState(model, optimizer, lr_scheduler),
-                            epochs=epoch,
-                            keep_last=keep_last,
-                        )
-                        keep_last = False or save_all_checkpoints
+                    keep_last = False or save_all_checkpoints
         if distributed:
             torch.distributed.barrier()
         if exit_now is not None:
@@ -523,6 +537,7 @@ def train_one_epoch(
     rank: Optional[int] = 0,
     loss_term_instrumentation: Optional[LossTermInstrumentation] = None,
     compiled_loss: Optional[Callable[..., torch.Tensor]] = None,
+    learning_rate_schedule: Optional[TwoStageLearningRateSchedule] = None,
 ) -> None:
     model_to_train = model if distributed_model is None else distributed_model
 
@@ -554,7 +569,9 @@ def train_one_epoch(
         # exactly zero loss trains nothing (no entry reaches a weighted term) and is refused.
         epoch_loss_magnitude: Optional[torch.Tensor] = None
         pending_metrics: Optional[StepMetrics] = None
-        for batch in data_loader:
+        for step_in_epoch, batch in enumerate(data_loader):
+            if learning_rate_schedule is not None:
+                learning_rate_schedule.apply(optimizer, epoch, step_in_epoch)
             if loss_term_instrumentation is not None:
                 loss_term_instrumentation.before_train_step(
                     model=model_to_train,

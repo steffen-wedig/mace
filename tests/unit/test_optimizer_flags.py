@@ -74,6 +74,14 @@ def args_for(**overrides):
         scheduler_patience=PATIENCE,
         lr_factor=0.6,
         lr_scheduler_gamma=GAMMA,
+        beta2=0.999,
+        warmup_steps=0,
+        decay_epochs=0,
+        decay_final_factor=0.0,
+        swa_hold_steps=0,
+        swa_warmup_steps=0,
+        swa_decay_epochs=0,
+        swa_decay_final_factor=0.0,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -91,11 +99,26 @@ def groups(model, **overrides):
 
 
 def test_beta_is_the_first_adam_moment(model):
-    """`--beta` sets beta1 only; beta2 is fixed at 0.999. A flag named `beta`
+    """`--beta` sets beta1 only, `--beta2` the second moment. A flag named `beta`
     could plausibly be read into either."""
     _, options = groups(model)
 
     assert options["betas"] == (BETA, 0.999)
+    _, options = groups(model, beta2=0.99)
+
+    assert options["betas"] == (BETA, 0.99)
+
+
+def test_amsgrad_can_be_switched_off_on_the_command_line():
+    """It was a store_true flag defaulting to True: impossible to switch off."""
+    from mace.tools import build_default_arg_parser  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
+
+    parser = build_default_arg_parser()
+    required = ["--name", "x", "--train_file", "x.xyz"]
+
+    assert parser.parse_args(required).amsgrad is True
+    assert parser.parse_args(required + ["--amsgrad"]).amsgrad is True
+    assert parser.parse_args(required + ["--amsgrad=False"]).amsgrad is False
 
 
 def test_amsgrad_reaches_the_optimizer(model):
@@ -180,10 +203,16 @@ def test_an_unknown_scheduler_is_refused(model):
         LRScheduler(optimizer, args_for(scheduler="Whatever"))
 
 
-def test_swa_lr_is_the_rate_the_second_stage_anneals_to(model):
-    """`--swa_lr` only appears after the stage-two swap, so it is checked on the
-    SWALR the swap builds rather than on the first-stage optimizer."""
-    from mace.tools.scripts_utils import get_swa  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
+def test_swa_lr_is_the_rate_of_the_second_stage(model):
+    """`--swa_lr` is the stage-two peak of the per-step schedule, applied to every group
+    with its learning-rate factor."""
+    from mace.tools.learning_rate_schedule import (  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
+        group_learning_rate_factors,
+    )
+    from mace.tools.scripts_utils import (  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
+        get_learning_rate_schedule,
+        get_swa,
+    )
 
     _, options = groups(model)
     optimizer = get_optimizer(args_for(), options)
@@ -198,11 +227,18 @@ def test_swa_lr_is_the_rate_the_second_stage_anneals_to(model):
         swa_stress_weight=1.0,
         swa_dipole_weight=1.0,
     )
+    swa, _ = get_swa(args, [])
+    schedule = get_learning_rate_schedule(
+        args,
+        group_learning_rate_factors(optimizer, args.lr),
+        steps_per_epoch=3,
+        stage_two_start_epoch=swa.start,
+    )
 
-    get_swa(args, model, optimizer, [])
+    schedule.apply(optimizer, epoch=2, step_in_epoch=0)
 
-    assert [group["swa_lr"] for group in optimizer.param_groups] == [0.0009] * len(
-        optimizer.param_groups
+    assert [group["lr"] for group in optimizer.param_groups] == pytest.approx(
+        [0.0009] * len(optimizer.param_groups)
     )
 
 

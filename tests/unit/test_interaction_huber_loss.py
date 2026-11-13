@@ -569,7 +569,7 @@ def test_both_stage_factories_build_the_loss():
 
     model = torch.nn.Linear(1, 1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-    swa, _ = get_swa(args, model, optimizer, swas=[False])
+    swa, _ = get_swa(args, swas=[False])
     stage_two = swa.loss_fn
     assert isinstance(stage_two, InteractionHuberLoss)
     assert stage_two.term_weights() == {

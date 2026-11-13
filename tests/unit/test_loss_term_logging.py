@@ -14,7 +14,6 @@ import numpy as np
 import pytest
 import torch
 from e3nn import o3
-from torch.optim.swa_utils import SWALR, AveragedModel
 
 from mace import data, modules, tools
 from mace.tools import torch_geometric
@@ -520,12 +519,7 @@ def run_training(
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
     stage_one_loss = loss_factory(STAGE_ONE_WEIGHTS)
     stage_two_loss = loss_factory(STAGE_TWO_WEIGHTS)
-    swa = SWAContainer(
-        model=AveragedModel(model),
-        scheduler=SWALR(optimizer, swa_lr=1e-3),
-        start=1,
-        loss_fn=stage_two_loss,
-    )
+    swa = SWAContainer(start=1, loss_fn=stage_two_loss)
     instrumentation = None
     if instrumentation_interval is not None:
         instrumentation = LossTermInstrumentation.for_run(

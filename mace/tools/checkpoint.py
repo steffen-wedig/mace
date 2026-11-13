@@ -8,7 +8,7 @@ import dataclasses
 import logging
 import os
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -19,9 +19,19 @@ Checkpoint = Dict[str, TensorDict]
 
 @dataclasses.dataclass
 class CheckpointState:
+    """What a checkpoint saves and restores.
+
+    With an ``ema`` (torch_ema ExponentialMovingAverage over ``model.parameters()``), a
+    checkpoint holds the EMA weights as ``model`` (what the exports load) and the raw
+    weights as ``raw_model``, plus the EMA's update count, so that a resumed run continues
+    both the raw trajectory and the average. Without one, ``model`` is the raw weights.
+    Pass the state with the raw weights in the model (not inside ``average_parameters``).
+    """
+
     model: torch.nn.Module
     optimizer: torch.optim.Optimizer
     lr_scheduler: torch.optim.lr_scheduler.ExponentialLR
+    ema: Optional[Any] = None
 
 
 # How an optimizer executes, not what it has learnt: taken from the optimizer being
@@ -48,20 +58,50 @@ def optimizer_state_for(
     return {**saved_state, "param_groups": param_groups}
 
 
+def _copied_state(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    return {key: value.detach().clone() for key, value in model.state_dict().items()}
+
+
 class CheckpointBuilder:
     @staticmethod
     def create_checkpoint(state: CheckpointState) -> Checkpoint:
-        return {
-            "model": state.model.state_dict(),
+        checkpoint: Checkpoint = {
             "optimizer": state.optimizer.state_dict(),
             "lr_scheduler": state.lr_scheduler.state_dict(),
         }
+        if state.ema is None:
+            checkpoint["model"] = state.model.state_dict()
+            return checkpoint
+        # Copies: average_parameters swaps the parameter values in place.
+        checkpoint["raw_model"] = _copied_state(state.model)
+        with state.ema.average_parameters():
+            checkpoint["model"] = _copied_state(state.model)
+        checkpoint["ema_updates"] = state.ema.num_updates
+        return checkpoint
 
     @staticmethod
     def load_checkpoint(
         state: CheckpointState, checkpoint: Checkpoint, strict: bool
     ) -> None:
+        """Without ``state.ema`` the model gets ``model`` (the EMA weights of a checkpoint
+        written with an EMA: what exports want). With it, the model gets the raw weights
+        and the EMA the averaged ones; a checkpoint without raw weights (written before
+        they were saved) restarts the EMA from its weights."""
         state.model.load_state_dict(checkpoint["model"], strict=strict)  # type: ignore
+        if state.ema is not None:
+            with torch.no_grad():
+                for shadow, parameter in zip(
+                    state.ema.shadow_params, state.model.parameters()
+                ):
+                    shadow.copy_(parameter.detach())
+            if "raw_model" in checkpoint:
+                state.model.load_state_dict(checkpoint["raw_model"], strict=strict)  # type: ignore
+                state.ema.num_updates = checkpoint["ema_updates"]
+            else:
+                logging.warning(
+                    "Checkpoint holds no raw weights (written before they were saved): "
+                    "training resumes from its EMA weights, the EMA restarts from them"
+                )
         try:
             state.optimizer.load_state_dict(
                 optimizer_state_for(state.optimizer, checkpoint["optimizer"])

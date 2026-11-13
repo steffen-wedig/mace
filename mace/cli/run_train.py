@@ -42,6 +42,7 @@ from mace.tools import compile as mace_compile
 from mace.tools import deprecation, torch_geometric
 from mace.tools.distributed_tools import init_distributed, xpu_device_index
 from mace.tools.ema import ForeachExponentialMovingAverage
+from mace.tools.learning_rate_schedule import group_learning_rate_factors
 from mace.tools.loss_terms import LossTermInstrumentation, supports_loss_terms
 from mace.tools.model_script_utils import configure_model
 from mace.tools.multihead_tools import (
@@ -74,6 +75,7 @@ from mace.tools.scripts_utils import (
     get_optimizer,
     get_params_options,
     get_selection_loss_fn,
+    get_learning_rate_schedule,
     get_swa,
     print_git_commit,
     remove_pt_head,
@@ -1076,6 +1078,7 @@ def run(args) -> None:
 
     optimizer: torch.optim.Optimizer
     optimizer = get_optimizer(args, param_options)
+    learning_rate_factors = group_learning_rate_factors(optimizer, args.lr)
     logging.info("=== Layer's learning rates ===")
     for name, p in model.named_parameters():
         st = optimizer.state.get(p, {})
@@ -1094,7 +1097,7 @@ def run(args) -> None:
     swa: Optional[tools.SWAContainer] = None
     swas = [False]
     if args.swa:
-        swa, swas = get_swa(args, model, optimizer, swas, dipole_only)
+        swa, swas = get_swa(args, swas, dipole_only)
         swa.loss_fn.to(device)
 
     checkpoint_handler = tools.CheckpointHandler(
@@ -1109,19 +1112,24 @@ def run(args) -> None:
         keep=args.keep_checkpoints,
     )
 
+    # Built before a resume: the checkpoint restores the averaged weights into it.
+    ema: Optional[ExponentialMovingAverage] = None
+    if args.ema:
+        ema = ForeachExponentialMovingAverage(model.parameters(), decay=args.ema_decay)
+
     start_epoch = 0
     opt_start_epoch = None
     if args.restart_latest:
         try:
             opt_start_epoch = checkpoint_handler.load_latest(
-                state=tools.CheckpointState(model, optimizer, lr_scheduler),
+                state=tools.CheckpointState(model, optimizer, lr_scheduler, ema),
                 swa=True,
                 device=device,
             )
         except Exception:  # pylint: disable=W0703
             try:
                 opt_start_epoch = checkpoint_handler.load_latest(
-                    state=tools.CheckpointState(model, optimizer, lr_scheduler),
+                    state=tools.CheckpointState(model, optimizer, lr_scheduler, ema),
                     swa=False,
                     device=device,
                 )
@@ -1134,11 +1142,8 @@ def run(args) -> None:
                     "loaded; training starts from scratch"
                 )
         if opt_start_epoch is not None:
-            start_epoch = opt_start_epoch
-
-    ema: Optional[ExponentialMovingAverage] = None
-    if args.ema:
-        ema = ForeachExponentialMovingAverage(model.parameters(), decay=args.ema_decay)
+            # The checkpoint was written after training its epoch: continue with the next.
+            start_epoch = opt_start_epoch + 1
 
     if args.lbfgs:
         logging.info("Switching optimizer to LBFGS")
@@ -1224,6 +1229,13 @@ def run(args) -> None:
             static_shapes=args.padding_buckets > 0,
         )
 
+    learning_rate_schedule = get_learning_rate_schedule(
+        args,
+        learning_rate_factors,
+        steps_per_epoch=len(training_loader),
+        stage_two_start_epoch=swa.start if swa is not None else None,
+    )
+
     tools.train(
         model=model,
         loss_fn=loss_fn,
@@ -1256,6 +1268,7 @@ def run(args) -> None:
         selection_loss_fn=selection_loss_fn,
         best_checkpoint_handler=best_checkpoint_handler,
         compiled_loss=compiled_loss,
+        learning_rate_schedule=learning_rate_schedule,
         # Resume the run-level best only when a checkpoint was actually restored: a fresh
         # start under --restart_latest must not inherit a stale results file's best value.
         lowest_selection_loss=(

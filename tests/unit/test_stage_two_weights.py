@@ -74,7 +74,7 @@ def settings(**overrides):
 
 def build(model, **overrides):
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    swa, swas = get_swa(settings(**overrides), model, optimizer, [])
+    swa, swas = get_swa(settings(**overrides), [])
     return swa, swas
 
 
@@ -107,7 +107,7 @@ def test_the_stage_two_weights_are_not_the_first_stage_ones(model):
     args.forces_weight = 100.0
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    swa, _ = get_swa(args, model, optimizer, [])
+    swa, _ = get_swa(args, [])
 
     assert swa.loss_fn.energy_weight != pytest.approx(args.energy_weight)
     assert swa.loss_fn.forces_weight != pytest.approx(args.forces_weight)
@@ -198,7 +198,7 @@ def test_every_loss_keeps_its_class_in_stage_two(model, loss):
         loss=loss, energy_weight=1.0, forces_weight=1.0, stress_weight=1.0, magforces_weight=1.0
     )
     stage_one = get_loss_fn(args, dipole_only=False, compute_dipole=False)
-    swa, _ = get_swa(args, model, torch.optim.Adam(model.parameters(), lr=1e-3), [])
+    swa, _ = get_swa(args, [])
 
     assert type(swa.loss_fn) is type(stage_one)
     assert swa.loss_fn.energy_weight == pytest.approx(ENERGY)

@@ -1080,11 +1080,21 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=None,
     )
+    # A bare --amsgrad still means on; --amsgrad=False switches it off (as a store_true flag
+    # defaulting to True it could not be switched off at all).
     parser.add_argument(
         "--amsgrad",
         help="use amsgrad variant of optimizer",
-        action="store_true",
+        type=str2bool,
+        nargs="?",
+        const=True,
         default=True,
+    )
+    parser.add_argument(
+        "--beta2",
+        help="Second-moment decay of Adam/AdamW",
+        type=float,
+        default=0.999,
     )
     parser.add_argument(
         "--scheduler", help="Type of scheduler", type=str, default="ReduceLROnPlateau"
@@ -1100,6 +1110,68 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         help="Gamma of learning rate scheduler",
         type=float,
         default=0.9993,
+    )
+    # Per-step learning-rate schedule of each stage (mace.tools.learning_rate_schedule).
+    # Stage one follows it with --scheduler Piecewise; stage two always does.
+    parser.add_argument(
+        "--warmup_steps",
+        help="Stage one (--scheduler Piecewise): linear warm-up from 0 to --lr over this many optimizer steps",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--decay_epochs",
+        help="Stage one (--scheduler Piecewise): linear decay over the stage's last N epochs",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--decay_final_factor",
+        help="Stage one (--scheduler Piecewise): learning rate at the end of the decay, as a fraction of --lr",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--swa_hold_steps",
+        help="Stage two: optimizer steps at learning rate 0 after the switch (the moments adapt to the stage-two loss without moving the parameters)",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--swa_warmup_steps",
+        help="Stage two: linear warm-up from 0 to --swa_lr over this many optimizer steps after the hold",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--swa_decay_epochs",
+        help="Stage two: linear decay over the stage's last N epochs",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--swa_decay_final_factor",
+        help="Stage two: learning rate at the end of the decay, as a fraction of --swa_lr",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--swa_reset_optimizer",
+        help="Stage two: clear the optimizer state (moments, step counts) at the switch",
+        type=str2bool,
+        default=False,
+    )
+    parser.add_argument(
+        "--swa_beta2",
+        help="Stage two: Adam's second-moment decay from the switch on (default: keep stage one's)",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--swa_amsgrad",
+        help="Stage two: AMSGrad on or off from the switch on (default: keep stage one's)",
+        type=str2bool,
+        default=None,
     )
     parser.add_argument(
         "--swa",

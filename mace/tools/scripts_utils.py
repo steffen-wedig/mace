@@ -17,10 +17,14 @@ import numpy as np
 import torch
 import torch.distributed
 from e3nn import o3
-from torch.optim.swa_utils import SWALR, AveragedModel
 
 from mace import data, modules, tools
 from mace.data import KeySpecification
+from mace.tools.learning_rate_schedule import (
+    StageLearningRate,
+    StageTwoOptimizerChange,
+    TwoStageLearningRateSchedule,
+)
 from mace.tools.train import SWAContainer
 
 
@@ -914,13 +918,15 @@ def get_loss_fn(
 
 def get_swa(
     args: argparse.Namespace,
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
     swas: List[bool],
     dipole_only: bool = False,
 ):
-    """Stage two: the configured loss at the ``swa_*`` weights (`get_loss_fn`), a lower
-    learning rate and weight averaging from ``start_swa``."""
+    """Stage two from ``start_swa``: the configured loss at the ``swa_*`` weights
+    (`get_loss_fn`), the stage-two learning rate (`get_learning_rate_schedule`) and the
+    optimizer change at the switch (`get_stage_two_optimizer_change`).
+
+    The name is historical: there is no weight averaging (the former AveragedModel was
+    updated every stage-two epoch and never used)."""
     assert dipole_only is False, "Stage Two for dipole fitting not implemented"
     swas.append(True)
     if args.start_swa is None:
@@ -941,17 +947,63 @@ def get_swa(
         f"and learning rate : {args.swa_lr}"
     )
     swa = SWAContainer(
-        model=AveragedModel(model),
-        scheduler=SWALR(
-            optimizer=optimizer,
-            swa_lr=args.swa_lr,
-            anneal_epochs=1,
-            anneal_strategy="linear",
-        ),
         start=args.start_swa,
         loss_fn=loss_fn_energy,
+        optimizer_change=get_stage_two_optimizer_change(args),
     )
     return swa, swas
+
+
+def get_stage_two_optimizer_change(args: argparse.Namespace) -> StageTwoOptimizerChange:
+    return StageTwoOptimizerChange(
+        reset_state=bool(getattr(args, "swa_reset_optimizer", False)),
+        beta2=getattr(args, "swa_beta2", None),
+        amsgrad=getattr(args, "swa_amsgrad", None),
+    )
+
+
+def get_learning_rate_schedule(
+    args: argparse.Namespace,
+    group_factors: List[float],
+    steps_per_epoch: int,
+    stage_two_start_epoch: Optional[int],
+) -> Optional[TwoStageLearningRateSchedule]:
+    """The per-step learning rate: stage one with ``--scheduler Piecewise``, stage two
+    whenever the run has one. None when neither applies (the epoch scheduler owns the
+    whole run)."""
+    stage_one = None
+    if args.scheduler == "Piecewise":
+        stage_one = StageLearningRate(
+            peak=args.lr,
+            warmup_steps=args.warmup_steps,
+            decay_epochs=args.decay_epochs,
+            final_factor=args.decay_final_factor,
+        )
+    stage_two = None
+    if stage_two_start_epoch is not None:
+        stage_two = StageLearningRate(
+            peak=args.swa_lr,
+            hold_steps=args.swa_hold_steps,
+            warmup_steps=args.swa_warmup_steps,
+            decay_epochs=args.swa_decay_epochs,
+            final_factor=args.swa_decay_final_factor,
+        )
+    if stage_one is None and stage_two is None:
+        return None
+    schedule = TwoStageLearningRateSchedule(
+        group_factors=group_factors,
+        stage_one=stage_one,
+        stage_two=stage_two,
+        stage_two_start_epoch=stage_two_start_epoch,
+        max_num_epochs=args.max_num_epochs,
+        steps_per_epoch=steps_per_epoch,
+    )
+    logging.info(
+        f"Per-step learning rate: stage one {stage_one or 'epoch scheduler ' + args.scheduler}, "
+        f"stage two {stage_two} from epoch {stage_two_start_epoch}, "
+        f"{steps_per_epoch} steps per epoch"
+    )
+    return schedule
 
 
 def freeze_module(module: torch.nn.Module, freeze: bool = True):
@@ -1042,7 +1094,7 @@ def get_params_options(
         ],
         lr=args.lr,
         amsgrad=args.amsgrad,
-        betas=(args.beta, 0.999),
+        betas=(args.beta, getattr(args, "beta2", 0.999)),
     )
     # Optional submodules that only exist on some model classes (joint
     # embeddings, MACELES, PolarMACE). Each gets its own named group so that
@@ -1222,10 +1274,18 @@ class LRScheduler:
                 factor=args.lr_factor,
                 patience=args.scheduler_patience,
             )
+        elif args.scheduler == "Piecewise":
+            # The per-step TwoStageLearningRateSchedule sets the learning rate; this one
+            # only provides the checkpoint's (empty) scheduler state.
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer=optimizer, lr_lambda=lambda _: 1.0
+            )
         else:
             raise RuntimeError(f"Unknown scheduler: '{args.scheduler}'")
 
     def step(self, metrics=None, epoch=None):  # pylint: disable=E1123
+        if self.scheduler == "Piecewise":
+            return
         if self._optimizer_type == "schedulefree":
             return  # In principle, schedulefree optimizer can be used with a scheduler but the paper suggests it's not necessary
         if self.scheduler == "ExponentialLR":
