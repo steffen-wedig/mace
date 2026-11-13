@@ -30,6 +30,11 @@ import torch._inductor
 from mace.tools import compile as mace_compile
 from mace.tools.compiled import small_matmuls
 
+# Dynamo's and Inductor's settings live in torch's private modules (torch._dynamo.config,
+# torch._inductor.list_mode_options); configuring them is this module's purpose.
+# pylint: disable=protected-access
+
+
 RECOMPILE_LIMIT = 8
 DEFAULT_OUTPUTS = ("energy", "forces", "stress")
 

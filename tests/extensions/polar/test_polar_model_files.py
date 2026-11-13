@@ -31,11 +31,13 @@ def _old_module(module: str) -> str | None:
     return None
 
 
-class MonopoleDipoleCorrectionBlock(torch.nn.Module):
+class MonopoleDipoleCorrectionBlock(torch.nn.Module):  # pylint: disable=abstract-method
     """Stand-in for the energy block's molecule-in-box correction of earlier code."""
 
 
-class GTOInternalFieldtoFeaturesBlock(torch.nn.Module):
+class GTOInternalFieldtoFeaturesBlock(
+    torch.nn.Module
+):  # pylint: disable=abstract-method
     """Stand-in for the corrections' displaced-source block (a removed class of a module
     that still exists)."""
 
@@ -44,7 +46,7 @@ class GTOInternalFieldtoFeaturesBlock(torch.nn.Module):
         self.register_buffer("factors", torch.ones(3))
 
 
-class NonPeriodicFeatureCorrections(torch.nn.Module):
+class NonPeriodicFeatureCorrections(torch.nn.Module):  # pylint: disable=abstract-method
     """Stand-in for the feature block's slab / molecule-in-box corrections, with its
     displaced-source child as in the real pickles."""
 
@@ -121,12 +123,13 @@ def test_model_pickled_under_the_old_class_paths_loads(tmp_path):
     assert b"graph_longrange" in pickled and b"mace.modules.extensions" in pickled
 
     loaded = load_polar_model(old_file)
-    assert type(loaded) is PolarMACE
+    assert type(loaded) is PolarMACE  # pylint: disable=unidiomatic-typecheck
     # The removed corrections are dropped on load.
-    assert "monopole_dipole_correction" not in loaded.coulomb_energy._modules
-    assert (
-        "non_periodic_correction_terms"
-        not in loaded.electric_potential_descriptor._modules
+    assert "monopole_dipole_correction" not in dict(
+        loaded.coulomb_energy.named_children()
+    )
+    assert "non_periodic_correction_terms" not in dict(
+        loaded.electric_potential_descriptor.named_children()
     )
     assert loaded.state_dict().keys() == model.state_dict().keys()
     for key, value in model.state_dict().items():
