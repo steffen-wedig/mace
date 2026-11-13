@@ -1168,6 +1168,12 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument(
+        "--optimizer_probe_interval",
+        help="Log Adam's state statistics per parameter group (mace.tools.optimizer_probe) every N optimizer steps, and every step for the first 100 steps of stage two; 0 = off",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
         "--swa_amsgrad",
         help="Stage two: AMSGrad on or off from the switch on (default: keep stage one's)",
         type=str2bool,

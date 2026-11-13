@@ -28,6 +28,7 @@ from mace.cli.visualise_train import TrainingPlotter
 
 from . import torch_geometric
 from .checkpoint import CheckpointHandler, CheckpointState
+from .optimizer_probe import OptimizerProbe
 from .learning_rate_schedule import (
     StageTwoOptimizerChange,
     TwoStageLearningRateSchedule,
@@ -256,6 +257,7 @@ def train(
     lowest_selection_loss: float = np.inf,
     compiled_loss: Optional[Callable[..., torch.Tensor]] = None,
     learning_rate_schedule: Optional[TwoStageLearningRateSchedule] = None,
+    optimizer_probe: Optional[OptimizerProbe] = None,
 ):
     """Train `model`; with `best_checkpoint_handler`, also keep the best model of the run.
 
@@ -352,6 +354,8 @@ def train(
                 keep_last = True
                 if start_epoch <= swa.start:
                     swa.optimizer_change.apply(optimizer)
+                if optimizer_probe is not None:
+                    optimizer_probe.stage_switch()
                 if loss_term_instrumentation is not None:
                     loss_term_instrumentation.stage_switch(
                         epoch=epoch, old_loss_fn=loss_fn, new_loss_fn=swa.loss_fn
@@ -381,6 +385,7 @@ def train(
             loss_term_instrumentation=loss_term_instrumentation,
             compiled_loss=compiled_loss,
             learning_rate_schedule=learning_rate_schedule,
+            optimizer_probe=optimizer_probe,
         )
         if distributed:
             torch.distributed.barrier()
@@ -538,6 +543,7 @@ def train_one_epoch(
     loss_term_instrumentation: Optional[LossTermInstrumentation] = None,
     compiled_loss: Optional[Callable[..., torch.Tensor]] = None,
     learning_rate_schedule: Optional[TwoStageLearningRateSchedule] = None,
+    optimizer_probe: Optional[OptimizerProbe] = None,
 ) -> None:
     model_to_train = model if distributed_model is None else distributed_model
 
@@ -600,6 +606,13 @@ def train_one_epoch(
             if loss_term_instrumentation is not None:
                 # The loss call inside `take_step` left its term statistics behind.
                 loss_term_instrumentation.after_train_step(loss_fn)
+            if optimizer_probe is not None:
+                if rank == 0 and optimizer_probe.due():
+                    probe_record = optimizer_probe.record(optimizer)
+                    probe_record["epoch"] = epoch
+                    probe_record["step_in_epoch"] = step_in_epoch
+                    logger.log(probe_record)
+                optimizer_probe.advance()
             if rank == 0:
                 # The previous step's loss, read now that this step is queued: the host
                 # never waits for the step it has just launched.
@@ -640,8 +653,11 @@ class StepMetrics:
     ended by waiting for its loss).
     """
 
-    def __init__(self, loss: torch.Tensor, host_seconds: float):
+    def __init__(
+        self, loss: torch.Tensor, host_seconds: float, learning_rate: Optional[float] = None
+    ):
         self.host_seconds = host_seconds
+        self.learning_rate = learning_rate
         self.ready: Optional[torch.cuda.Event] = None
         if loss.is_cuda:
             self.loss = loss.detach().to("cpu", non_blocking=True)
@@ -653,7 +669,10 @@ class StepMetrics:
     def as_dict(self) -> Dict[str, Any]:
         if self.ready is not None:
             self.ready.synchronize()
-        return {"loss": to_numpy(self.loss), "time": self.host_seconds}
+        metrics = {"loss": to_numpy(self.loss), "time": self.host_seconds}
+        if self.learning_rate is not None:
+            metrics["lr"] = self.learning_rate
+        return metrics
 
     def log(self, logger: MetricsLogger, epoch: int) -> None:
         metrics = self.as_dict()
@@ -722,7 +741,9 @@ def take_step(
     if ema is not None:
         ema.update()
 
-    return loss, StepMetrics(loss, time.time() - start_time)
+    return loss, StepMetrics(
+        loss, time.time() - start_time, float(optimizer.param_groups[0]["lr"])
+    )
 
 
 def take_step_lbfgs(

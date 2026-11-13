@@ -186,3 +186,25 @@ def test_an_export_load_gets_the_averaged_weights():
 
     for parameter, expected in zip(export_model.parameters(), averaged):
         torch.testing.assert_close(parameter.detach(), expected)
+
+
+def test_restored_moments_take_their_parameter_shape():
+    """An e3nn checkpoint (weights (n,)) restored into the cueq layout ((1, n))."""
+    from mace.tools.checkpoint import reshape_state_to_parameters  # noqa: PLC0415
+
+    flat = torch.nn.Parameter(torch.ones(6))
+    saved = torch.optim.Adam([flat], lr=1e-3, amsgrad=True)
+    flat.grad = torch.arange(6.0)
+    saved.step()
+    row = torch.nn.Parameter(torch.ones(1, 6))
+    restored = torch.optim.Adam([row], lr=1e-3, amsgrad=True)
+    restored.load_state_dict(saved.state_dict())
+
+    reshape_state_to_parameters(restored)
+
+    state = restored.state[row]
+    assert state["exp_avg"].shape == (1, 6)
+    assert state["max_exp_avg_sq"].shape == (1, 6)
+    torch.testing.assert_close(state["exp_avg"].flatten(), saved.state[flat]["exp_avg"])
+    row.grad = torch.ones(1, 6)
+    restored.step()

@@ -62,6 +62,29 @@ def _copied_state(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
     return {key: value.detach().clone() for key, value in model.state_dict().items()}
 
 
+def reshape_state_to_parameters(optimizer: torch.optim.Optimizer) -> None:
+    """Give restored per-element state (Adam's moments) its parameter's shape.
+
+    A parameter stored with another shape of the same size (e3nn ``(n,)`` against cueq
+    ``(1, n)`` linears across fork versions) loads into the model, whose load hooks reshape
+    it, but the optimizer restores its moments as saved; the fused Adam kernel then refuses
+    the mismatch. A size mismatch is left alone (the optimizer reports it on its step).
+    """
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            parameter_state = optimizer.state.get(parameter)
+            if not parameter_state:
+                continue
+            for key, value in parameter_state.items():
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value.dim() > 0
+                    and value.shape != parameter.shape
+                    and value.numel() == parameter.numel()
+                ):
+                    parameter_state[key] = value.reshape(parameter.shape)
+
+
 class CheckpointBuilder:
     @staticmethod
     def create_checkpoint(state: CheckpointState) -> Checkpoint:
@@ -106,6 +129,7 @@ class CheckpointBuilder:
             state.optimizer.load_state_dict(
                 optimizer_state_for(state.optimizer, checkpoint["optimizer"])
             )
+            reshape_state_to_parameters(state.optimizer)
             state.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
         except ValueError as exc:
             logging.warning(

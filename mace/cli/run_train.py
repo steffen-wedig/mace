@@ -43,6 +43,7 @@ from mace.tools import deprecation, torch_geometric
 from mace.tools.distributed_tools import init_distributed, xpu_device_index
 from mace.tools.ema import ForeachExponentialMovingAverage
 from mace.tools.learning_rate_schedule import group_learning_rate_factors
+from mace.tools.optimizer_probe import OptimizerProbe
 from mace.tools.loss_terms import LossTermInstrumentation, supports_loss_terms
 from mace.tools.model_script_utils import configure_model
 from mace.tools.multihead_tools import (
@@ -1269,6 +1270,11 @@ def run(args) -> None:
         best_checkpoint_handler=best_checkpoint_handler,
         compiled_loss=compiled_loss,
         learning_rate_schedule=learning_rate_schedule,
+        optimizer_probe=(
+            OptimizerProbe(args.optimizer_probe_interval)
+            if args.optimizer_probe_interval > 0
+            else None
+        ),
         # Resume the run-level best only when a checkpoint was actually restored: a fresh
         # start under --restart_latest must not inherit a stale results file's best value.
         lowest_selection_loss=(
