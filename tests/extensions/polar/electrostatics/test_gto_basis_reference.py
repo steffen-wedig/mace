@@ -33,7 +33,9 @@ def test_gto_basis_matches_old_reference(rtol, atol):
             torch.get_default_dtype()
         )
         k_norm2 = torch.from_numpy(data["k_norm2_flat"]).to(torch.get_default_dtype())
-        k0_mask = torch.from_numpy(data["k0_mask_flat"]).to(torch.get_default_dtype())
+        excluded_k_mask = torch.from_numpy(data["excluded_k_mask_flat"]).to(
+            torch.get_default_dtype()
+        )
         reference_values = torch.from_numpy(data["basis_values_flat"]).to(
             torch.get_default_dtype()
         )
@@ -45,11 +47,11 @@ def test_gto_basis_matches_old_reference(rtol, atol):
         k_mask = torch.from_numpy(data["k_mask"]).to(torch.bool)
         k_vectors = k_vectors_dense[k_mask, ...]
         k_norm2 = k_norm2_dense[k_mask]
-        k0_mask = torch.zeros_like(k_norm2)
+        excluded_k_mask = torch.zeros_like(k_norm2)
         start = 0
         for b in range(k_mask.size(0)):
             n_k = int(k_mask[b].sum().item())
-            k0_mask[start] = 1.0
+            excluded_k_mask[start] = 1.0
             start += n_k
         reference_values = torch.from_numpy(data["basis_values"]).to(
             torch.get_default_dtype()
@@ -64,7 +66,7 @@ def test_gto_basis_matches_old_reference(rtol, atol):
     )
 
     with torch.no_grad():
-        new_values = basis(k_vectors, k_norm2, k0_mask)
+        new_values = basis(k_vectors, k_norm2, excluded_k_mask)
 
     torch.testing.assert_close(new_values, reference_values, rtol=rtol, atol=atol)
 
@@ -93,7 +95,9 @@ def test_gto_basis_direct_matches_reference_l1(rtol, atol):
             torch.get_default_dtype()
         )
         k_norm2 = torch.from_numpy(data["k_norm2_flat"]).to(torch.get_default_dtype())
-        k0_mask = torch.from_numpy(data["k0_mask_flat"]).to(torch.get_default_dtype())
+        excluded_k_mask = torch.from_numpy(data["excluded_k_mask_flat"]).to(
+            torch.get_default_dtype()
+        )
         reference_values = torch.from_numpy(data["basis_values_flat"]).to(
             torch.get_default_dtype()
         )
@@ -105,11 +109,11 @@ def test_gto_basis_direct_matches_reference_l1(rtol, atol):
         k_mask = torch.from_numpy(data["k_mask"]).to(torch.bool)
         k_vectors = k_vectors_dense[k_mask, ...]
         k_norm2 = k_norm2_dense[k_mask]
-        k0_mask = torch.zeros_like(k_norm2)
+        excluded_k_mask = torch.zeros_like(k_norm2)
         start = 0
         for b in range(k_mask.size(0)):
             n_k = int(k_mask[b].sum().item())
-            k0_mask[start] = 1.0
+            excluded_k_mask[start] = 1.0
             start += n_k
         reference_values = torch.from_numpy(data["basis_values"]).to(
             torch.get_default_dtype()
@@ -128,6 +132,6 @@ def test_gto_basis_direct_matches_reference_l1(rtol, atol):
     )
 
     with torch.no_grad():
-        new_values = basis(k_vectors, k_norm2, k0_mask)
+        new_values = basis(k_vectors, k_norm2, excluded_k_mask)
 
     torch.testing.assert_close(new_values, reference_slice, rtol=rtol, atol=atol)

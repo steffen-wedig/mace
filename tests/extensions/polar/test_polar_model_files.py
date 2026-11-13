@@ -35,17 +35,28 @@ class MonopoleDipoleCorrectionBlock(torch.nn.Module):
     """Stand-in for the energy block's molecule-in-box correction of earlier code."""
 
 
-class NonPeriodicFeatureCorrections(torch.nn.Module):
-    """Stand-in for the feature block's slab / molecule-in-box corrections."""
+class GTOInternalFieldtoFeaturesBlock(torch.nn.Module):
+    """Stand-in for the corrections' displaced-source block (a removed class of a module
+    that still exists)."""
 
     def __init__(self):
         super().__init__()
         self.register_buffer("factors", torch.ones(3))
 
 
+class NonPeriodicFeatureCorrections(torch.nn.Module):
+    """Stand-in for the feature block's slab / molecule-in-box corrections, with its
+    displaced-source child as in the real pickles."""
+
+    def __init__(self):
+        super().__init__()
+        self.displaced_interactions = GTOInternalFieldtoFeaturesBlock()
+
+
 REMOVED = [
     (MonopoleDipoleCorrectionBlock, "graph_longrange.slabs"),
     (NonPeriodicFeatureCorrections, "graph_longrange.features"),
+    (GTOInternalFieldtoFeaturesBlock, "graph_longrange.gto_utils"),
 ]
 
 
@@ -65,19 +76,34 @@ def _save_under_old_paths(model: torch.nn.Module, path) -> None:
         for value in vars(module).values():
             if isinstance(value, type) and value.__module__ == name:
                 moved_classes.append((value, name, old))
-    aliases = {}
+    # Old module paths that no longer exist (graph_longrange.*, mace.modules.field_blocks)
+    # get stand-in modules, their parent packages included (pickle imports the module);
+    # a path that still exists (mace.modules.extensions) gets the class set on it.
+    aliases: dict[str, types.ModuleType] = {}
+    added_attributes: list[tuple[types.ModuleType, str]] = []
     try:
         for cls, _, old in moved_classes:
-            alias = aliases.setdefault(old, types.ModuleType(old))
-            setattr(alias, cls.__qualname__, cls)
+            module = sys.modules.get(old) or aliases.get(old)
+            if module is None:
+                parts = old.split(".")
+                for depth in range(1, len(parts) + 1):
+                    package = ".".join(parts[:depth])
+                    if package not in sys.modules and package not in aliases:
+                        aliases[package] = types.ModuleType(package)
+                module = aliases[old]
+            if not hasattr(module, cls.__qualname__):
+                setattr(module, cls.__qualname__, cls)
+                added_attributes.append((module, cls.__qualname__))
             cls.__module__ = old
         sys.modules.update(aliases)
         torch.save(model, path)
     finally:
         for cls, name, _ in moved_classes:
             cls.__module__ = name
-        for old in aliases:
-            sys.modules.pop(old, None)
+        for module, attribute in added_attributes:
+            delattr(module, attribute)
+        for package in aliases:
+            sys.modules.pop(package, None)
         del model.coulomb_energy.monopole_dipole_correction
         del model.electric_potential_descriptor.non_periodic_correction_terms
 

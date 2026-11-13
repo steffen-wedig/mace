@@ -61,6 +61,8 @@ REMOVED_MODULES = {
 }
 REMOVED_CLASSES = {
     ("mace.modules.polar.electrostatics.features", "NonPeriodicFeatureCorrections"),
+    # The corrections' displaced-source block (a child of NonPeriodicFeatureCorrections).
+    ("mace.modules.polar.electrostatics.gto_utils", "GTOInternalFieldtoFeaturesBlock"),
 }
 
 

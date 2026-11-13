@@ -140,23 +140,25 @@ class GTOBasis(torch.nn.Module):
         self._initialize_basis_state()
 
     def _prepare_k_moduli(
-        self, k_norm2: torch.Tensor, k0_mask: torch.Tensor
+        self, k_norm2: torch.Tensor, excluded_k_mask: torch.Tensor
     ) -> torch.Tensor:
         safe_k_norm2 = torch.where(
-            k0_mask > 0.0,
+            excluded_k_mask > 0.0,
             torch.ones_like(k_norm2),
             torch.clamp_min(k_norm2, 0.0),
         )
         k_moduli = torch.sqrt(safe_k_norm2)
-        return torch.where(k0_mask > 0.0, torch.zeros_like(k_moduli), k_moduli)
+        return torch.where(excluded_k_mask > 0.0, torch.zeros_like(k_moduli), k_moduli)
 
     def _compute_ylmk(
-        self, k_vectors: torch.Tensor, k0_mask: torch.Tensor
+        self, k_vectors: torch.Tensor, excluded_k_mask: torch.Tensor
     ) -> torch.Tensor:
         replacement = torch.tensor(
             [1.0, 0.0, 0.0], dtype=k_vectors.dtype, device=k_vectors.device
         )
-        k_vectors = torch.where((k0_mask > 0.0).unsqueeze(-1), replacement, k_vectors)
+        k_vectors = torch.where(
+            (excluded_k_mask > 0.0).unsqueeze(-1), replacement, k_vectors
+        )
         k_vectors = torch.index_select(k_vectors, -1, self.permute_indices)
         return self.spherical_harmonics(k_vectors)
 
@@ -179,10 +181,10 @@ class GTOBasis(torch.nn.Module):
         self,
         k_vectors: torch.Tensor,
         k_norm2: torch.Tensor,
-        k0_mask: torch.Tensor,
+        excluded_k_mask: torch.Tensor,
     ) -> torch.Tensor:
-        k_moduli = self._prepare_k_moduli(k_norm2, k0_mask)
-        yklm = self._compute_ylmk(k_vectors, k0_mask)
+        k_moduli = self._prepare_k_moduli(k_norm2, excluded_k_mask)
+        yklm = self._compute_ylmk(k_vectors, excluded_k_mask)
         return self._evaluate_fourier_basis(k_moduli, yklm)
 
 

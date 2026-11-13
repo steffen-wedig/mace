@@ -195,10 +195,16 @@ def products_sharing_input(
             layout,
         )
         matrices = [products[index][1] for index in indices]
+        matrix = matrices[0] if len(matrices) == 1 else torch.cat(matrices, dim=1)
+        # One 2D GEMM over the n * dimension rows. torch.matmul of the strided
+        # [n, dimension, multiplicity] view with a matrix would broadcast the matrix
+        # over n and run a per-node bmm (its gradient too): ~10x slower.
+        merged = torch.matmul(block.reshape(-1, segment.multiplicity), matrix).view(
+            block.shape[0], segment.dimension, matrix.shape[1]
+        )
         if len(matrices) == 1:
-            results[indices[0]] = torch.matmul(block, matrices[0])
+            results[indices[0]] = merged
             continue
-        merged = torch.matmul(block, torch.cat(matrices, dim=1))
         parts = merged.split([matrix.shape[1] for matrix in matrices], dim=-1)
         for index, part in zip(indices, parts):
             results[index] = part

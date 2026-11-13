@@ -17,7 +17,11 @@ from mace.modules.polar.electrostatics.gto_utils import (
     DisplacedGTOExternalFieldBlock,
     gto_basis_kspace_cutoff,
 )
-from mace.modules.polar.electrostatics.kspace import compute_k_vectors_flat
+from mace.modules.polar.electrostatics.kspace import (
+    ReciprocalLatticeIndices,
+    lattice_k_vectors,
+    reciprocal_lattice_indices,
+)
 from mace.modules.polar.electrostatics.realspace_electrostatics import (
     RealSpaceAnalyticalElectrostaticFeatures,
     RealSpaceAnalyticalEnergy,
@@ -439,6 +443,14 @@ class PolarMACE(ScaleShiftMACE):
         super().__setstate__(state)
         ensure_polar_compatibility(self)
 
+    def kspace_cutoff_value(self) -> float:
+        """The reciprocal-space cutoff that selects the k-vectors (1/Angstrom): the
+        ``kspace_cutoff`` buffer (a host read). Models fine-tuned from a foundation carry
+        the foundation's buffer, which can differ from ``kspace_cutoff_factor`` times the
+        heuristic their GTO bases were built with (MACE-POLAR-1-M fine-tunes: 1.85 vs
+        2.77); the buffer is what the forward has always used."""
+        return float(self.kspace_cutoff)
+
     def set_electrostatic_pbcs(self, pbc_handling: str) -> None:
         """Select the same electrostatic evaluator for features and energy.
 
@@ -689,27 +701,43 @@ class PolarMACE(ScaleShiftMACE):
             k_vectors = positions.new_empty((0, 3))
             kv_norms_squared = positions.new_empty((0,))
             k_vectors_batch = data["batch"].new_empty((0,))
-            k_vectors_0mask = positions.new_empty((0,))
+            excluded_k_vectors = positions.new_empty((0,))
             realspace_geometry = self.prepare_real_space_geometry(
                 long_range_positions,
                 data["batch"],
                 pair_index=data.get("real_space_pair_index"),
             )
         else:
+            # k-vectors from integer lattice indices and the strained reciprocal cell:
+            # the indices come with the batch (fixed shapes, compiled MD) or are listed
+            # here from the cell (host read, eager); the cutoff applies at this cell.
+            # The selection uses the kspace_cutoff buffer, as a tensor (no host read); it
+            # can differ from the cutoff the GTO bases were built for (fine-tunes carry
+            # the foundation's buffer, see kspace_cutoff_value).
+            lattice = (
+                ReciprocalLatticeIndices(
+                    data["kspace_miller"],
+                    data["kspace_structure"],
+                    data["kspace_padding"],
+                )
+                if "kspace_miller" in data
+                else reciprocal_lattice_indices(
+                    long_range_cell, self.kspace_cutoff_value()
+                )
+            )
             (
                 k_vectors,
                 kv_norms_squared,
                 k_vectors_batch,
-                k_vectors_0mask,
-            ) = compute_k_vectors_flat(
-                self.kspace_cutoff, long_range_cell, long_range_rcell
+                excluded_k_vectors,
+            ) = lattice_k_vectors(
+                lattice, long_range_rcell, self.kspace_cutoff.to(long_range_rcell.dtype)
             )
-
         field_feature_cache = self.electric_potential_descriptor.precompute_geometry(
             k_vectors=k_vectors,
             k_norm2=kv_norms_squared,
             k_vector_batch=k_vectors_batch,
-            k0_mask=k_vectors_0mask,
+            excluded_k_mask=excluded_k_vectors,
             node_positions=long_range_positions,
             batch=data["batch"],
             volume=long_range_volume,
@@ -900,7 +928,7 @@ class PolarMACE(ScaleShiftMACE):
             k_vectors=k_vectors,
             k_norm2=kv_norms_squared,
             k_vector_batch=k_vectors_batch,
-            k0_mask=k_vectors_0mask,
+            excluded_k_mask=excluded_k_vectors,
             source_feats=charge_density_mul_ir,
             node_positions=long_range_positions,
             batch=data["batch"],

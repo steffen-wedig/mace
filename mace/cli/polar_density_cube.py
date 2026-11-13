@@ -287,7 +287,7 @@ class PotentialInterpolator:
             )
             multipoles[:, 0] -= total_charge[0] / multipoles.shape[0]
 
-        k_vectors, k_norm2, k_vector_batch, k0_mask = self._compute_kspace(cell)
+        k_vectors, k_norm2, k_vector_batch, excluded_k_mask = self._compute_kspace(cell)
 
         inner_products = torch.matmul(k_vectors, node_positions.t())
         k_mask = k_vector_batch[:, None] == batch[None, :]
@@ -295,7 +295,7 @@ class PotentialInterpolator:
         cosines = torch.cos(inner_products) * k_mask_f
         sines = torch.sin(inner_products) * k_mask_f
 
-        density_basis_fs = self.density_basis(k_vectors, k_norm2, k0_mask)
+        density_basis_fs = self.density_basis(k_vectors, k_norm2, excluded_k_mask)
         volume_per_k = volume.reshape(-1)[k_vector_batch]
         density = assemble_fourier_series_batch(
             source_feats=multipoles,
@@ -306,7 +306,7 @@ class PotentialInterpolator:
         )
         k_factor_coulomb = compute_coulomb_factor(
             k_norm2=k_norm2,
-            k0_mask=k0_mask,
+            excluded_k_mask=excluded_k_mask,
         )
         potential = apply_coulomb_kernel_batch(
             density=density,
@@ -330,7 +330,7 @@ class PotentialInterpolator:
             fourier_coefficients=density,
             sample_points=sample_points,
             sample_batch=sample_batch,
-            k0_mask=k0_mask,
+            excluded_k_mask=excluded_k_mask,
         )
         samples_potential = (
             evaluate_fourier_series_at_points_flat(
@@ -339,7 +339,7 @@ class PotentialInterpolator:
                 fourier_coefficients=potential,
                 sample_points=sample_points,
                 sample_batch=sample_batch,
-                k0_mask=k0_mask,
+                excluded_k_mask=excluded_k_mask,
             )
             + fermi_level
         )

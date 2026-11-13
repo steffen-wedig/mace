@@ -294,7 +294,7 @@ def block_geometry_arguments(positions, batch, num_graphs):
         k_vectors=positions.new_empty((0, 3)),
         k_norm2=positions.new_empty((0,)),
         k_vector_batch=batch.new_empty((0,)),
-        k0_mask=positions.new_empty((0,)),
+        excluded_k_mask=positions.new_empty((0,)),
         node_positions=positions,
         batch=batch,
         volume=torch.ones(num_graphs),

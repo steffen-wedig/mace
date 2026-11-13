@@ -99,7 +99,7 @@ def test_electrostatics_matches_saved_reference(case_name):
     pbc_handling = CASE_TO_PBC_HANDLING[case_name]
 
     common_inputs = _load_batched_inputs(density_max_l=density_max_l)
-    k_vectors, k_norm2, k_vector_batch, k0_mask = compute_k_vectors_flat(
+    k_vectors, k_norm2, k_vector_batch, excluded_k_mask = compute_k_vectors_flat(
         cutoff=kspace_cutoff,
         cell_vectors=common_inputs["cell"],
         r_cell_vectors=common_inputs["r_cell"],
@@ -130,7 +130,7 @@ def test_electrostatics_matches_saved_reference(case_name):
             k_vectors=k_vectors,
             k_norm2=k_norm2,
             k_vector_batch=k_vector_batch,
-            k0_mask=k0_mask,
+            excluded_k_mask=excluded_k_mask,
             source_feats=common_inputs["source_feats"],
             node_positions=common_inputs["node_positions"],
             batch=common_inputs["batch"],
@@ -141,7 +141,7 @@ def test_electrostatics_matches_saved_reference(case_name):
             k_vectors=k_vectors,
             k_norm2=k_norm2,
             k_vector_batch=k_vector_batch,
-            k0_mask=k0_mask,
+            excluded_k_mask=excluded_k_mask,
             source_feats=common_inputs["source_feats"],
             node_positions=common_inputs["node_positions"],
             batch=common_inputs["batch"],

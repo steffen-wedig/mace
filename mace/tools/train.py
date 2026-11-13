@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import time
+import weakref
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -644,6 +645,27 @@ class StepMetrics:
         logger.log(metrics)
 
 
+# The parameters of each training model, listed once. `model.parameters()` is a generator
+# over the whole module tree (`named_modules` recursion): passed to clip_grad_norm_ every
+# step, it walked the tree each step (POLAR-M: 149 parameters, ~3,500 generator resumes),
+# ~1 ms of host time on the dev machine and ~5 ms on the cluster's B200 nodes (cProfile
+# counts each generator resume as a call, hence "149 calls of parameters() per step";
+# experiment 08 cluster_host_bound.md). The parameter objects of a
+# model do not change during training (dtype and device moves replace their data in place).
+_PARAMETER_LISTS: (
+    "weakref.WeakKeyDictionary[torch.nn.Module, List[torch.nn.Parameter]]"
+) = weakref.WeakKeyDictionary()
+
+
+def parameter_list(model: torch.nn.Module) -> List[torch.nn.Parameter]:
+    """``list(model.parameters())``, built once per model object."""
+    parameters = _PARAMETER_LISTS.get(model)
+    if parameters is None:
+        parameters = list(model.parameters())
+        _PARAMETER_LISTS[model] = parameters
+    return parameters
+
+
 def take_step(
     model: torch.nn.Module,
     loss_fn: torch.nn.Module,
@@ -671,7 +693,9 @@ def take_step(
             loss = loss_fn(pred=output, ref=batch)
         loss.backward()
         if max_grad_norm is not None:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(
+                parameter_list(model), max_norm=max_grad_norm
+            )
 
         return loss
 
@@ -746,7 +770,9 @@ def take_step_lbfgs(
             total_loss += batch_loss
 
         if max_grad_norm is not None:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(
+                parameter_list(model), max_norm=max_grad_norm
+            )
 
         if distributed:
             torch.distributed.all_reduce(total_loss, op=torch.distributed.ReduceOp.SUM)

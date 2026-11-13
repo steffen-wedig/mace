@@ -72,12 +72,12 @@ def assemble_fourier_series_batch(
 
 def compute_coulomb_factor(
     k_norm2: torch.Tensor,
-    k0_mask: torch.Tensor,
+    excluded_k_mask: torch.Tensor,
 ) -> torch.Tensor:
     """Build the masked Coulomb factor 1/|k|^2 with the k=0 mode set to zero."""
-    k0_mask_bool = k0_mask > 0.0
-    safe_k_norm2 = torch.where(k0_mask_bool, torch.ones_like(k_norm2), k_norm2)
-    return (~k0_mask_bool).to(k_norm2.dtype) / safe_k_norm2
+    excluded_k_mask_bool = excluded_k_mask > 0.0
+    safe_k_norm2 = torch.where(excluded_k_mask_bool, torch.ones_like(k_norm2), k_norm2)
+    return (~excluded_k_mask_bool).to(k_norm2.dtype) / safe_k_norm2
 
 
 def apply_coulomb_kernel_batch(
@@ -127,15 +127,15 @@ def reconstruct_esps_batch(
     potential: torch.Tensor,
     cosines: torch.Tensor,
     sines: torch.Tensor,
-    k0_mask: torch.Tensor,
+    excluded_k_mask: torch.Tensor,
 ) -> torch.Tensor:
     """Reconstruct electrostatic potential at node positions."""
     summand = (
         2.0 * potential[:, 0].unsqueeze(-1) * cosines
         - 2.0 * potential[:, 1].unsqueeze(-1) * sines
     )
-    k0_factor = torch.ones_like(k0_mask)
-    k0_factor[k0_mask > 0.0] = 0.5
+    k0_factor = torch.ones_like(excluded_k_mask)
+    k0_factor[excluded_k_mask > 0.0] = 0.5
     summand = summand * k0_factor.unsqueeze(-1)
     return torch.sum(summand, dim=0) / (2 * pi) ** 3
 
@@ -276,7 +276,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         k_vectors: torch.Tensor,
         k_norm2: torch.Tensor,
         k_vector_batch: torch.Tensor,
-        k0_mask: torch.Tensor,
+        excluded_k_mask: torch.Tensor,
         source_feats: torch.Tensor,
         node_positions: torch.Tensor,
         batch: torch.Tensor,
@@ -287,7 +287,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
             k_vectors=k_vectors,
             k_norm2=k_norm2,
             k_vector_batch=k_vector_batch,
-            k0_mask=k0_mask,
+            excluded_k_mask=excluded_k_mask,
             node_positions=node_positions,
             batch=batch,
             volume=volume,
@@ -303,7 +303,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         k_vectors: torch.Tensor,
         k_norm2: torch.Tensor,
         k_vector_batch: torch.Tensor,
-        k0_mask: torch.Tensor,
+        excluded_k_mask: torch.Tensor,
         node_positions: torch.Tensor,
         batch: torch.Tensor,
         volume: torch.Tensor,
@@ -322,7 +322,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
             k_vectors=k_vectors,
             k_norm2=k_norm2,
             k_vector_batch=k_vector_batch,
-            k0_mask=k0_mask,
+            excluded_k_mask=excluded_k_mask,
             node_positions=node_positions,
             batch=batch,
             volume=volume,
@@ -369,7 +369,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         k_vectors: torch.Tensor,
         k_norm2: torch.Tensor,
         k_vector_batch: torch.Tensor,
-        k0_mask: torch.Tensor,
+        excluded_k_mask: torch.Tensor,
         node_positions: torch.Tensor,
         batch: torch.Tensor,
         volume: torch.Tensor,
@@ -386,7 +386,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         k_vectors: torch.Tensor,
         k_norm2: torch.Tensor,
         k_vector_batch: torch.Tensor,
-        k0_mask: torch.Tensor,
+        excluded_k_mask: torch.Tensor,
         node_positions: torch.Tensor,
         batch: torch.Tensor,
         volume: torch.Tensor,
@@ -400,20 +400,20 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         cosines = torch.cos(inner_products) * mask_f
         sines = torch.sin(inner_products) * mask_f
 
-        density_basis_fs = self.density_basis(k_vectors, k_norm2, k0_mask)
-        feature_basis_fs = self.feature_basis(k_vectors, k_norm2, k0_mask)
+        density_basis_fs = self.density_basis(k_vectors, k_norm2, excluded_k_mask)
+        feature_basis_fs = self.feature_basis(k_vectors, k_norm2, excluded_k_mask)
 
         volume_per_k = volume.reshape(-1)[k_vector_batch]
-        k0_mask_bool = k0_mask > 0.0
-        k_factor_coulomb = compute_coulomb_factor(k_norm2, k0_mask)
+        excluded_k_mask_bool = excluded_k_mask > 0.0
+        k_factor_coulomb = compute_coulomb_factor(k_norm2, excluded_k_mask)
         k_factor_proj = torch.ones_like(k_norm2)
-        k_factor_proj[k0_mask_bool] = 0.5
+        k_factor_proj[excluded_k_mask_bool] = 0.5
 
         return {
             "mode": "pbc",
             "k_norm2": k_norm2,
             "k_vector_batch": k_vector_batch,
-            "k0_mask": k0_mask,
+            "excluded_k_mask": excluded_k_mask,
             "volume_per_k": volume_per_k,
             "k_factor_coulomb": k_factor_coulomb,
             "k_factor_proj": k_factor_proj,
@@ -432,7 +432,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         k_vectors: torch.Tensor,
         k_norm2: torch.Tensor,
         k_vector_batch: torch.Tensor,
-        k0_mask: torch.Tensor,
+        excluded_k_mask: torch.Tensor,
         node_positions: torch.Tensor,
         batch: torch.Tensor,
         volume: torch.Tensor,
@@ -442,7 +442,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
             k_vectors=k_vectors,
             k_norm2=k_norm2,
             k_vector_batch=k_vector_batch,
-            k0_mask=k0_mask,
+            excluded_k_mask=excluded_k_mask,
             node_positions=node_positions,
             batch=batch,
             volume=volume,
@@ -454,7 +454,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         k_vectors: torch.Tensor,
         k_norm2: torch.Tensor,
         k_vector_batch: torch.Tensor,
-        k0_mask: torch.Tensor,
+        excluded_k_mask: torch.Tensor,
         node_positions: torch.Tensor,
         batch: torch.Tensor,
         volume: torch.Tensor,
@@ -470,7 +470,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
                 k_vectors=k_vectors,
                 k_norm2=k_norm2,
                 k_vector_batch=k_vector_batch,
-                k0_mask=k0_mask,
+                excluded_k_mask=excluded_k_mask,
                 node_positions=node_positions,
                 batch=batch,
                 volume=volume,
@@ -480,7 +480,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
             k_vectors=k_vectors,
             k_norm2=k_norm2,
             k_vector_batch=k_vector_batch,
-            k0_mask=k0_mask,
+            excluded_k_mask=excluded_k_mask,
             node_positions=node_positions,
             batch=batch,
             volume=volume,
@@ -513,7 +513,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
             potential=potential,
             cosines=cache["cosines"],
             sines=cache["sines"],
-            k0_mask=cache["k0_mask"],
+            excluded_k_mask=cache["excluded_k_mask"],
         )
         return esps
 

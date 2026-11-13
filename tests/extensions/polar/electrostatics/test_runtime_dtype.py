@@ -28,7 +28,7 @@ def test_feature_dtype_follows_inputs_not_process_default(pbc_handling, pbc, n_g
         cell = 6.0 * torch.eye(3, dtype=dtype).repeat(n_graphs, 1, 1)
         r_cell = 2.0 * torch.pi * torch.linalg.inv(cell).transpose(-1, -2)
         volume = torch.linalg.det(cell)
-        k_vectors, k_norm2, k_vector_batch, k0_mask = compute_k_vectors_flat(
+        k_vectors, k_norm2, k_vector_batch, excluded_k_mask = compute_k_vectors_flat(
             cutoff=1.2,
             cell_vectors=cell,
             r_cell_vectors=r_cell,
@@ -47,7 +47,7 @@ def test_feature_dtype_follows_inputs_not_process_default(pbc_handling, pbc, n_g
             k_vectors=k_vectors,
             k_norm2=k_norm2,
             k_vector_batch=k_vector_batch,
-            k0_mask=k0_mask,
+            excluded_k_mask=excluded_k_mask,
             source_feats=source_feats,
             node_positions=positions,
             batch=batch,

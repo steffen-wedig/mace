@@ -1651,7 +1651,11 @@ class RealAgnosticResidualNonLinearInteractionBlock(InteractionBlock):
 
         edge_density = torch.tanh(self.density_fn.net[1:](density_hidden) ** 2)
         if cutoff is not None:
-            tp_weights = tp_weights * cutoff
+            # The convolution is linear in the edge attributes and in its weights, so
+            # conv(x, Y, w * cutoff) = conv(x, Y * cutoff, w): the cutoff multiplies the
+            # (max_ell + 1)^2 harmonics instead of the conv weights (2048 / 1280 per edge
+            # in POLAR-M), in the forward and in the force backward (exact up to rounding).
+            edge_attrs = edge_attrs * cutoff
             edge_density = edge_density * cutoff
         density = scatter_sum(
             src=edge_density, index=edge_index[1], dim=0, dim_size=num_nodes

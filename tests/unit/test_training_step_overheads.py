@@ -1,6 +1,7 @@
-"""Host-overhead reductions of the training step: foreach EMA and fused Adam on CUDA.
+"""Host-overhead reductions of the training step: foreach EMA, fused Adam on CUDA, and the
+parameter list of gradient clipping built once.
 
-Both must give the update of the implementations they replace.
+Each must give the update of the implementation it replaces.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from torch_ema import ExponentialMovingAverage
 from mace.tools.checkpoint import optimizer_state_for
 from mace.tools.ema import ForeachExponentialMovingAverage
 from mace.tools.scripts_utils import get_optimizer
+from mace.tools.train import parameter_list
 
 
 def _module(seed: int) -> torch.nn.Module:
@@ -120,8 +122,36 @@ def test_fused_optimizer_loads_a_foreach_checkpoint():
     cpu_optimizer = get_optimizer(
         argparse.Namespace(optimizer="adam", device="cpu"), _amsgrad_options(cpu_module)
     )
-    cpu_optimizer.load_state_dict(optimizer_state_for(cpu_optimizer, fused.state_dict()))
+    cpu_optimizer.load_state_dict(
+        optimizer_state_for(cpu_optimizer, fused.state_dict())
+    )
     for parameter in cpu_module.parameters():
         parameter.grad = torch.ones_like(parameter)
     cpu_optimizer.step()
     assert not any(group.get("fused") for group in cpu_optimizer.param_groups)
+
+
+def test_gradient_clipping_over_the_cached_parameter_list():
+    """clip_grad_norm_ over parameter_list(model) (built once per model) clips exactly as
+    over model.parameters(), and later calls reuse the same list (no module-tree walk).
+    """
+    reference_module, cached_module = _module(0), _module(0)
+    inputs = torch.randn(11, 5, dtype=torch.float64)
+    for module in (reference_module, cached_module):
+        (module(inputs) ** 2).sum().backward()
+    reference_norm = torch.nn.utils.clip_grad_norm_(reference_module.parameters(), 0.1)
+    cached_norm = torch.nn.utils.clip_grad_norm_(parameter_list(cached_module), 0.1)
+    assert torch.equal(cached_norm, reference_norm)
+    for reference, cached in zip(
+        reference_module.parameters(), cached_module.parameters()
+    ):
+        assert torch.equal(cached.grad, reference.grad)
+    listed = parameter_list(cached_module)
+    assert listed is parameter_list(cached_module)
+    assert all(a is b for a, b in zip(listed, cached_module.parameters()))
+    # Moving the model replaces parameter data, not the parameter objects.
+    cached_module.float()
+    assert all(
+        a is b
+        for a, b in zip(parameter_list(cached_module), cached_module.parameters())
+    )

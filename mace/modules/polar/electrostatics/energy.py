@@ -139,7 +139,7 @@ class GTOElectrostaticEnergy(torch.nn.Module):
         k_vectors: torch.Tensor,
         k_norm2: torch.Tensor,
         k_vector_batch: torch.Tensor,
-        k0_mask: torch.Tensor,
+        excluded_k_mask: torch.Tensor,
         source_feats: torch.Tensor,
         node_positions: torch.Tensor,
         batch: torch.Tensor,
@@ -172,7 +172,7 @@ class GTOElectrostaticEnergy(torch.nn.Module):
             k_vectors=k_vectors,
             k_norm2=k_norm2,
             k_vector_batch=k_vector_batch,
-            k0_mask=k0_mask,
+            excluded_k_mask=excluded_k_mask,
             source_feats=source_feats,
             node_positions=node_positions,
             batch=batch,
@@ -226,7 +226,7 @@ class GTOElectrostaticEnergy(torch.nn.Module):
         k_vectors: torch.Tensor,
         k_norm2: torch.Tensor,
         k_vector_batch: torch.Tensor,
-        k0_mask: torch.Tensor,
+        excluded_k_mask: torch.Tensor,
         source_feats: torch.Tensor,
         node_positions: torch.Tensor,
         batch: torch.Tensor,
@@ -240,7 +240,7 @@ class GTOElectrostaticEnergy(torch.nn.Module):
         cosines = torch.cos(inner_products) * mask_f
         sines = torch.sin(inner_products) * mask_f
 
-        density_basis_fs = self.density_basis(k_vectors, k_norm2, k0_mask)
+        density_basis_fs = self.density_basis(k_vectors, k_norm2, excluded_k_mask)
         volume_per_k = volume.reshape(-1)[k_vector_batch]
         density = assemble_fourier_series_batch(
             source_feats=source_feats,
@@ -250,7 +250,7 @@ class GTOElectrostaticEnergy(torch.nn.Module):
             volume_per_k=volume_per_k,
         )
 
-        k_factor_coulomb = compute_coulomb_factor(k_norm2, k0_mask)
+        k_factor_coulomb = compute_coulomb_factor(k_norm2, excluded_k_mask)
         potential = apply_coulomb_kernel_batch(
             density=density,
             k_factor_coulomb=k_factor_coulomb,
@@ -274,7 +274,7 @@ class GTOElectrostaticEnergy(torch.nn.Module):
         k_vectors: torch.Tensor,
         k_norm2: torch.Tensor,
         k_vector_batch: torch.Tensor,
-        k0_mask: torch.Tensor,
+        excluded_k_mask: torch.Tensor,
         source_feats: torch.Tensor,
         node_positions: torch.Tensor,
         batch: torch.Tensor,
@@ -293,7 +293,7 @@ class GTOElectrostaticEnergy(torch.nn.Module):
         k_vectors: torch.Tensor,
         k_norm2: torch.Tensor,
         k_vector_batch: torch.Tensor,
-        k0_mask: torch.Tensor,
+        excluded_k_mask: torch.Tensor,
         source_feats: torch.Tensor,
         node_positions: torch.Tensor,
         batch: torch.Tensor,
@@ -304,7 +304,7 @@ class GTOElectrostaticEnergy(torch.nn.Module):
             k_vectors=k_vectors,
             k_norm2=k_norm2,
             k_vector_batch=k_vector_batch,
-            k0_mask=k0_mask,
+            excluded_k_mask=excluded_k_mask,
             source_feats=source_feats,
             node_positions=node_positions,
             batch=batch,
@@ -316,7 +316,7 @@ class GTOElectrostaticEnergy(torch.nn.Module):
         k_vectors: torch.Tensor,
         k_norm2: torch.Tensor,
         k_vector_batch: torch.Tensor,
-        k0_mask: torch.Tensor,
+        excluded_k_mask: torch.Tensor,
         source_feats: torch.Tensor,
         node_positions: torch.Tensor,
         batch: torch.Tensor,
@@ -333,7 +333,7 @@ class GTOElectrostaticEnergy(torch.nn.Module):
                 k_vectors=k_vectors,
                 k_norm2=k_norm2,
                 k_vector_batch=k_vector_batch,
-                k0_mask=k0_mask,
+                excluded_k_mask=excluded_k_mask,
                 source_feats=source_feats,
                 node_positions=node_positions,
                 batch=batch,
@@ -344,7 +344,7 @@ class GTOElectrostaticEnergy(torch.nn.Module):
             k_vectors=k_vectors,
             k_norm2=k_norm2,
             k_vector_batch=k_vector_batch,
-            k0_mask=k0_mask,
+            excluded_k_mask=excluded_k_mask,
             source_feats=source_feats,
             node_positions=node_positions,
             batch=batch,
