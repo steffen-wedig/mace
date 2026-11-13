@@ -135,7 +135,9 @@ def padded_training_loader(args, train_set, real_space_pairs: bool):
         bucket_count=args.padding_buckets,
         cost_model=StepCostModel(per_node, per_edge, per_pair),
         real_space_pairs=real_space_pairs,
-        seed=args.seed,
+        # A fixed sampling seed, not --seed: the budgets are a property of the training set,
+        # and runs that differ only in their data order then share the compiled graphs of
+        # the Inductor cache instead of compiling every budget again.
     )
     for budget in plan.budgets:
         logging.info(f"Padding budget: {budget}")
