@@ -14,8 +14,20 @@ import torch
 from e3nn import nn, o3
 from e3nn.util.jit import compile_mode
 
-from mace.modules.blocks import GeneralNonLinearBiasReadoutBlock
+from mace.modules.blocks import (
+    GeneralNonLinearBiasReadoutBlock,
+    rows_from_element_table,
+)
 from mace.modules.irreps_tools import tp_out_irreps_with_instructions
+from mace.modules.linear_folds import (
+    FoldedLinearInput,
+    LinearFold,
+    SegmentProduct,
+    folded_linear_input,
+    linear_fold,
+    path_dimension,
+    path_matrix,
+)
 from mace.modules.radial import RadialMLP
 
 from .wrapper_ops import (
@@ -29,7 +41,9 @@ from .wrapper_ops import (
 
 
 def _use_layout_native_linears(
-    block: torch.nn.Module, linear_names: Tuple[str, ...], transpose_names: Tuple[str, ...]
+    block: torch.nn.Module,
+    linear_names: Tuple[str, ...],
+    transpose_names: Tuple[str, ...],
 ) -> None:
     """Replace a block's e3nn linears by linears in the cueq layout, with the same
     parameters (transplanted), and drop the layout transposes that surrounded them.
@@ -44,7 +58,9 @@ def _use_layout_native_linears(
     for name in linear_names:
         linear = getattr(block, name)
         if isinstance(linear, o3.Linear):
-            setattr(block, name, LayoutNativeLinear.from_e3nn(linear, block.cueq_config))
+            setattr(
+                block, name, LayoutNativeLinear.from_e3nn(linear, block.cueq_config)
+            )
     for name in transpose_names:
         setattr(block, name, None)
 
@@ -156,6 +172,7 @@ class AgnosticChargeBiasedLinearPotentialEmbedding(
         self.charge_embedding = field_linear(
             self.charges_irreps, self.node_feats_irreps, self.cueq_config
         )
+        self.prepare_linear_folds()
         if cueq_handles_linears(self.cueq_config):
             self._potential_to_mul_ir = None
             self._node_feats_to_mul_ir = None
@@ -223,6 +240,44 @@ class AgnosticChargeBiasedLinearPotentialEmbedding(
             charges_emb = node_feats_from_mul_ir(charges_emb)
 
         return potential_emb + node_feats_emb + charges_emb
+
+    def prepare_linear_folds(self) -> None:
+        self.potential_linear_fold = linear_fold(
+            self.potential_irreps, self.node_feats_irreps, biases=False
+        )
+        self.node_feats_linear_fold = linear_fold(
+            self.node_feats_irreps, self.node_feats_irreps, biases=False
+        )
+        self.charge_embedding_fold = linear_fold(
+            self.charges_irreps, self.node_feats_irreps, biases=False
+        )
+
+    def folded_inputs(
+        self,
+        potential_feats: torch.Tensor,
+        node_feats: Optional[torch.Tensor],
+        local_charges: torch.Tensor,
+    ) -> List[FoldedLinearInput]:
+        """The three linears of ``forward`` (whose outputs it sums) as inputs of
+        ``SparseUvuTensorProduct.forward_folded``: inputs in the model layout, no layout
+        transposes, no linear evaluated. Without ``node_feats`` the node-feature linear
+        is left out (its folded terms are evaluated by the caller)."""
+        inputs = [
+            folded_linear_input(
+                potential_feats, self.potential_linear, self.potential_linear_fold
+            ),
+            folded_linear_input(
+                local_charges, self.charge_embedding, self.charge_embedding_fold
+            ),
+        ]
+        if node_feats is not None:
+            inputs.insert(
+                1,
+                folded_linear_input(
+                    node_feats, self.node_feats_linear, self.node_feats_linear_fold
+                ),
+            )
+        return inputs
 
     def use_layout_native_linears(self) -> None:
         """Upgrade a block built with e3nn linears under cueq (older models)."""
@@ -439,6 +494,146 @@ class SparseUvuTensorProduct(torch.nn.Module):
             )
             w_offset += w_size
 
+    def _as_mul_ir(self, block: torch.Tensor, mul: int, dim: int) -> torch.Tensor:
+        if self.layout == "mul_ir":
+            return block.view(block.shape[0], mul, dim)
+        return block.view(block.shape[0], dim, mul).transpose(1, 2)
+
+    def folded_path_products(
+        self, linear_weight: torch.Tensor, fold: LinearFold
+    ) -> List[Tuple[int, SegmentProduct, torch.Tensor]]:
+        """The folded matrices of one linear (no biases) as segment products of its input.
+
+        Per invariant path p (index into the paths of this product) and per block M of the
+        linear that writes the path's x2 segment: the [k, u] matrix (W M)^T, so that
+        ``channels_last(y) @ (W M)^T`` is the [batch, 2l+1, u] term ``forward_folded`` adds
+        for this linear. Lets a caller evaluate the terms of several products that fold
+        linears of the same input in one matmul (``products_sharing_input``).
+        """
+        products: List[Tuple[int, SegmentProduct, torch.Tensor]] = []
+        for path_index, meta in enumerate(self._path_meta):
+            in2_start, w_start, w_stop, mode_code, mul1, mul2 = (
+                meta[2],
+                meta[6],
+                meta[7],
+                meta[9],
+                meta[10],
+                meta[11],
+            )
+            if mode_code != 0:
+                raise NotImplementedError(
+                    "folded products support invariant contractions (l x l -> 0) only"
+                )
+            weight = self.weight[w_start:w_stop].view(mul1, mul2)
+            for path in fold.paths:
+                if path.output_start != in2_start:
+                    continue
+                matrix = torch.matmul(path_matrix(linear_weight, path), weight.T)
+                products.append(
+                    (
+                        path_index,
+                        SegmentProduct(
+                            path.input_start,
+                            path.input_stop,
+                            path.input_multiplicity,
+                            path_dimension(path),
+                        ),
+                        matrix,
+                    )
+                )
+        return products
+
+    def forward_folded(
+        self,
+        x1: torch.Tensor,
+        folded_inputs: List[FoldedLinearInput],
+        path_terms: Optional[List[Optional[torch.Tensor]]] = None,
+    ) -> torch.Tensor:
+        """``self(x1, sum_i linear_i(y_i))`` without evaluating the linears.
+
+        Only for invariant contractions (l x l -> 0). Per path, with the product weight
+        W [u, v] and a linear's block M [v, k] (y's k channels to the v channels of x2):
+        W (M y + b) = (W M) y + W b. The [u, k] matrices of all inputs are concatenated
+        and applied in one product; the [batch, v, 2l+1] outputs of the linears are never
+        formed. ``path_terms`` (per path, [batch, 2l+1, u] or None) are folded terms the
+        caller evaluated already (``folded_path_products``). Exact up to the order of
+        summation.
+        """
+        if x1.ndim != 2:
+            raise ValueError(
+                "SparseUvuTensorProduct expects flattened 2D tensors with shape [batch, irreps.dim]"
+            )
+        batch = x1.shape[0]
+        out = x1.new_zeros((batch, self.output_dimension))
+        for path_index, (
+            in1_start,
+            in1_stop,
+            in2_start,
+            _in2_stop,
+            out_start,
+            out_stop,
+            w_start,
+            w_stop,
+            path_weight,
+            mode_code,
+            mul1,
+            mul2,
+            d1,
+        ) in enumerate(self._path_meta):
+            if mode_code != 0:
+                raise NotImplementedError(
+                    "forward_folded supports invariant contractions (l x l -> 0) only"
+                )
+            weight = self.weight[w_start:w_stop].view(mul1, mul2)
+            matrices: List[torch.Tensor] = []
+            inputs: List[torch.Tensor] = []
+            constant: Optional[torch.Tensor] = None
+            for y, linear_weight, linear_bias, fold in folded_inputs:
+                for path in fold.paths:
+                    if path.output_start != in2_start:
+                        continue
+                    matrices.append(
+                        torch.matmul(weight, path_matrix(linear_weight, path).T)
+                    )
+                    inputs.append(
+                        self._as_mul_ir(
+                            y[:, path.input_start : path.input_stop],
+                            path.input_multiplicity,
+                            d1,
+                        )
+                    )
+                if linear_bias is not None:
+                    for bias in fold.biases:
+                        if bias.output_start != in2_start:
+                            continue
+                        # Biases sit on scalar outputs only (d1 == 1).
+                        term = torch.matmul(
+                            weight, linear_bias[bias.bias_start : bias.bias_stop]
+                        )
+                        constant = term if constant is None else constant + term
+            weighted: Optional[torch.Tensor] = None
+            if matrices:
+                weighted = torch.einsum(
+                    "uk,bkd->bud", torch.cat(matrices, dim=1), torch.cat(inputs, dim=1)
+                )
+            if path_terms is not None and path_terms[path_index] is not None:
+                term = path_terms[path_index].transpose(1, 2)
+                weighted = term if weighted is None else weighted + term
+            if constant is not None:
+                weighted = (
+                    constant.view(1, mul1, 1).expand(batch, mul1, d1)
+                    if weighted is None
+                    else weighted + constant.view(1, mul1, 1)
+                )
+            if weighted is None:
+                continue
+            x1v = self._as_mul_ir(x1[:, in1_start:in1_stop], mul1, d1)
+            mixed = (x1v * weighted).sum(dim=-1) / math.sqrt(float(d1))
+            out[:, out_start:out_stop] = (
+                out[:, out_start:out_stop] + path_weight * mixed
+            )
+        return out * self.output_mask
+
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         if x1.ndim != 2 or x2.ndim != 2:
             raise ValueError(
@@ -602,6 +797,43 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
             cueq_config=self.cueq_config,
         )
 
+    def _nonlinearity_first_layer(
+        self, invariant_descriptors: torch.Tensor, node_attrs: torch.Tensor
+    ) -> torch.Tensor:
+        """First Linear of ``nonlinearity`` on [invariants, source_embedding(node_attrs)].
+
+        The embedding is linear without bias, so its columns of the first layer act through
+        a table with one row per element, source_embedding(I) W_s^T (weights only),
+        expanded per node; no concatenation, no per-node embedding product. Exact up to the
+        order of summation.
+        """
+        first = self.nonlinearity.net[0]
+        invariant_width = invariant_descriptors.shape[-1]
+        identity = torch.eye(
+            node_attrs.shape[-1], dtype=node_attrs.dtype, device=node_attrs.device
+        )
+        source_table = torch.matmul(
+            self.source_embedding(identity), first.weight[:, invariant_width:].T
+        )
+        return torch.nn.functional.linear(
+            invariant_descriptors, first.weight[:, :invariant_width], first.bias
+        ) + rows_from_element_table(node_attrs, source_table)
+
+    def node_feats_products(
+        self,
+    ) -> Optional[List[Tuple[int, SegmentProduct, torch.Tensor]]]:
+        """The dot products' folded terms of the node features (they do not depend on the
+        field): per dot-product path, the segment product of ``node_feats``. None when the
+        embedding is not a sum of linears. The update blocks of all recursion steps read
+        the same ``node_feats``, so the caller evaluates their terms in one matmul per
+        segment and passes them back as ``node_feats_terms``."""
+        embedding = self.potential_embedding
+        if not isinstance(embedding, AgnosticChargeBiasedLinearPotentialEmbedding):
+            return None
+        return self.dot_products.folded_path_products(
+            embedding.node_feats_linear.weight, embedding.node_feats_linear_fold
+        )
+
     def forward(
         self,
         node_attrs: torch.Tensor,
@@ -611,20 +843,31 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
         edge_index: torch.Tensor,
         potential_features: torch.Tensor,
         local_charges: torch.Tensor,
+        node_feats_terms: Optional[List[Optional[torch.Tensor]]] = None,
     ) -> torch.Tensor:
-        # create pot feats
-        mixed_feats = self.potential_embedding(
-            potential_features,
-            node_feats,
-            node_attrs,
-            local_charges,
+        embedding = self.potential_embedding
+        if isinstance(embedding, AgnosticChargeBiasedLinearPotentialEmbedding):
+            # The embedding is a sum of linears: fold them into the dot product.
+            invariant_descriptors = self.dot_products.forward_folded(
+                node_feats,
+                embedding.folded_inputs(
+                    potential_features,
+                    None if node_feats_terms is not None else node_feats,
+                    local_charges,
+                ),
+                path_terms=node_feats_terms,
+            )
+        else:
+            mixed_feats = embedding(
+                potential_features,
+                node_feats,
+                node_attrs,
+                local_charges,
+            )
+            invariant_descriptors = self.dot_products(node_feats, mixed_feats)
+        nonlin_feats = self.nonlinearity.net[1:](
+            self._nonlinearity_first_layer(invariant_descriptors, node_attrs)
         )
-        invariant_descriptors = self.dot_products(node_feats, mixed_feats)
-        source_embedding = self.source_embedding(node_attrs)
-        invariant_descriptors_embedded = torch.cat(
-            [invariant_descriptors, source_embedding], dim=-1
-        )
-        nonlin_feats = self.nonlinearity(invariant_descriptors_embedded)
         new_feats = self.tp_out(node_feats, nonlin_feats)
         readout_to_mul_ir = getattr(self, "_readout_to_mul_ir", None)
         readout_from_mul_ir = getattr(self, "_readout_from_mul_ir", None)
@@ -701,34 +944,8 @@ class OneBodyMLPFieldReadout(PostScfReadout):
         self.linear_up_v = field_linear(
             self.potential_irreps, self.node_feats_irreps, self.cueq_config, biases=True
         )
-        if cueq_handles_linears(self.cueq_config):
-            self._q_to_mul_ir = None
-            self._v_to_mul_ir = None
-            self._up_from_mul_ir = None
-        else:
-            layout_str = (
-                self.cueq_config.layout_str
-                if (self.cueq_config is not None and self.cueq_config.enabled)
-                else "mul_ir"
-            )
-            self._q_to_mul_ir = TransposeIrrepsLayoutWrapper(
-                irreps=self.charges_irreps,
-                source=layout_str,
-                target="mul_ir",
-                cueq_config=self.cueq_config,
-            )
-            self._v_to_mul_ir = TransposeIrrepsLayoutWrapper(
-                irreps=self.potential_irreps,
-                source=layout_str,
-                target="mul_ir",
-                cueq_config=self.cueq_config,
-            )
-            self._up_from_mul_ir = TransposeIrrepsLayoutWrapper(
-                irreps=self.node_feats_irreps,
-                source="mul_ir",
-                target=layout_str,
-                cueq_config=self.cueq_config,
-            )
+        # The linears are folded into the dot products (forward): no layout transposes.
+        self.prepare_linear_folds()
         new_instructions = instructions_for_sparse_tp(
             self.node_feats_irreps, self.node_feats_irreps, invar_irreps
         )
@@ -773,30 +990,38 @@ class OneBodyMLPFieldReadout(PostScfReadout):
         charges_0: torch.Tensor,
         charges_induced: torch.Tensor,
     ):
-        q_in = charges_induced + charges_0
-        q_to_mul_ir = getattr(self, "_q_to_mul_ir", None)
-        v_to_mul_ir = getattr(self, "_v_to_mul_ir", None)
-        up_from_mul_ir = getattr(self, "_up_from_mul_ir", None)
-        if q_to_mul_ir is not None:
-            q_in = q_to_mul_ir(q_in)
-        q_up = self.linear_up_q(q_in)
-        if up_from_mul_ir is not None:
-            q_up = up_from_mul_ir(q_up)
-
-        v_in = field_feats
-        if v_to_mul_ir is not None:
-            v_in = v_to_mul_ir(v_in)
-        v_up = self.linear_up_v(v_in)
-        if up_from_mul_ir is not None:
-            v_up = up_from_mul_ir(v_up)
+        charges = charges_induced + charges_0
+        # dot(x, linear_up(y)) with each linear folded into the dot-product weights.
         invar_feats = torch.cat(
             [
-                self.dot_products_q(node_feats, q_up),
-                self.dot_products_v(node_feats, v_up),
+                self.dot_products_q.forward_folded(
+                    node_feats,
+                    [
+                        folded_linear_input(
+                            charges, self.linear_up_q, self.linear_up_q_fold
+                        )
+                    ],
+                ),
+                self.dot_products_v.forward_folded(
+                    node_feats,
+                    [
+                        folded_linear_input(
+                            field_feats, self.linear_up_v, self.linear_up_v_fold
+                        )
+                    ],
+                ),
             ],
             dim=-1,
         )
         return self.mlp(invar_feats).squeeze(-1)
+
+    def prepare_linear_folds(self) -> None:
+        self.linear_up_q_fold = linear_fold(
+            self.charges_irreps, self.node_feats_irreps, biases=True
+        )
+        self.linear_up_v_fold = linear_fold(
+            self.potential_irreps, self.node_feats_irreps, biases=True
+        )
 
     def use_layout_native_linears(self) -> None:
         """Upgrade a block built with e3nn linears under cueq (older models)."""

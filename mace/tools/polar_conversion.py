@@ -102,5 +102,9 @@ def convert_polar_model(model, pbc_handling: str = "auto"):
         upgrade = getattr(module, "use_layout_native_linears", None)
         if upgrade is not None:
             upgrade()
+        # Fold metadata of the field linears (models built before the folds).
+        prepare = getattr(module, "prepare_linear_folds", None)
+        if prepare is not None:
+            prepare()
     model.set_electrostatic_pbcs(pbc_handling)
     return model

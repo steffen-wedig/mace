@@ -111,7 +111,13 @@ class NonLinearReadoutBlock(torch.nn.Module):
     def forward(
         self, x: torch.Tensor, heads: Optional[torch.Tensor] = None
     ) -> torch.Tensor:  # [n_nodes, irreps]  # [..., ]
-        x = self.non_linearity(self.linear_1(x))
+        return self.forward_from_hidden(self.linear_1(x), heads)
+
+    def forward_from_hidden(
+        self, hidden: torch.Tensor, heads: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """The readout from ``linear_1(x)`` (evaluated by the caller)."""
+        x = self.non_linearity(hidden)
         if hasattr(self, "num_heads"):
             if self.num_heads > 1 and heads is not None:
                 x = mask_head(x, heads, self.num_heads)
@@ -1408,8 +1414,24 @@ class RealAgnosticAttResidualInteractionBlock(InteractionBlock):
         )  # [n_nodes, channels, (lmax + 1)**2]
 
 
+def rows_from_element_table(
+    node_attrs: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    """node_attrs @ table for a table with one row per element, as a multiply and a sum
+    over the (few) elements: Inductor fuses it with its neighbours, where a matmul with a
+    contraction length of 4 would be a separate GEMM kernel (and its weight gradient a
+    split-K GEMM over the nodes)."""
+    return (node_attrs.unsqueeze(-1) * table.unsqueeze(0)).sum(dim=1)
+
+
 @compile_mode("script")
 class RealAgnosticResidualNonLinearInteractionBlock(InteractionBlock):
+    # PolarMACE passes the element-embedding table to the first layer (node_feats_table)
+    # and, to later layers, skip_tp and linear_up evaluated together with the other
+    # linears of the previous layer's output (skip_and_up).
+    accepts_node_feats_table = True
+    accepts_skip_and_up = True
+
     def _setup(self) -> None:
         if not hasattr(self, "cueq_config"):
             self.cueq_config = None
@@ -1525,6 +1547,52 @@ class RealAgnosticResidualNonLinearInteractionBlock(InteractionBlock):
         self.alpha = torch.nn.Parameter(torch.tensor(20.0), requires_grad=True)
         self.beta = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
+    def _radial_first_layers(
+        self,
+        radial_feats: torch.Tensor,
+        node_attrs: torch.Tensor,
+        edge_index: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """First Linear of conv_tp_weights and of density_fn on
+        [radial_feats, s[sender], t[receiver]], s = source_embedding(node_attrs),
+        t = target_embedding(node_attrs).
+
+        Both MLPs read the same edge input. Its embedding columns are not multiplied per
+        edge (E rows, E/N ~ 30):
+        W [r; s[sender]; t[receiver]] + c = W_r r + (s W_s^T)[sender] + (t W_t^T)[receiver] + c,
+        and s W_s^T = node_attrs (source_embedding(I) W_s^T) because the embedding is linear
+        without bias: a table with one row per element (weights only), expanded per node and
+        gathered to the edges. Exact up to the order of summation; one product per part for
+        both MLPs.
+        """
+        first_layers = (self.conv_tp_weights.net[0], self.density_fn.net[0])
+        weight = torch.cat([layer.weight for layer in first_layers], dim=0)
+        bias = torch.cat([layer.bias for layer in first_layers], dim=0)
+        identity = torch.eye(
+            node_attrs.shape[-1], dtype=node_attrs.dtype, device=node_attrs.device
+        )
+        source_rows = self.source_embedding(identity)
+        target_rows = self.target_embedding(identity)
+        radial_width = radial_feats.shape[-1]
+        source_width = source_rows.shape[-1]
+        source_columns = weight[:, radial_width : radial_width + source_width]
+        target_columns = weight[:, radial_width + source_width :]
+        source_projection = rows_from_element_table(
+            node_attrs, torch.matmul(source_rows, source_columns.T)
+        )
+        target_projection = rows_from_element_table(
+            node_attrs, torch.matmul(target_rows, target_columns.T)
+        )
+        hidden = (
+            torch.nn.functional.linear(radial_feats, weight[:, :radial_width], bias)
+            + source_projection[edge_index[0]]
+            + target_projection[edge_index[1]]
+        )
+        tp_weights_hidden, density_hidden = hidden.split(
+            [layer.out_features for layer in first_layers], dim=-1
+        )
+        return tp_weights_hidden, density_hidden
+
     def forward(
         self,
         node_attrs: torch.Tensor,
@@ -1536,12 +1604,29 @@ class RealAgnosticResidualNonLinearInteractionBlock(InteractionBlock):
         lammps_class: Optional[Any] = None,
         lammps_natoms: Tuple[int, int] = (0, 0),
         first_layer: bool = False,
+        node_feats_table: Optional[torch.Tensor] = None,
+        skip_and_up: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        num_nodes = node_feats.shape[0]
+        num_nodes = node_attrs.shape[0]
         n_real = lammps_natoms[0] if lammps_class is not None else None
-        sc = self.skip_tp(node_feats)
-        node_feats = self.linear_up(node_feats)
-        node_feats_res = self.linear_res(node_feats)
+        if node_feats_table is not None:
+            # First layer: node_feats = node_attrs @ node_feats_table (the element
+            # embedding). skip_tp, linear_up and linear_res are linear without biases, so
+            # they are evaluated on the table's rows (one per element) and expanded per node.
+            sc = rows_from_element_table(node_attrs, self.skip_tp(node_feats_table))
+            up_table = self.linear_up(node_feats_table)
+            node_feats = rows_from_element_table(node_attrs, up_table)
+            node_feats_res = rows_from_element_table(
+                node_attrs, self.linear_res(up_table)
+            )
+        elif skip_and_up is not None:
+            # skip_tp(node_feats) and linear_up(node_feats), evaluated by the caller.
+            sc, node_feats = skip_and_up
+            node_feats_res = self.linear_res(node_feats)
+        else:
+            sc = self.skip_tp(node_feats)
+            node_feats = self.linear_up(node_feats)
+            node_feats_res = self.linear_res(node_feats)
         node_feats_attrs = torch.cat(
             [node_feats, node_attrs],
             dim=-1,
@@ -1554,19 +1639,12 @@ class RealAgnosticResidualNonLinearInteractionBlock(InteractionBlock):
         )
         node_feats = node_feats_attrs[:, : node_feats.shape[-1]]
         node_attrs = node_feats_attrs[:, node_feats.shape[-1] :]
-        source_embedding = self.source_embedding(node_attrs)
-        target_embedding = self.target_embedding(node_attrs)
-        edge_feats = torch.cat(
-            [
-                edge_feats,
-                source_embedding[edge_index[0]],
-                target_embedding[edge_index[1]],
-            ],
-            dim=-1,
+        tp_weights_hidden, density_hidden = self._radial_first_layers(
+            edge_feats, node_attrs, edge_index
         )
-        tp_weights = self.conv_tp_weights(edge_feats)
+        tp_weights = self.conv_tp_weights.net[1:](tp_weights_hidden)
 
-        edge_density = torch.tanh(self.density_fn(edge_feats) ** 2)
+        edge_density = torch.tanh(self.density_fn.net[1:](density_hidden) ** 2)
         if cutoff is not None:
             tp_weights = tp_weights * cutoff
             edge_density = edge_density * cutoff

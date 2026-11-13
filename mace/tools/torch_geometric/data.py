@@ -161,8 +161,15 @@ class Data(object):
         their attribute names and content.
         If :obj:`*keys` is not given this method will iterative over all
         present attributes."""
-        for key in sorted(self.keys) if not keys else keys:
-            if key in self:
+        # The present keys once: `key in self` lists every attribute per key.
+        present = self.keys
+        if not keys:
+            for key in sorted(present):
+                yield key, self[key]
+            return
+        present = set(present)
+        for key in keys:
+            if key in present:
                 yield key, self[key]
 
     def __cat_dim__(self, key, value):

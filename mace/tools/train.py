@@ -396,7 +396,10 @@ def train(
                     # Plain copy before valid_err_log fills the defaultdict with
                     # placeholders for the metrics the error table asks for.
                     selection_metrics = dict(eval_metrics)
-                    if loss_term_instrumentation is not None and term_accumulator is not None:
+                    if (
+                        loss_term_instrumentation is not None
+                        and term_accumulator is not None
+                    ):
                         loss_term_instrumentation.write_validation_summary(
                             term_accumulator, head=valid_loader_name, epoch=epoch
                         )
@@ -549,6 +552,7 @@ def train_one_epoch(
         # Sum of |loss| over the epoch, on the device: an epoch whose every batch has an
         # exactly zero loss trains nothing (no entry reaches a weighted term) and is refused.
         epoch_loss_magnitude: Optional[torch.Tensor] = None
+        pending_metrics: Optional[StepMetrics] = None
         for batch in data_loader:
             if loss_term_instrumentation is not None:
                 loss_term_instrumentation.before_train_step(
@@ -558,7 +562,7 @@ def train_one_epoch(
                     output_args=output_args,
                     epoch=epoch,
                 )
-            loss, opt_metrics = take_step(
+            loss, step_metrics = take_step(
                 model=model_to_train,
                 loss_fn=loss_fn,
                 batch=batch,
@@ -578,10 +582,14 @@ def train_one_epoch(
             if loss_term_instrumentation is not None:
                 # The loss call inside `take_step` left its term statistics behind.
                 loss_term_instrumentation.after_train_step(loss_fn)
-            opt_metrics["mode"] = "opt"
-            opt_metrics["epoch"] = epoch
             if rank == 0:
-                logger.log(opt_metrics)
+                # The previous step's loss, read now that this step is queued: the host
+                # never waits for the step it has just launched.
+                if pending_metrics is not None:
+                    pending_metrics.log(logger, epoch)
+                pending_metrics = step_metrics
+        if pending_metrics is not None:
+            pending_metrics.log(logger, epoch)
         if loss_term_instrumentation is not None:
             loss_term_instrumentation.finish_train_epoch(epoch)
         require_nonzero_epoch_loss(epoch_loss_magnitude, epoch, loss_fn)
@@ -592,7 +600,8 @@ def require_nonzero_epoch_loss(
 ) -> None:
     """Refuse an epoch whose training loss was exactly zero on every batch: no entry of the
     training set reaches a weighted loss term (for example ``interaction_huber`` frame terms
-    on aperiodic data), so the gradients are zero and only weight decay moves the model."""
+    on aperiodic data), so the gradients are zero and only weight decay moves the model.
+    """
     if epoch_loss_magnitude is None:
         raise RuntimeError(f"epoch {epoch}: the training loader yielded no batch")
     if float(epoch_loss_magnitude) == 0.0:
@@ -601,6 +610,38 @@ def require_nonzero_epoch_loss(
             "no training entry reaches a weighted loss term (check the loss against the "
             "data: periodicity, record format, term weights)"
         )
+
+
+class StepMetrics:
+    """The logged values of one training step, read without stalling the device.
+
+    The loss is copied to (pinned) host memory behind the step's own work and a CUDA event
+    marks the copy; ``log`` waits for that event only. Logged after the next step has been
+    queued, the host prepares and launches step k+1 while the device still runs step k.
+    ``time`` is the host time of ``take_step`` (it was the device time while every step
+    ended by waiting for its loss).
+    """
+
+    def __init__(self, loss: torch.Tensor, host_seconds: float):
+        self.host_seconds = host_seconds
+        self.ready: Optional[torch.cuda.Event] = None
+        if loss.is_cuda:
+            self.loss = loss.detach().to("cpu", non_blocking=True)
+            self.ready = torch.cuda.Event()
+            self.ready.record()
+        else:
+            self.loss = loss.detach()
+
+    def as_dict(self) -> Dict[str, Any]:
+        if self.ready is not None:
+            self.ready.synchronize()
+        return {"loss": to_numpy(self.loss), "time": self.host_seconds}
+
+    def log(self, logger: MetricsLogger, epoch: int) -> None:
+        metrics = self.as_dict()
+        metrics["mode"] = "opt"
+        metrics["epoch"] = epoch
+        logger.log(metrics)
 
 
 def take_step(
@@ -613,9 +654,10 @@ def take_step(
     max_grad_norm: Optional[float],
     device: torch.device,
     compiled_loss: Optional[Callable[..., torch.Tensor]] = None,
-) -> Tuple[float, Dict[str, Any]]:
+) -> Tuple[torch.Tensor, StepMetrics]:
     start_time = time.time()
-    batch = batch.to(device)
+    # Pinned batches (the loaders' pin_memory) are copied without blocking the host.
+    batch = batch.to(device, non_blocking=True)
     batch_dict = batch.to_dict()
 
     def closure():
@@ -639,12 +681,7 @@ def take_step(
     if ema is not None:
         ema.update()
 
-    loss_dict = {
-        "loss": to_numpy(loss),
-        "time": time.time() - start_time,
-    }
-
-    return loss, loss_dict
+    return loss, StepMetrics(loss, time.time() - start_time)
 
 
 def take_step_lbfgs(
@@ -861,7 +898,9 @@ class MACELoss(Metric):
         # Periodic frames only (pbc and, on cluster records, sign +1): the configurations
         # the frame terms of InteractionHuberLoss train on. The plain E/F metrics above also
         # count in-place monomers, which inherit the frame weights.
-        self.add_state("frames_computed", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state(
+            "frames_computed", default=torch.tensor(0.0), dist_reduce_fx="sum"
+        )
         self.add_state("delta_es_per_atom_frames", default=[], dist_reduce_fx="cat")
         self.add_state("delta_fs_frames", default=[], dist_reduce_fx="cat")
 

@@ -1,7 +1,7 @@
 # pylint: disable=too-many-lines  # magnetic MACE variants live here
 import logging
 from abc import abstractmethod
-from typing import Any, Callable, Dict, List, Optional, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import torch
@@ -38,6 +38,15 @@ from mace.modules.blocks import (
     NonLinearReadoutBlock,
 )
 from mace.modules.embeddings import GenericJointEmbedding
+from mace.modules.linear_folds import (
+    LayerOutputLinears,
+    LinearFold,
+    SegmentProduct,
+    SharedInputPlan,
+    evaluate_linears_sharing_input,
+    linear_fold_of,
+    products_sharing_input,
+)
 from mace.modules.models import ScaleShiftMACE
 from mace.modules.utils import compute_polarizability as _compute_polarizability
 from mace.modules.utils import (
@@ -51,6 +60,7 @@ from mace.modules.wrapper_ops import (
     CuEquivarianceConfig,
     OEQConfig,
     TransposeIrrepsLayoutWrapper,
+    cueq_handles_linears,
 )
 from mace.tools.polar_conversion import (
     ensure_polar_compatibility,
@@ -69,6 +79,7 @@ from .blocks import (
     RadialEmbeddingBlock,
     ScaleShiftBlock,
 )
+from .boundary_split import forward_by_boundary, graph_periodicity
 from .field_blocks import (
     EnvironmentDependentSpinSourceBlock,
     MultiLayerFeatureMixer,
@@ -77,7 +88,6 @@ from .field_blocks import (
 )
 from .radial import ZBLBasis
 from .utils import get_edge_vectors_and_lengths, get_symmetric_displacement
-from .boundary_split import forward_by_boundary, graph_periodicity
 
 
 def _copy_mace_readout(
@@ -969,6 +979,90 @@ class PolarMACE(ScaleShiftMACE):
             num_interactions=num_interactions,
             cueq_config=cueq_config,
         )
+        self.prepare_linear_folds()
+
+    def _readout_index(self, layer: int) -> int:
+        return -1 if len(self.readouts) == 1 else min(layer, len(self.readouts) - 1)
+
+    def prepare_linear_folds(self) -> None:
+        """Plan the linears that read the same tensor, evaluated as one product per irrep.
+
+        Each layer's output is read by the feature mixer's linear of that layer, by the
+        next interaction's ``skip_tp`` and ``linear_up`` and by the first linear of a
+        nonlinear readout; ``features_mixed`` by the node-feature linear of every
+        charge map (folded into its dot products). ``forward`` concatenates their weights
+        per input irrep and multiplies once (``evaluate_linears_sharing_input``): one
+        GEMM per irrep instead of one per linear, in the forward and in each backward.
+        Exact up to the order of summation. No plan (None) when the linears are e3nn
+        linears on cueq-layout features.
+        """
+        self.shared_input_plan: Optional[SharedInputPlan] = None
+        cueq_config = getattr(self, "cueq_config", None)
+        if cueq_handles_linears(cueq_config):
+            layout = cueq_config.layout_str
+        elif cueq_config is None or not cueq_config.enabled:
+            layout = "mul_ir"
+        else:
+            return
+        num_layers = len(self.interactions)
+        layers: List[LayerOutputLinears] = []
+        for layer in range(num_layers):
+            next_skip: Optional[LinearFold] = None
+            next_up: Optional[LinearFold] = None
+            if layer + 1 < num_layers and getattr(
+                self.interactions[layer + 1], "accepts_skip_and_up", False
+            ):
+                next_interaction = self.interactions[layer + 1]
+                next_skip = linear_fold_of(next_interaction.skip_tp)
+                next_up = linear_fold_of(next_interaction.linear_up)
+            readout = self.readouts[self._readout_index(layer)]
+            readout_first: Optional[LinearFold] = None
+            if isinstance(readout, NonLinearReadoutBlock):
+                readout_first = linear_fold_of(readout.linear_1)
+            layers.append(
+                LayerOutputLinears(
+                    mixer=linear_fold_of(self.layer_feature_mixer.linears[layer]),
+                    next_skip=next_skip,
+                    next_up=next_up,
+                    readout_first=readout_first,
+                )
+            )
+        self.shared_input_plan = SharedInputPlan(layout, layers)
+
+    def _charge_map_node_feats_terms(
+        self, features_mixed: torch.Tensor, layout: str
+    ) -> List[Optional[List[Optional[torch.Tensor]]]]:
+        """Per charge map, the folded node-feature terms of its dot products, all maps
+        in one matmul per irrep (the maps of the recursion steps read the same
+        ``features_mixed``; only their field inputs change from step to step)."""
+        maps = [
+            self.field_dependent_charges_maps[step]
+            for step in range(self.num_recursion_steps)
+        ]
+        requests: List[Tuple[SegmentProduct, torch.Tensor]] = []
+        owners: List[Tuple[int, int]] = []
+        for map_index, charge_map in enumerate(maps):
+            products_of = getattr(charge_map, "node_feats_products", None)
+            products = products_of() if products_of is not None else None
+            if products is None:
+                continue
+            if charge_map.dot_products.layout != layout:
+                raise ValueError("charge map layout differs from the model layout")
+            for path_index, segment, matrix in products:
+                requests.append((segment, matrix))
+                owners.append((map_index, path_index))
+        terms: List[Optional[List[Optional[torch.Tensor]]]] = [None] * len(maps)
+        if not requests:
+            return terms
+        results = products_sharing_input(features_mixed, layout, requests)
+        for (map_index, path_index), result in zip(owners, results):
+            map_terms = terms[map_index]
+            if map_terms is None:
+                map_terms = [None] * len(maps[map_index].dot_products._path_meta)
+                terms[map_index] = map_terms
+            existing = map_terms[path_index]
+            map_terms[path_index] = result if existing is None else existing + result
+        return terms
 
     def __setstate__(self, state):
         """Restore whole-model pickles, repairing known legacy electrostatic state."""
@@ -1158,12 +1252,38 @@ class PolarMACE(ScaleShiftMACE):
             dtype=vectors.dtype,
         )
 
+        # The first layer's input is linear in node_attrs: blocks that accept it get the
+        # element-embedding table (one row per element) and evaluate their first linears
+        # on it instead of on every node.
+        node_feats_table: Optional[torch.Tensor] = None
+        if getattr(self.interactions[0], "accepts_node_feats_table", False):
+            node_feats_table = self.node_embedding(
+                torch.eye(
+                    data["node_attrs"].shape[1],
+                    dtype=data["node_attrs"].dtype,
+                    device=data["node_attrs"].device,
+                )
+            )
+        # Linears that read the same tensor, one product per irrep (prepare_linear_folds).
+        shared_input_plan: Optional[SharedInputPlan] = getattr(
+            self, "shared_input_plan", None
+        )
+        if is_lammps:
+            shared_input_plan = None
+        mixer_terms: List[torch.Tensor] = []
+        skip_and_up: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         for i, (interaction, product, lr_src) in enumerate(
             zip(self.interactions, self.products, self.lr_source_maps)
         ):
             node_attrs_slice = data["node_attrs"]
             if is_lammps and i > 0:
                 node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]
+            interaction_kwargs = {}
+            if i == 0 and node_feats_table is not None:
+                interaction_kwargs.update(node_feats_table=node_feats_table)
+            if skip_and_up is not None:
+                interaction_kwargs.update(skip_and_up=skip_and_up)
+                skip_and_up = None
             node_feats, sc = interaction(
                 node_attrs=node_attrs_slice,
                 node_feats=node_feats,
@@ -1174,6 +1294,7 @@ class PolarMACE(ScaleShiftMACE):
                 first_layer=(i == 0),
                 lammps_class=lammps_class,
                 lammps_natoms=lammps_natoms,
+                **interaction_kwargs,
             )
             if is_lammps and i == 0:
                 node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]
@@ -1182,11 +1303,42 @@ class PolarMACE(ScaleShiftMACE):
             )
             node_feats_list.append(node_feats)
 
-            feat_idx = -1 if len(self.readouts) == 1 else min(i, len(self.readouts) - 1)
-            node_es = self.readouts[feat_idx](node_feats, node_heads)[
-                num_atoms_arange, node_heads
-            ]
-            node_es_list.append(node_es)
+            readout = self.readouts[self._readout_index(i)]
+            readout_hidden: Optional[torch.Tensor] = None
+            if shared_input_plan is not None:
+                layer_linears = shared_input_plan.layers[i]
+                linears = [self.layer_feature_mixer.linears[i]]
+                folds = [layer_linears.mixer]
+                if (
+                    layer_linears.next_skip is not None
+                    and layer_linears.next_up is not None
+                ):
+                    next_interaction = self.interactions[i + 1]
+                    linears.extend(
+                        [next_interaction.skip_tp, next_interaction.linear_up]
+                    )
+                    folds.extend([layer_linears.next_skip, layer_linears.next_up])
+                if layer_linears.readout_first is not None:
+                    linears.append(readout.linear_1)
+                    folds.append(layer_linears.readout_first)
+                outputs = evaluate_linears_sharing_input(
+                    node_feats, linears, folds, shared_input_plan.layout
+                )
+                mixer_terms.append(outputs[0])
+                position = 1
+                if (
+                    layer_linears.next_skip is not None
+                    and layer_linears.next_up is not None
+                ):
+                    skip_and_up = (outputs[1], outputs[2])
+                    position = 3
+                if layer_linears.readout_first is not None:
+                    readout_hidden = outputs[position]
+            if readout_hidden is not None:
+                node_es = readout.forward_from_hidden(readout_hidden, node_heads)
+            else:
+                node_es = readout(node_feats, node_heads)
+            node_es_list.append(node_es[num_atoms_arange, node_heads])
 
             spin_charge_sources = lr_src(node_feats).squeeze(-2)
             spin_charge_density = spin_charge_density + spin_charge_sources
@@ -1234,7 +1386,21 @@ class PolarMACE(ScaleShiftMACE):
         )
 
         # SCF fixed point
-        features_mixed = self.layer_feature_mixer(torch.stack(node_feats_list, dim=0))
+        if shared_input_plan is not None:
+            features_mixed = mixer_terms[0]
+            for term in mixer_terms[1:]:
+                features_mixed = features_mixed + term
+        else:
+            features_mixed = self.layer_feature_mixer(
+                torch.stack(node_feats_list, dim=0)
+            )
+        charge_map_node_feats_terms: List[Optional[List[Optional[torch.Tensor]]]] = [
+            None
+        ] * self.num_recursion_steps
+        if shared_input_plan is not None:
+            charge_map_node_feats_terms = self._charge_map_node_feats_terms(
+                features_mixed, shared_input_plan.layout
+            )
         spin_charge_density = spin_charge_density.view(
             spin_charge_density.shape[0], 2, -1
         )
@@ -1316,6 +1482,11 @@ class PolarMACE(ScaleShiftMACE):
             ) / self.field_feature_norms
             # [alpha features, beta features] along the last axis.
             potential_features = field_feats.reshape(num_nodes, -1)
+            charge_map_kwargs = {}
+            if charge_map_node_feats_terms[i] is not None:
+                charge_map_kwargs.update(
+                    node_feats_terms=charge_map_node_feats_terms[i]
+                )
             charge_sources_out = self.field_dependent_charges_maps[i](
                 node_attrs=data["node_attrs"],
                 node_feats=features_mixed,
@@ -1326,6 +1497,7 @@ class PolarMACE(ScaleShiftMACE):
                 local_charges=spin_charge_density.view(
                     spin_charge_density.shape[0], -1
                 ),
+                **charge_map_kwargs,
             )
 
             current_fukui_sources = charge_sources_out[:, -2:]

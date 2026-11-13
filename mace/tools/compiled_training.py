@@ -30,6 +30,7 @@ import torch
 import torch._dynamo
 
 from mace.tools import compile as mace_compile
+from mace.tools.small_matmuls import install_small_matmul_pass
 
 # Recompiles beyond this many are an error, not a silent fall-back to eager (reforge F6).
 RECOMPILE_LIMIT = 8
@@ -42,7 +43,9 @@ def configure_dynamo_for_training(recompile_limit: int = RECOMPILE_LIMIT) -> Non
     - Python floats specialised: model hyperparameters (smearing widths, cutoffs) stay
       constants under dynamic shapes instead of becoming symbolic;
     - a recompile beyond the limit raises instead of running eagerly (static shapes:
-      at least one graph per padding budget and loss, the SWA loss being a second one).
+      at least one graph per padding budget and loss, the SWA loss being a second one);
+    - small matrix products (≤ 4 outputs or a contraction over ≤ 8) as fused reductions
+      (``mace.tools.small_matmuls``), not as separate GEMM kernels.
     """
     import torch._dynamo  # noqa: PLC0415
 
@@ -50,6 +53,7 @@ def configure_dynamo_for_training(recompile_limit: int = RECOMPILE_LIMIT) -> Non
     torch._dynamo.config.specialize_float = True
     torch._dynamo.config.recompile_limit = recompile_limit
     torch._dynamo.config.fail_on_recompile_limit_hit = True
+    install_small_matmul_pass()
 
 
 class CompiledForceTrainingLoss:
