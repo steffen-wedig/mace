@@ -118,10 +118,18 @@ def select_graphs(
     edge_mask = node_mask[edge_index[0]]
     edge_indices = torch.nonzero(edge_mask, as_tuple=False).view(-1)
 
-    new_node_of_old = torch.full((num_nodes,), -1, dtype=torch.long, device=batch.device)
-    new_node_of_old[node_indices] = torch.arange(node_indices.numel(), device=batch.device)
-    new_graph_of_old = torch.full((num_graphs,), -1, dtype=torch.long, device=batch.device)
-    new_graph_of_old[graph_indices] = torch.arange(graph_indices.numel(), device=batch.device)
+    new_node_of_old = torch.full(
+        (num_nodes,), -1, dtype=torch.long, device=batch.device
+    )
+    new_node_of_old[node_indices] = torch.arange(
+        node_indices.numel(), device=batch.device
+    )
+    new_graph_of_old = torch.full(
+        (num_graphs,), -1, dtype=torch.long, device=batch.device
+    )
+    new_graph_of_old[graph_indices] = torch.arange(
+        graph_indices.numel(), device=batch.device
+    )
 
     sub: Dict[str, torch.Tensor] = {}
     sub["batch"] = new_graph_of_old[batch[node_indices]]
@@ -157,7 +165,11 @@ def select_graphs(
 
 
 def merge_outputs(
-    parts: Sequence[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Optional[torch.Tensor]]]],
+    parts: Sequence[
+        Tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Optional[torch.Tensor]]
+        ]
+    ],
     num_graphs: int,
     num_nodes: int,
     num_edges: int,
@@ -183,7 +195,8 @@ def merge_outputs(
             sub_nodes = node_indices.numel()
             sub_edges = edge_indices.numel()
             if key in PER_GRAPH_OUTPUT_KEYS or (
-                value.shape[0] == sub_graphs and value.shape[0] not in (sub_nodes, sub_edges)
+                value.shape[0] == sub_graphs
+                and value.shape[0] not in (sub_nodes, sub_edges)
             ):
                 target_size, target_indices = num_graphs, graph_indices
             elif value.shape[0] == sub_nodes:
@@ -217,7 +230,9 @@ def forward_by_boundary(
         if not bool(mask.any()):
             continue
         sub, graph_indices, node_indices, edge_indices = select_graphs(data, mask)
-        parts.append((graph_indices, node_indices, edge_indices, forward(sub, **kwargs)))
+        parts.append(
+            (graph_indices, node_indices, edge_indices, forward(sub, **kwargs))
+        )
     return merge_outputs(parts, num_graphs, num_nodes, num_edges)
 
 

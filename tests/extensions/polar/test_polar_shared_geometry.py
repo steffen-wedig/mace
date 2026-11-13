@@ -18,7 +18,7 @@ from e3nn import o3
 
 from mace import data
 from mace.modules import interaction_classes
-from mace.modules.boundary_split import select_graphs
+from mace.modules.polar.boundary_split import select_graphs
 from mace.tools import torch_geometric, utils
 from tests.helpers import GRAPH_LONGRANGE_AVAILABLE
 
@@ -33,7 +33,7 @@ ATOMIC_NUMBERS = [1, 6, 8]
 
 
 def _polar_model(dtype=torch.float64, cueq_config=None):
-    from mace.modules.extensions import PolarMACE  # noqa: PLC0415
+    from mace.modules.polar import PolarMACE  # noqa: PLC0415
 
     torch.manual_seed(3)
     return PolarMACE(
@@ -223,16 +223,16 @@ def test_shared_geometry_matches_separate_evaluation(pbc_handling, monkeypatch):
 def test_one_geometry_per_forward(monkeypatch):
     """One preparation per forward, with both kernel widths; the blocks never prepare
     their own."""
-    from graph_longrange.realspace_electrostatics import (  # noqa: PLC0415
+    from mace.modules.polar.electrostatics.realspace_electrostatics import (  # noqa: PLC0415
         RealSpaceAnalyticalElectrostaticFeatures,
         RealSpaceAnalyticalEnergy,
     )
 
-    from mace.modules import extensions  # noqa: PLC0415
+    from mace.modules.polar import model as polar_model_module  # noqa: PLC0415
 
     model = _polar_model()
     prepared = []
-    prepare = extensions.prepare_real_space_geometry
+    prepare = polar_model_module.prepare_real_space_geometry
 
     def counting_prepare(*args, **kwargs):
         geometry = prepare(*args, **kwargs)
@@ -242,7 +242,9 @@ def test_one_geometry_per_forward(monkeypatch):
     def refuse(*_, **__):
         raise AssertionError("a block prepared its own geometry")
 
-    monkeypatch.setattr(extensions, "prepare_real_space_geometry", counting_prepare)
+    monkeypatch.setattr(
+        polar_model_module, "prepare_real_space_geometry", counting_prepare
+    )
     monkeypatch.setattr(RealSpaceAnalyticalElectrostaticFeatures, "prepare", refuse)
     monkeypatch.setattr(RealSpaceAnalyticalEnergy, "prepare", refuse)
     model(_clone(_batch(_molecules())), training=True, compute_force=True)

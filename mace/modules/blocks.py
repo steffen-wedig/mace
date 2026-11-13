@@ -1426,11 +1426,10 @@ def rows_from_element_table(
 
 @compile_mode("script")
 class RealAgnosticResidualNonLinearInteractionBlock(InteractionBlock):
-    # PolarMACE passes the element-embedding table to the first layer (node_feats_table)
-    # and, to later layers, skip_tp and linear_up evaluated together with the other
-    # linears of the previous layer's output (skip_and_up).
-    accepts_node_feats_table = True
-    accepts_skip_and_up = True
+    # PolarMACE evaluates the first linears itself (first_linears): in the first layer
+    # from the element-embedding table, in later layers together with the other linears
+    # that read the previous layer's output.
+    accepts_first_linears = True
 
     def _setup(self) -> None:
         if not hasattr(self, "cueq_config"):
@@ -1593,6 +1592,26 @@ class RealAgnosticResidualNonLinearInteractionBlock(InteractionBlock):
         )
         return tp_weights_hidden, density_hidden
 
+    def first_linears(
+        self, node_feats: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(skip_tp(x), linear_up(x), linear_res(linear_up(x)))."""
+        up = self.linear_up(node_feats)
+        return self.skip_tp(node_feats), up, self.linear_res(up)
+
+    def first_linears_from_element_table(
+        self, node_attrs: torch.Tensor, node_feats_table: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``first_linears(node_attrs @ node_feats_table)`` for the first layer, whose
+        input is the element embedding: the linears have no biases, so they are
+        evaluated on the table's rows (one per element) and expanded per node."""
+        skip_table, up_table, residual_table = self.first_linears(node_feats_table)
+        return (
+            rows_from_element_table(node_attrs, skip_table),
+            rows_from_element_table(node_attrs, up_table),
+            rows_from_element_table(node_attrs, residual_table),
+        )
+
     def forward(
         self,
         node_attrs: torch.Tensor,
@@ -1604,29 +1623,15 @@ class RealAgnosticResidualNonLinearInteractionBlock(InteractionBlock):
         lammps_class: Optional[Any] = None,
         lammps_natoms: Tuple[int, int] = (0, 0),
         first_layer: bool = False,
-        node_feats_table: Optional[torch.Tensor] = None,
-        skip_and_up: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        first_linears: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``first_linears``: ``self.first_linears(node_feats)`` evaluated by the caller
+        (then ``node_feats`` is not read)."""
         num_nodes = node_attrs.shape[0]
         n_real = lammps_natoms[0] if lammps_class is not None else None
-        if node_feats_table is not None:
-            # First layer: node_feats = node_attrs @ node_feats_table (the element
-            # embedding). skip_tp, linear_up and linear_res are linear without biases, so
-            # they are evaluated on the table's rows (one per element) and expanded per node.
-            sc = rows_from_element_table(node_attrs, self.skip_tp(node_feats_table))
-            up_table = self.linear_up(node_feats_table)
-            node_feats = rows_from_element_table(node_attrs, up_table)
-            node_feats_res = rows_from_element_table(
-                node_attrs, self.linear_res(up_table)
-            )
-        elif skip_and_up is not None:
-            # skip_tp(node_feats) and linear_up(node_feats), evaluated by the caller.
-            sc, node_feats = skip_and_up
-            node_feats_res = self.linear_res(node_feats)
-        else:
-            sc = self.skip_tp(node_feats)
-            node_feats = self.linear_up(node_feats)
-            node_feats_res = self.linear_res(node_feats)
+        if first_linears is None:
+            first_linears = self.first_linears(node_feats)
+        sc, node_feats, node_feats_res = first_linears
         node_feats_attrs = torch.cat(
             [node_feats, node_attrs],
             dim=-1,

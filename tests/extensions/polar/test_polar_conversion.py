@@ -22,13 +22,13 @@ def test_calculator_constructor_propagates_pbc_handling(polar_calc_model):
         model_type="PolarMACE",
         device="cpu",
         default_dtype="float64",
-        pbc_handling="slab",
+        pbc_handling="pbc",
     )
 
-    assert calc.pbc_handling == "slab"
-    assert calc.models[0].pbc_handling == "slab"
-    assert calc.models[0].electric_potential_descriptor.pbc_handling == "slab"
-    assert calc.models[0].coulomb_energy.pbc_handling == "slab"
+    assert calc.pbc_handling == "pbc"
+    assert calc.models[0].pbc_handling == "pbc"
+    assert calc.models[0].electric_potential_descriptor.pbc_handling == "pbc"
+    assert calc.models[0].coulomb_energy.pbc_handling == "pbc"
 
 
 def test_calculator_constructor_disables_stress(polar_calc_model):
@@ -45,7 +45,7 @@ def test_calculator_constructor_disables_stress(polar_calc_model):
 
 
 def test_legacy_conversion_preserves_tensors_and_rebinds_after_reload(tmp_path):
-    from graph_longrange.gto_utils import GTOSelfInteractionBlock
+    from mace.modules.polar.electrostatics.gto_utils import GTOSelfInteractionBlock
 
     model = _build_minimal_model(torch.device("cpu"), torch.float64)
     before = {key: value.clone() for key, value in model.state_dict().items()}

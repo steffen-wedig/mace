@@ -254,15 +254,18 @@ def assemble_linear_output(
 def evaluate_linears_sharing_input(
     x: torch.Tensor,
     linears: List[torch.nn.Module],
-    folds: List[LinearFold],
-    layout: str,
+    folds: Optional[List[LinearFold]],
+    layout: Optional[str],
 ) -> List[torch.Tensor]:
     """``[linear(x) for linear in linears]`` with one matmul per input irrep segment.
 
     The linears must have no biases and read ``x`` in ``layout`` ("ir_mul" for cueq
     linears, "mul_ir" for e3nn linears; a linear that reads and writes scalars only is
-    the same in both).
+    the same in both). Without folds or layout (e3nn linears on cueq-layout features)
+    every linear is called on its own.
     """
+    if folds is None or layout is None:
+        return [linear(x) for linear in linears]
     products: List[Tuple[SegmentProduct, torch.Tensor]] = []
     counts: List[int] = []
     for linear, fold in zip(linears, folds):
@@ -281,19 +284,21 @@ def evaluate_linears_sharing_input(
 
 
 class LayerOutputLinears(NamedTuple):
-    """Folds of the linears that read one layer's output (None: not merged)."""
+    """The linears PolarMACE evaluates on one layer's output: the feature mixer's, the
+    next interaction's ``skip_tp`` and ``linear_up`` (``with_next``) and the readout's
+    first linear (``with_readout``); their folds in that order (None: evaluated one by
+    one)."""
 
-    mixer: LinearFold
-    next_skip: Optional[LinearFold]
-    next_up: Optional[LinearFold]
-    readout_first: Optional[LinearFold]
+    with_next: bool
+    with_readout: bool
+    folds: Optional[List[LinearFold]]
 
 
 class SharedInputPlan(NamedTuple):
-    """Which linears PolarMACE.forward evaluates together, per layer output, and the
-    layout they read (built from the module structure by ``prepare_linear_folds``)."""
+    """Per layer output, the linears PolarMACE.forward evaluates together, and the
+    layout they read (None: each linear on its own). Built from the module structure."""
 
-    layout: str
+    layout: Optional[str]
     layers: List[LayerOutputLinears]
 
 

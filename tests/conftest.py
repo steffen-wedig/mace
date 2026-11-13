@@ -61,7 +61,7 @@ CAPABILITY_PROBES = {
     "gpu": _gpu_available,
     "cueq": lambda: _module_available("cuequivariance"),
     "oeq": lambda: _module_available("openequivariance"),
-    "polar": lambda: _module_available("graph_longrange"),
+    "polar": lambda: _module_available("mace.modules.polar.electrostatics"),
     "les": lambda: _module_available("les"),
     "magnetic": lambda: _module_available("sphericart"),
     "torchsim": lambda: _module_available("torch_sim"),

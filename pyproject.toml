@@ -14,17 +14,20 @@ profile = "black"
 # This helps diagnose hangs in CI without requiring extra dependencies.
 faulthandler_timeout = 300
 # A misspelled marker is a collection error, not a silently-ignored no-op.
-addopts = "--strict-markers"
+# Slow tests (training runs via subprocess, compile benchmarks, CUDA-graph captures of the
+# polar model) are deselected by default: `pytest -m slow` (or `-m "slow or not slow"`)
+# runs them; a later -m on the command line replaces this one.
+addopts = "--strict-markers -m 'not slow'"
 # Capability markers (gpu/network and dependency markers) are enforced by
 # tests/conftest.py: a test whose capability is unavailable is skipped locally,
 # but FAILS in CI jobs that guarantee that capability via MACE_REQUIRE_CAPS.
 markers = [
-    "slow: end-to-end test that trains models via subprocess",
+    "slow: deselected by default (addopts): training via subprocess, compile benchmarks, polar CUDA-graph captures",
     "gpu: requires a GPU usable by torch (any vendor: CUDA or ROCm)",
     "network: downloads from the internet (foundation models); opt-in via MACE_CI_ALLOW_NETWORK=1",
     "cueq: requires cuEquivariance (its GPU kernels are NVIDIA-only)",
     "oeq: requires OpenEquivariance (JIT kernels for CUDA or HIP)",
-    "polar: requires graph_longrange",
+    "polar: MACE-POLAR (PolarMACE and its electrostatics, mace.modules.polar)",
     "les: requires the LES library",
     "magnetic: requires sphericart-torch (import name sphericart)",
     "torchsim: requires torch-sim-atomistic (python >= 3.12)",

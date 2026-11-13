@@ -19,7 +19,7 @@ import pytest
 import torch
 from e3nn import o3
 
-from mace.modules.field_blocks import (
+from mace.modules.polar.field_blocks import (
     SparseUvuTensorProduct,
     instructions_for_sparse_tp,
 )

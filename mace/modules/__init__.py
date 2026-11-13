@@ -32,7 +32,6 @@ from .extensions import (
     MACELES,
     MagneticScaleShiftMACE,
     MagneticSCFMACE,
-    PolarMACE,
     TimeReversalSymmetrizedMACE,
 )
 from .gate import GatedEquivariantBlock
@@ -58,6 +57,7 @@ from .models import (
     EnergyDipolesMACE,
     ScaleShiftMACE,
 )
+from .polar import PolarMACE
 from .radial import BesselBasis, GaussianBasis, PolynomialCutoff, ZBLBasis
 from .symmetric_contraction import SymmetricContraction
 from .utils import (

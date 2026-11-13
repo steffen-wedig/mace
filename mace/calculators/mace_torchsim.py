@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, Optional, Union
 
 import torch
 
-from mace.modules.extensions import PolarMACE
+from mace.modules.polar import PolarMACE
 from mace.tools import atomic_numbers_to_indices, utils
 
 log = logging.getLogger(__name__)

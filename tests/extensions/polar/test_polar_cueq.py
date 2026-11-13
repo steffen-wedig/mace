@@ -15,7 +15,7 @@ from mace.cli.convert_e3nn_cueq import run as run_e3nn_to_cueq
 from mace.tools import torch_geometric, utils
 
 try:
-    import graph_longrange  # noqa: F401
+    import mace.modules.polar.electrostatics  # noqa: F401
 
     GRAPH_LONGRANGE_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):

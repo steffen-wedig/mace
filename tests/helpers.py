@@ -61,7 +61,7 @@ except ImportError:
     OEQ_AVAILABLE = False
 
 try:
-    import graph_longrange  # noqa: F401  # pylint: disable=unused-import
+    import mace.modules.polar.electrostatics  # noqa: F401  # pylint: disable=unused-import
 
     GRAPH_LONGRANGE_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):

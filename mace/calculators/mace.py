@@ -22,6 +22,7 @@ from ase.stress import full_3x3_to_voigt_6_stress
 from e3nn import o3
 
 from mace import data as mace_data
+from mace.modules.polar.conversion import validate_pbc_handling
 from mace.modules.utils import extract_invariant
 from mace.tools import torch_geometric, torch_tools, utils
 from mace.tools.compile import (
@@ -32,7 +33,6 @@ from mace.tools.compile import (
 )
 from mace.tools.default_keys import DefaultKeys
 from mace.tools.deprecation import warn
-from mace.tools.polar_conversion import validate_pbc_handling
 from mace.tools.scripts_utils import extract_model
 
 try:

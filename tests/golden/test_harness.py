@@ -974,7 +974,7 @@ def test_the_scans_still_find_the_families_they_are_meant_to():
     for name in (
         "mace/modules/models.py::MACE",  # return {...}
         "mace/modules/models.py::AtomicDielectricMACE",  # output = {...}; return output
-        "mace/modules/extensions.py::PolarMACE",
+        "mace/modules/polar/model.py::PolarMACE",
         "mace/modules/extensions.py::MagneticSCFMACE",  # out["k"] = ...
     ):
         assert name in model.keys, sorted(model.keys)
@@ -986,6 +986,7 @@ def test_the_scans_still_find_the_families_they_are_meant_to():
     assert files == {
         "mace/modules/models.py",
         "mace/modules/extensions.py",
+        "mace/modules/polar/model.py",
         "mace/calculators/lammps_mace.py",
         "mace/calculators/mace_torchsim.py",
     }, sorted(files)

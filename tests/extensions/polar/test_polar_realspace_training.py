@@ -55,7 +55,7 @@ def test_pair_index_lists_every_directed_pair_once(sizes):
 
 
 def test_pair_index_matches_the_device_builder():
-    from graph_longrange.realspace_electrostatics import (  # noqa: PLC0415
+    from mace.modules.polar.electrostatics.realspace_electrostatics import (  # noqa: PLC0415
         real_space_pair_index as device_pair_index,
     )
 

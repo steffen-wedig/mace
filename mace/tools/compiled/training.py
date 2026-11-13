@@ -28,9 +28,10 @@ from typing import Any, Callable, Dict
 
 import torch
 import torch._dynamo
+import torch._inductor
 
 from mace.tools import compile as mace_compile
-from mace.tools.small_matmuls import install_small_matmul_pass
+from mace.tools.compiled import small_matmuls
 
 # Recompiles beyond this many are an error, not a silent fall-back to eager (reforge F6).
 RECOMPILE_LIMIT = 8
@@ -43,9 +44,9 @@ def configure_dynamo_for_training(recompile_limit: int = RECOMPILE_LIMIT) -> Non
     - Python floats specialised: model hyperparameters (smearing widths, cutoffs) stay
       constants under dynamic shapes instead of becoming symbolic;
     - a recompile beyond the limit raises instead of running eagerly (static shapes:
-      at least one graph per padding budget and loss, the SWA loss being a second one);
-    - small matrix products (≤ 4 outputs or a contraction over ≤ 8) as fused reductions
-      (``mace.tools.small_matmuls``), not as separate GEMM kernels.
+      at least one graph per padding budget and loss, the SWA loss being a second one).
+
+    Inductor options of the training graph itself: ``training_inductor_options``.
     """
     import torch._dynamo  # noqa: PLC0415
 
@@ -53,7 +54,18 @@ def configure_dynamo_for_training(recompile_limit: int = RECOMPILE_LIMIT) -> Non
     torch._dynamo.config.specialize_float = True
     torch._dynamo.config.recompile_limit = recompile_limit
     torch._dynamo.config.fail_on_recompile_limit_hit = True
-    install_small_matmul_pass()
+
+
+def training_inductor_options(static_shapes: bool) -> Dict[str, Any]:
+    """Inductor options of the compiled training loss, passed to its ``torch.compile``:
+
+    - small matrix products as fused reductions (``mace.tools.compiled.small_matmuls``);
+    - with static shapes (padded batches), CUDA graphs (``mode="reduce-overhead"``).
+    """
+    options = small_matmuls.inductor_options()
+    if static_shapes:
+        options.update(torch._inductor.list_mode_options("reduce-overhead"))
+    return options
 
 
 class CompiledForceTrainingLoss:
@@ -87,12 +99,12 @@ class CompiledForceTrainingLoss:
         self.static_shapes = static_shapes
         # Unpadded batches run eagerly under static shapes (counted for the logs).
         self.eager_batches = 0
-        if static_shapes:
-            self._compiled = torch.compile(
-                self._loss, fullgraph=True, dynamic=False, mode="reduce-overhead"
-            )
-        else:
-            self._compiled = torch.compile(self._loss, fullgraph=True, dynamic=True)
+        self._compiled = torch.compile(
+            self._loss,
+            fullgraph=True,
+            dynamic=not static_shapes,
+            options=training_inductor_options(static_shapes),
+        )
 
     def _loss(
         self,

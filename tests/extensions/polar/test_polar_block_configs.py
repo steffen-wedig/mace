@@ -20,7 +20,7 @@ import torch
 from e3nn import o3
 
 from mace import modules
-from mace.modules.field_blocks import (
+from mace.modules.polar.field_blocks import (
     AgnosticChargeBiasedLinearPotentialEmbedding,
     AgnosticEmbeddedOneBodyVariableUpdate,
     MLPNonLinearity,

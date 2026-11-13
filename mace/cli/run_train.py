@@ -104,7 +104,6 @@ def _warn_about_v1_removals(parser, args) -> None:
             deprecation.warn_choice("reg", getattr(args, dest, None))
 
 
-
 def padded_training_loader(args, train_set, real_space_pairs: bool):
     """The training loader padding every batch to one of --padding_buckets budgets.
 
@@ -115,7 +114,7 @@ def padded_training_loader(args, train_set, real_space_pairs: bool):
         StepCostModel,
         plan_padding_budgets,
     )
-    from mace.tools.compiled_training import (  # pylint: disable=import-outside-toplevel
+    from mace.tools.compiled.training import (  # pylint: disable=import-outside-toplevel
         RECOMPILE_LIMIT,
         configure_dynamo_for_training,
     )
@@ -724,8 +723,8 @@ def run(args) -> None:
             raise NotImplementedError("--cluster_records does not support multihead finetuning")
         if args.lbfgs:
             raise NotImplementedError("--cluster_records does not support the LBFGS optimizer")
-        from mace.tools.torch_geometric.cluster_collate import (  # pylint: disable=import-outside-toplevel
-            get_cluster_data_loader as TrainingDataLoader,
+        from mace.tools.torch_geometric.cluster_collate import (
+            get_cluster_data_loader as TrainingDataLoader,  # pylint: disable=import-outside-toplevel
         )
     else:
         TrainingDataLoader = torch_geometric.dataloader.DataLoader  # pylint: disable=invalid-name
@@ -760,7 +759,7 @@ def run(args) -> None:
             raise NotImplementedError(
                 f"--compile_training trains a single head only (heads: {heads})"
             )
-        from mace.tools.compiled_training import (  # pylint: disable=import-outside-toplevel
+        from mace.tools.compiled.training import (  # pylint: disable=import-outside-toplevel
             configure_dynamo_for_training,
         )
 
@@ -1212,7 +1211,7 @@ def run(args) -> None:
                 "--compile_training does not support per-term loss logging yet "
                 f"(loss {args.loss})"
             )
-        from mace.tools.compiled_training import (  # pylint: disable=import-outside-toplevel
+        from mace.tools.compiled.training import (  # pylint: disable=import-outside-toplevel
             CompiledForceTrainingLoss,
         )
         from mace.tools.loss_terms import (  # pylint: disable=import-outside-toplevel

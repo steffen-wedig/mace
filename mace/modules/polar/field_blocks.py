@@ -19,18 +19,14 @@ from mace.modules.blocks import (
     rows_from_element_table,
 )
 from mace.modules.irreps_tools import tp_out_irreps_with_instructions
-from mace.modules.linear_folds import (
+from mace.modules.polar.linear_folds import (
     FoldedLinearInput,
-    LinearFold,
-    SegmentProduct,
     folded_linear_input,
     linear_fold,
-    path_dimension,
     path_matrix,
 )
 from mace.modules.radial import RadialMLP
-
-from .wrapper_ops import (
+from mace.modules.wrapper_ops import (
     CuEquivarianceConfig,
     Linear,
     OEQConfig,
@@ -51,7 +47,9 @@ def _use_layout_native_linears(
     For blocks built (or unpickled) with o3.Linear under a cueq config. A no-op when cueq
     does not handle linears or the linears are already in the cueq layout.
     """
-    from .wrapper_ops import LayoutNativeLinear  # noqa: PLC0415  # needs cuequivariance
+    from mace.modules.wrapper_ops import (  # noqa: PLC0415  # needs cuequivariance
+        LayoutNativeLinear,
+    )
 
     if not cueq_handles_linears(block.cueq_config):
         return
@@ -255,29 +253,23 @@ class AgnosticChargeBiasedLinearPotentialEmbedding(
     def folded_inputs(
         self,
         potential_feats: torch.Tensor,
-        node_feats: Optional[torch.Tensor],
+        node_feats: torch.Tensor,
         local_charges: torch.Tensor,
     ) -> List[FoldedLinearInput]:
         """The three linears of ``forward`` (whose outputs it sums) as inputs of
         ``SparseUvuTensorProduct.forward_folded``: inputs in the model layout, no layout
-        transposes, no linear evaluated. Without ``node_feats`` the node-feature linear
-        is left out (its folded terms are evaluated by the caller)."""
-        inputs = [
+        transposes, no linear evaluated."""
+        return [
             folded_linear_input(
                 potential_feats, self.potential_linear, self.potential_linear_fold
+            ),
+            folded_linear_input(
+                node_feats, self.node_feats_linear, self.node_feats_linear_fold
             ),
             folded_linear_input(
                 local_charges, self.charge_embedding, self.charge_embedding_fold
             ),
         ]
-        if node_feats is not None:
-            inputs.insert(
-                1,
-                folded_linear_input(
-                    node_feats, self.node_feats_linear, self.node_feats_linear_fold
-                ),
-            )
-        return inputs
 
     def use_layout_native_linears(self) -> None:
         """Upgrade a block built with e3nn linears under cueq (older models)."""
@@ -499,55 +491,10 @@ class SparseUvuTensorProduct(torch.nn.Module):
             return block.view(block.shape[0], mul, dim)
         return block.view(block.shape[0], dim, mul).transpose(1, 2)
 
-    def folded_path_products(
-        self, linear_weight: torch.Tensor, fold: LinearFold
-    ) -> List[Tuple[int, SegmentProduct, torch.Tensor]]:
-        """The folded matrices of one linear (no biases) as segment products of its input.
-
-        Per invariant path p (index into the paths of this product) and per block M of the
-        linear that writes the path's x2 segment: the [k, u] matrix (W M)^T, so that
-        ``channels_last(y) @ (W M)^T`` is the [batch, 2l+1, u] term ``forward_folded`` adds
-        for this linear. Lets a caller evaluate the terms of several products that fold
-        linears of the same input in one matmul (``products_sharing_input``).
-        """
-        products: List[Tuple[int, SegmentProduct, torch.Tensor]] = []
-        for path_index, meta in enumerate(self._path_meta):
-            in2_start, w_start, w_stop, mode_code, mul1, mul2 = (
-                meta[2],
-                meta[6],
-                meta[7],
-                meta[9],
-                meta[10],
-                meta[11],
-            )
-            if mode_code != 0:
-                raise NotImplementedError(
-                    "folded products support invariant contractions (l x l -> 0) only"
-                )
-            weight = self.weight[w_start:w_stop].view(mul1, mul2)
-            for path in fold.paths:
-                if path.output_start != in2_start:
-                    continue
-                matrix = torch.matmul(path_matrix(linear_weight, path), weight.T)
-                products.append(
-                    (
-                        path_index,
-                        SegmentProduct(
-                            path.input_start,
-                            path.input_stop,
-                            path.input_multiplicity,
-                            path_dimension(path),
-                        ),
-                        matrix,
-                    )
-                )
-        return products
-
     def forward_folded(
         self,
         x1: torch.Tensor,
         folded_inputs: List[FoldedLinearInput],
-        path_terms: Optional[List[Optional[torch.Tensor]]] = None,
     ) -> torch.Tensor:
         """``self(x1, sum_i linear_i(y_i))`` without evaluating the linears.
 
@@ -555,9 +502,7 @@ class SparseUvuTensorProduct(torch.nn.Module):
         W [u, v] and a linear's block M [v, k] (y's k channels to the v channels of x2):
         W (M y + b) = (W M) y + W b. The [u, k] matrices of all inputs are concatenated
         and applied in one product; the [batch, v, 2l+1] outputs of the linears are never
-        formed. ``path_terms`` (per path, [batch, 2l+1, u] or None) are folded terms the
-        caller evaluated already (``folded_path_products``). Exact up to the order of
-        summation.
+        formed. Exact up to the order of summation.
         """
         if x1.ndim != 2:
             raise ValueError(
@@ -565,7 +510,7 @@ class SparseUvuTensorProduct(torch.nn.Module):
             )
         batch = x1.shape[0]
         out = x1.new_zeros((batch, self.output_dimension))
-        for path_index, (
+        for (
             in1_start,
             in1_stop,
             in2_start,
@@ -579,7 +524,7 @@ class SparseUvuTensorProduct(torch.nn.Module):
             mul1,
             mul2,
             d1,
-        ) in enumerate(self._path_meta):
+        ) in self._path_meta:
             if mode_code != 0:
                 raise NotImplementedError(
                     "forward_folded supports invariant contractions (l x l -> 0) only"
@@ -616,9 +561,6 @@ class SparseUvuTensorProduct(torch.nn.Module):
                 weighted = torch.einsum(
                     "uk,bkd->bud", torch.cat(matrices, dim=1), torch.cat(inputs, dim=1)
                 )
-            if path_terms is not None and path_terms[path_index] is not None:
-                term = path_terms[path_index].transpose(1, 2)
-                weighted = term if weighted is None else weighted + term
             if constant is not None:
                 weighted = (
                     constant.view(1, mul1, 1).expand(batch, mul1, d1)
@@ -715,6 +657,14 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
         **kwargs,
     ) -> None:
         _ = (nonlinearity_cls, num_elements)
+        if not issubclass(
+            potential_embedding_cls, AgnosticChargeBiasedLinearPotentialEmbedding
+        ):
+            raise TypeError(
+                "the update folds its potential embedding's linears into the dot "
+                "products: the embedding must be a sum of linears "
+                "(AgnosticChargeBiasedLinearPotentialEmbedding)"
+            )
         # product irreps is node_feats_irreps but only l=0
         invar_irreps = o3.Irreps(f"{self.node_feats_irreps.count(o3.Irrep(0, 1))}x0e")
         self.potential_embedding = potential_embedding_cls(
@@ -819,21 +769,6 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
             invariant_descriptors, first.weight[:, :invariant_width], first.bias
         ) + rows_from_element_table(node_attrs, source_table)
 
-    def node_feats_products(
-        self,
-    ) -> Optional[List[Tuple[int, SegmentProduct, torch.Tensor]]]:
-        """The dot products' folded terms of the node features (they do not depend on the
-        field): per dot-product path, the segment product of ``node_feats``. None when the
-        embedding is not a sum of linears. The update blocks of all recursion steps read
-        the same ``node_feats``, so the caller evaluates their terms in one matmul per
-        segment and passes them back as ``node_feats_terms``."""
-        embedding = self.potential_embedding
-        if not isinstance(embedding, AgnosticChargeBiasedLinearPotentialEmbedding):
-            return None
-        return self.dot_products.folded_path_products(
-            embedding.node_feats_linear.weight, embedding.node_feats_linear_fold
-        )
-
     def forward(
         self,
         node_attrs: torch.Tensor,
@@ -843,28 +778,14 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
         edge_index: torch.Tensor,
         potential_features: torch.Tensor,
         local_charges: torch.Tensor,
-        node_feats_terms: Optional[List[Optional[torch.Tensor]]] = None,
     ) -> torch.Tensor:
-        embedding = self.potential_embedding
-        if isinstance(embedding, AgnosticChargeBiasedLinearPotentialEmbedding):
-            # The embedding is a sum of linears: fold them into the dot product.
-            invariant_descriptors = self.dot_products.forward_folded(
-                node_feats,
-                embedding.folded_inputs(
-                    potential_features,
-                    None if node_feats_terms is not None else node_feats,
-                    local_charges,
-                ),
-                path_terms=node_feats_terms,
-            )
-        else:
-            mixed_feats = embedding(
-                potential_features,
-                node_feats,
-                node_attrs,
-                local_charges,
-            )
-            invariant_descriptors = self.dot_products(node_feats, mixed_feats)
+        # dot(x, embedding(...)) with the embedding's linears folded into the dot product.
+        invariant_descriptors = self.dot_products.forward_folded(
+            node_feats,
+            self.potential_embedding.folded_inputs(
+                potential_features, node_feats, local_charges
+            ),
+        )
         nonlin_feats = self.nonlinearity.net[1:](
             self._nonlinearity_first_layer(invariant_descriptors, node_attrs)
         )

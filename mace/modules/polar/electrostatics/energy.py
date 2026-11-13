@@ -1,0 +1,353 @@
+###########################################################################################
+# Functions for computing electrostatic energy from from atomic multipoles
+# and gaussian type orbitals
+# Authors: Will Baldwin
+# This program is distributed under the MIT License (see MIT.md)
+###########################################################################################
+
+from typing import Callable, Literal
+
+import torch
+from scipy.constants import pi
+
+from .features import (
+    apply_coulomb_kernel_batch,
+    assemble_fourier_series_batch,
+    compute_coulomb_factor,
+)
+from .gto_utils import GTOBasis, GTOSelfInteractionBlock
+from .realspace_electrostatics import (
+    RealSpaceAnalyticalEnergy,
+    RealSpaceFiniteDiffereneEnergy,
+    RealSpaceGeometry,
+    RealSpaceMethod,
+    _match_tensor_placement,
+    _upgrade_legacy_realspace,
+)
+
+# realspace: open structures; pbc: fully periodic cells (reciprocal space); auto: one of
+# the two per batch (a batch must be all open or all fully periodic).
+PBCHandling = Literal["realspace", "pbc", "auto"]
+
+
+def energy_product_batch(
+    density: torch.Tensor,
+    potential: torch.Tensor,
+    volume: torch.Tensor,
+    k_vector_batch: torch.Tensor,
+) -> torch.Tensor:
+    """Compute k-space electrostatic energy for flattened batch."""
+    per_k = 2.0 * torch.sum(density * potential, dim=-1)
+    num_graphs = int(volume.shape[0])
+    if num_graphs == 1:
+        energy_k = per_k.sum().view(1)
+        return 0.5 * volume.reshape(-1) * energy_k / (2 * pi) ** 6
+    energy_k = torch.zeros(num_graphs, dtype=per_k.dtype, device=per_k.device)
+    energy_k.index_add_(0, k_vector_batch, per_k)
+    return 0.5 * volume.reshape(-1) * energy_k / (2 * pi) ** 6
+
+
+class GTOElectrostaticEnergy(torch.nn.Module):
+    def __init__(
+        self,
+        density_max_l: int,
+        density_smearing_width: float,
+        kspace_cutoff: float,
+        include_self_interaction: bool = False,
+        pbc_handling: PBCHandling = "auto",
+        realspace_method: RealSpaceMethod = "analytical",
+    ):
+        super().__init__()
+        self.density_max_l = density_max_l
+        self.density_smearing_width = density_smearing_width
+        self.kspace_cutoff = kspace_cutoff
+        self.include_self_interaction = include_self_interaction
+        self.pbc_handling = pbc_handling
+        self.realspace_method = realspace_method
+
+        self.density_basis = GTOBasis(
+            max_l=density_max_l,
+            sigmas=[density_smearing_width],
+            kspace_cutoff=kspace_cutoff,
+            normalize="multipoles",
+        )
+        self.self_interaction_terms = GTOSelfInteractionBlock(
+            l_source=density_max_l,
+            sigma_source=density_smearing_width,
+            l_receive=density_max_l,
+            sigmas_receive=[density_smearing_width],
+            normalize_source="multipoles",
+            normalize_receive="multipoles",
+        )
+        self.realspace_energy = self._build_realspace_energy()
+        self._forward_impl = self._select_forward_impl()
+
+    def _build_realspace_energy(self, method=None, *, dtype=None):
+        if method is None:
+            method = getattr(self, "realspace_method", "finite_difference")
+        kwargs = dict(
+            density_max_l=self.density_max_l,
+            density_smearing_width=self.density_smearing_width,
+            include_self_interaction=self.include_self_interaction,
+            dtype=dtype,
+        )
+        if method == "finite_difference":
+            return RealSpaceFiniteDiffereneEnergy(**kwargs)
+        if method == "analytical":
+            return RealSpaceAnalyticalEnergy(**kwargs)
+        raise ValueError(f"Unsupported realspace_method: {method}")
+
+    def _select_forward_impl(self) -> Callable:
+        if self.pbc_handling == "realspace":
+            return self._forward_realspace
+        if self.pbc_handling == "pbc":
+            return self._forward_pbc
+        if self.pbc_handling == "auto":
+            return self._forward_auto
+        raise ValueError(f"Unsupported pbc_handling: {self.pbc_handling}")
+
+    def set_pbc_handling(self, pbc_handling: PBCHandling) -> None:
+        self.pbc_handling = pbc_handling
+        self._forward_impl = self._select_forward_impl()
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        _upgrade_legacy_realspace(self, state)
+
+    def set_realspace_method(self, realspace_method: RealSpaceMethod) -> None:
+        """Swap the non-periodic evaluator on an already-built block.
+
+        The analytical evaluator is exactly rotationally invariant; the
+        finite-difference one (graph_longrange <= v0.4.4) is orientation dependent.
+        Analytical is the default; legacy pickles are upgraded on load.
+        """
+        old = self.realspace_energy
+        reference = next(
+            buffer for buffer in old.buffers() if buffer.is_floating_point()
+        )
+        replacement = self._build_realspace_energy(
+            realspace_method, dtype=reference.dtype
+        )
+        replacement = _match_tensor_placement(replacement, old)
+        replacement.train(old.training)
+        # Leave the current evaluator and flag unchanged if construction fails.
+        self.realspace_energy = replacement
+        self.realspace_method = realspace_method
+
+    def forward(
+        self,
+        k_vectors: torch.Tensor,
+        k_norm2: torch.Tensor,
+        k_vector_batch: torch.Tensor,
+        k0_mask: torch.Tensor,
+        source_feats: torch.Tensor,
+        node_positions: torch.Tensor,
+        batch: torch.Tensor,
+        volume: torch.Tensor,
+        pbc: torch.Tensor,
+        realspace_geometry: RealSpaceGeometry | None = None,
+    ) -> torch.Tensor:
+        """Energy per structure ([n_graphs], n_graphs = volume.shape[0]).
+
+        realspace_geometry: a geometry the caller prepared for this batch of open
+        structures (prepare_real_space_geometry, with this module's kernel widths
+        among its kernel_widths), shared with other modules. Passing one states that
+        the batch is open: in "auto" mode no periodicity check is made.
+        """
+        if realspace_geometry is not None:
+            if self.pbc_handling not in ("realspace", "auto"):
+                raise ValueError(
+                    "a real-space geometry was passed to an energy block with "
+                    f"pbc_handling={self.pbc_handling!r}"
+                )
+            if not isinstance(self.realspace_energy, RealSpaceAnalyticalEnergy):
+                raise ValueError(
+                    "the finite-difference real-space energy cannot use a prepared "
+                    "geometry; set realspace_method='analytical'"
+                )
+            return self.realspace_energy.evaluate(
+                source_feats, realspace_geometry, batch, int(volume.shape[0])
+            )
+        return self._forward_impl(
+            k_vectors=k_vectors,
+            k_norm2=k_norm2,
+            k_vector_batch=k_vector_batch,
+            k0_mask=k0_mask,
+            source_feats=source_feats,
+            node_positions=node_positions,
+            batch=batch,
+            volume=volume,
+            pbc=pbc,
+        )
+
+    def _realspace_energy(
+        self,
+        source_feats: torch.Tensor,
+        node_positions: torch.Tensor,
+        batch: torch.Tensor,
+        num_graphs: int,
+    ) -> torch.Tensor:
+        if isinstance(self.realspace_energy, RealSpaceAnalyticalEnergy):
+            return self.realspace_energy.evaluate(
+                source_feats,
+                self.realspace_energy.prepare(node_positions, batch),
+                batch,
+                num_graphs,
+            )
+        return self.realspace_energy(
+            source_feats=source_feats,
+            positions=node_positions,
+            batch=batch,
+        )
+
+    def _subtract_self_interaction_if_needed(
+        self,
+        energy: torch.Tensor,
+        source_feats: torch.Tensor,
+        batch: torch.Tensor,
+        num_graphs: int,
+    ) -> torch.Tensor:
+        if self.include_self_interaction:
+            return energy
+        self_fields = self.self_interaction_terms(source_feats)
+        node_energies = torch.einsum("nb,nb->n", source_feats, self_fields)
+        if num_graphs == 1:
+            return energy - node_energies.sum().view(1) * 0.5
+        self_energy = torch.zeros(
+            num_graphs,
+            dtype=node_energies.dtype,
+            device=node_energies.device,
+        )
+        self_energy.index_add_(0, batch, node_energies)
+        return energy - self_energy * 0.5
+
+    def _compute_kspace_energy_common(
+        self,
+        k_vectors: torch.Tensor,
+        k_norm2: torch.Tensor,
+        k_vector_batch: torch.Tensor,
+        k0_mask: torch.Tensor,
+        source_feats: torch.Tensor,
+        node_positions: torch.Tensor,
+        batch: torch.Tensor,
+        volume: torch.Tensor,
+    ) -> torch.Tensor:
+        inner_products = torch.matmul(
+            k_vectors, node_positions.t()
+        )  # [n_k_total, n_nodes]
+        mask = k_vector_batch[:, None] == batch[None, :]
+        mask_f = mask.to(dtype=inner_products.dtype)
+        cosines = torch.cos(inner_products) * mask_f
+        sines = torch.sin(inner_products) * mask_f
+
+        density_basis_fs = self.density_basis(k_vectors, k_norm2, k0_mask)
+        volume_per_k = volume.reshape(-1)[k_vector_batch]
+        density = assemble_fourier_series_batch(
+            source_feats=source_feats,
+            cosines=cosines,
+            sines=sines,
+            density_basis_fs=density_basis_fs,
+            volume_per_k=volume_per_k,
+        )
+
+        k_factor_coulomb = compute_coulomb_factor(k_norm2, k0_mask)
+        potential = apply_coulomb_kernel_batch(
+            density=density,
+            k_factor_coulomb=k_factor_coulomb,
+        )
+        energy = energy_product_batch(
+            density=density,
+            potential=potential,
+            volume=volume,
+            k_vector_batch=k_vector_batch,
+        )
+
+        return self._subtract_self_interaction_if_needed(
+            energy=energy,
+            source_feats=source_feats,
+            batch=batch,
+            num_graphs=int(volume.shape[0]),
+        )
+
+    def _forward_realspace(
+        self,
+        k_vectors: torch.Tensor,
+        k_norm2: torch.Tensor,
+        k_vector_batch: torch.Tensor,
+        k0_mask: torch.Tensor,
+        source_feats: torch.Tensor,
+        node_positions: torch.Tensor,
+        batch: torch.Tensor,
+        volume: torch.Tensor,
+        pbc: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._realspace_energy(
+            source_feats=source_feats,
+            node_positions=node_positions,
+            batch=batch,
+            num_graphs=int(volume.shape[0]),
+        )
+
+    def _forward_pbc(
+        self,
+        k_vectors: torch.Tensor,
+        k_norm2: torch.Tensor,
+        k_vector_batch: torch.Tensor,
+        k0_mask: torch.Tensor,
+        source_feats: torch.Tensor,
+        node_positions: torch.Tensor,
+        batch: torch.Tensor,
+        volume: torch.Tensor,
+        pbc: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._compute_kspace_energy_common(
+            k_vectors=k_vectors,
+            k_norm2=k_norm2,
+            k_vector_batch=k_vector_batch,
+            k0_mask=k0_mask,
+            source_feats=source_feats,
+            node_positions=node_positions,
+            batch=batch,
+            volume=volume,
+        )
+
+    def _forward_auto(
+        self,
+        k_vectors: torch.Tensor,
+        k_norm2: torch.Tensor,
+        k_vector_batch: torch.Tensor,
+        k0_mask: torch.Tensor,
+        source_feats: torch.Tensor,
+        node_positions: torch.Tensor,
+        batch: torch.Tensor,
+        volume: torch.Tensor,
+        pbc: torch.Tensor,
+    ) -> torch.Tensor:
+        if torch.any(pbc):
+            if not bool(torch.all(pbc)):
+                raise ValueError(
+                    "pbc_handling 'auto' needs a batch of open or of fully periodic "
+                    "structures (slabs and mixed batches are not supported)"
+                )
+            return self._forward_pbc(
+                k_vectors=k_vectors,
+                k_norm2=k_norm2,
+                k_vector_batch=k_vector_batch,
+                k0_mask=k0_mask,
+                source_feats=source_feats,
+                node_positions=node_positions,
+                batch=batch,
+                volume=volume,
+                pbc=pbc,
+            )
+        return self._forward_realspace(
+            k_vectors=k_vectors,
+            k_norm2=k_norm2,
+            k_vector_batch=k_vector_batch,
+            k0_mask=k0_mask,
+            source_feats=source_feats,
+            node_positions=node_positions,
+            batch=batch,
+            volume=volume,
+            pbc=pbc,
+        )

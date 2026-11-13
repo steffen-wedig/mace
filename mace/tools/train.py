@@ -33,6 +33,13 @@ from .loss_terms import (
     LossTermInstrumentation,
     training_forward_kwargs,
 )
+from .torch_geometric.cluster_collate import (
+    cluster_atom_counts,
+    combine_energy,
+    combine_forces,
+    is_cluster_batch,
+    slot_to_cluster,
+)
 from .torch_tools import to_numpy
 from .utils import (
     MetricsLogger,
@@ -42,13 +49,6 @@ from .utils import (
     compute_rel_rmse,
     compute_rmse,
     filter_nonzero_weight,
-)
-from .torch_geometric.cluster_collate import (
-    cluster_atom_counts,
-    combine_energy,
-    combine_forces,
-    is_cluster_batch,
-    slot_to_cluster,
 )
 
 
@@ -251,7 +251,7 @@ def train(
 ):
     """Train `model`; with `best_checkpoint_handler`, also keep the best model of the run.
 
-    With `compiled_loss` (mace.tools.compiled_training.CompiledForceTrainingLoss), every
+    With `compiled_loss` (mace.tools.compiled.training.CompiledForceTrainingLoss), every
     training step evaluates forward, forces and loss as one compiled graph.
 
     The per-stage checkpoints are selected by each stage's own validation loss, which is not

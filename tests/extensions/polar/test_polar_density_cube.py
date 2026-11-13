@@ -12,7 +12,6 @@ from ase.io.cube import read_cube_data
 
 from mace.cli import polar_density_cube
 from mace.cli.polar_density_cube import (
-    GRAPH_LONGRANGE_AVAILABLE,
     PotentialInterpolator,
     RealSpaceDensityInterpolator,
     _select_backend,
@@ -290,9 +289,6 @@ def test_realspace_integrated_charge_converges_with_grid():
 
 
 @pytest.mark.polar
-@pytest.mark.skipif(
-    not GRAPH_LONGRANGE_AVAILABLE, reason="graph_longrange is not installed"
-)
 def test_potential_interpolator_writes_cube(tmp_path):
     atoms = _slab_atoms()
     coords = make_grid(atoms, (5, 4, 6))
@@ -329,9 +325,6 @@ def test_potential_interpolator_writes_cube(tmp_path):
 
 
 @pytest.mark.polar
-@pytest.mark.skipif(
-    not GRAPH_LONGRANGE_AVAILABLE, reason="graph_longrange is not installed"
-)
 def test_fourier_and_realspace_monopole_densities_agree_for_full_pbc():
     atoms = Atoms(
         numbers=[1],

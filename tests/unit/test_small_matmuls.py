@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import pytest
 import torch
 from torch._inductor.utils import run_and_get_code
 
-from mace.tools.small_matmuls import install_small_matmul_pass, is_small_product
+from mace.tools.compiled.small_matmuls import inductor_options, is_small_product
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -60,23 +59,24 @@ def test_compiled_force_loss_matches_eager_with_small_products_fused():
         loss = function(leaf, lift, *parameters)
         return [loss.detach(), *torch.autograd.grad(loss, parameters)]
 
-    def compiled_run():
+    def compiled_run(options):
         torch._dynamo.reset()
-        compiled = torch.compile(_force_loss, fullgraph=True, dynamic=False)
+        compiled = torch.compile(
+            _force_loss, fullgraph=True, dynamic=False, options=options
+        )
         return run_and_get_code(gradients, compiled)
 
     expected = gradients(_force_loss)
-    previous_pass = inductor_config.post_grad_custom_pre_pass
     previous_trace = torch._dynamo.config.trace_autograd_ops
     torch._dynamo.config.trace_autograd_ops = True
     try:
-        _, plain_codes = compiled_run()
-        install_small_matmul_pass()
-        actual, fused_codes = compiled_run()
+        _, plain_codes = compiled_run({})
+        actual, fused_codes = compiled_run(inductor_options())
     finally:
-        inductor_config.post_grad_custom_pre_pass = previous_pass
         torch._dynamo.config.trace_autograd_ops = previous_trace
         torch._dynamo.reset()
+    # Per compile only: Inductor's global config is untouched.
+    assert inductor_config.post_grad_custom_pre_pass is None
     for want, have in zip(expected, actual):
         torch.testing.assert_close(have, want, rtol=1e-10, atol=1e-12)
     # The 64 x 64 products stay GEMMs; the 2-output readout, the 4-element table and

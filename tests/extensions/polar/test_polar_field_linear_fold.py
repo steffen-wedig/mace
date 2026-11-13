@@ -15,13 +15,13 @@ import pytest
 import torch
 from e3nn import o3
 
-from mace.modules.field_blocks import (
+from mace.modules.polar.field_blocks import (
     AgnosticEmbeddedOneBodyVariableUpdate,
     OneBodyMLPFieldReadout,
     SparseUvuTensorProduct,
     instructions_for_sparse_tp,
 )
-from mace.modules.linear_folds import folded_linear_input, linear_fold
+from mace.modules.polar.linear_folds import folded_linear_input, linear_fold
 from mace.modules.wrapper_ops import CUET_AVAILABLE, CuEquivarianceConfig
 from tests.extensions.polar.test_polar_shared_geometry import (
     _batch,
@@ -30,6 +30,16 @@ from tests.extensions.polar.test_polar_shared_geometry import (
     _polar_model,
 )
 from tests.helpers import GRAPH_LONGRANGE_AVAILABLE
+
+
+def separate_linears(model) -> None:
+    """Every linear that reads a layer's output evaluated on its own: the plan without a
+    layout (as for e3nn linears on cueq-layout features)."""
+    plan = model.shared_input_plan
+    model.shared_input_plan = plan._replace(
+        layout=None, layers=[layer._replace(folds=None) for layer in plan.layers]
+    )
+
 
 pytestmark = pytest.mark.polar
 
@@ -131,6 +141,7 @@ def _unfolded_update(
     potential_features,
     local_charges,
 ):
+    # Reference: the embedding evaluated (its linears not folded).
     mixed = self.potential_embedding(
         potential_features, node_feats, node_attrs, local_charges
     )
@@ -173,7 +184,7 @@ def _unfolded_readout(
 
 def _unfold(model) -> None:
     # The reference evaluates every linear on its own (no shared-input products either).
-    model.shared_input_plan = None
+    separate_linears(model)
     for module in model.modules():
         if isinstance(module, AgnosticEmbeddedOneBodyVariableUpdate):
             module.forward = types.MethodType(_unfolded_update, module)

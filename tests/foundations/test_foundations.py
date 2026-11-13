@@ -20,7 +20,7 @@ from mace.tools.torch_tools import default_dtype
 from mace.tools.utils import AtomicNumberTable
 
 try:
-    import graph_longrange  # noqa: F401
+    import mace.modules.polar.electrostatics  # noqa: F401
 
     GRAPH_LONGRANGE_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):

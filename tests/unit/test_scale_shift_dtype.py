@@ -40,6 +40,7 @@ import pytest
 import torch
 
 from mace.modules import extensions, models
+from mace.modules.polar import model as polar_model
 from mace.modules.blocks import AtomicEnergiesBlock, ScaleShiftBlock
 from mace.modules.utils import safe_double
 from mace.tools import torch_tools
@@ -197,7 +198,7 @@ def _calls_safe_double(expression):
 
 def _model_classes_returning_a_node_energy():
     classes = {}
-    for module in (models, extensions):
+    for module in (models, extensions, polar_model):
         for name, obj in vars(module).items():
             if not (isinstance(obj, type) and issubclass(obj, torch.nn.Module)):
                 continue

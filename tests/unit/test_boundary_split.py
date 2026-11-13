@@ -6,7 +6,7 @@ import torch
 from e3nn import o3
 
 from mace import data, modules, tools
-from mace.modules.boundary_split import (
+from mace.modules.polar.boundary_split import (
     forward_by_boundary,
     graph_periodicity,
     select_graphs,

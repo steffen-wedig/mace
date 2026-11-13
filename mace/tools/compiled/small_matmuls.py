@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import torch
 from torch._inductor.custom_graph_pass import CustomGraphPass
@@ -118,22 +118,20 @@ class SmallMatmulsAsReductions(CustomGraphPass):
         return hashlib.sha256(source.encode()).hexdigest()
 
 
-def install_small_matmul_pass() -> None:
-    """Set the pass as Inductor's post-grad pre-pass (refuses to replace another pass)."""
-    import torch._inductor.config as inductor_config  # noqa: PLC0415
+def inductor_options() -> Dict[str, Any]:
+    """Inductor options of one ``torch.compile`` call that run the pass on its graphs.
 
-    current = inductor_config.post_grad_custom_pre_pass
-    if current is not None and not isinstance(current, SmallMatmulsAsReductions):
-        raise RuntimeError(
-            f"an Inductor post-grad pre-pass is already installed: {current!r}"
-        )
-    inductor_config.post_grad_custom_pre_pass = SmallMatmulsAsReductions()
+    Passed per compile (``torch.compile(..., options=inductor_options())``), not set in
+    Inductor's global config: it applies to the graphs that ask for it (compiled
+    training, a compiled inference step) and to nothing else in the process.
+    """
+    return {"post_grad_custom_pre_pass": SmallMatmulsAsReductions()}
 
 
 __all__ = [
     "MAX_CONTRACTION",
     "MAX_OUTPUTS",
     "SmallMatmulsAsReductions",
-    "install_small_matmul_pass",
+    "inductor_options",
     "is_small_product",
 ]

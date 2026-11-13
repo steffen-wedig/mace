@@ -68,7 +68,7 @@ def test_mace_mp(capsys: pytest.CaptureFixture):
 @pytest.mark.polar
 def test_mace_polar_constructor():
     try:
-        import graph_longrange  # noqa: F401
+        import mace.modules.polar.electrostatics  # noqa: F401
     except (ImportError, ModuleNotFoundError):
         pytest.skip("graph_longrange is not installed")
     model_name = "polar-1-m"

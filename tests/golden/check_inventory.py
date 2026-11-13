@@ -314,6 +314,7 @@ def _classes(path: Path) -> dict[str, Decl]:
 def source_model_classes() -> dict[str, Decl]:
     out = _classes(REPO / "mace" / "modules" / "models.py")
     out.update(_classes(REPO / "mace" / "modules" / "extensions.py"))
+    out.update(_classes(REPO / "mace" / "modules" / "polar" / "model.py"))
     return out
 
 
@@ -519,7 +520,7 @@ def source_model_output_keys() -> dict[str, Decl]:
     """Keys of the dicts the model `forward`s return — the contract every
     consumer (calculator, eval CLI, LAMMPS, training loop) reads."""
     out: dict[str, Decl] = {}
-    for name in ("models.py", "extensions.py"):
+    for name in ("models.py", "extensions.py", "polar/model.py"):
         path = REPO / "mace" / "modules" / name
         for cls in _parse(path).body:
             if not isinstance(cls, ast.ClassDef):

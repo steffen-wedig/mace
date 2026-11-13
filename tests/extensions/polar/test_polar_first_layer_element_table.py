@@ -8,6 +8,8 @@ Values and every gradient (through the force, as in training) must not change.
 
 from __future__ import annotations
 
+import types
+
 import pytest
 import torch
 
@@ -30,13 +32,21 @@ pytestmark = [
 
 def _compare_table_and_per_node(cueq_config, device) -> None:
     model = _polar_model(cueq_config=cueq_config).to(device)
-    assert model.interactions[0].accepts_node_feats_table
+    assert model.interactions[0].accepts_first_linears
     batch = {
         key: value.to(device) if torch.is_tensor(value) else value
         for key, value in _batch(_molecules()).items()
     }
     from_table = _outputs_and_gradients(model, batch)
-    model.interactions[0].accepts_node_feats_table = False
+
+    def first_linears_per_node(self, node_attrs, node_feats_table):
+        # Reference: the first linears of node_feats = node_attrs @ table, per node.
+        return self.first_linears(node_attrs @ node_feats_table)
+
+    first = model.interactions[0]
+    first.first_linears_from_element_table = types.MethodType(
+        first_linears_per_node, first
+    )
     per_node = _outputs_and_gradients(model, batch)
     assert from_table.keys() == per_node.keys()
     for key, value in per_node.items():

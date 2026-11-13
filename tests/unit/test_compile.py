@@ -186,6 +186,10 @@ def test_eager_benchmark(
     benchmark(model, batch, training=True)
 
 
+# A timing benchmark of the torch.compile modes (max-autotune alone takes minutes),
+# not a correctness check: slow and benchmark, run on demand (pytest -m benchmark).
+@pytest.mark.slow
+@pytest.mark.benchmark
 @pytest.mark.gpu
 @pytest.mark.skipif(os.name == "nt", reason="Not supported on Windows")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="cuda is not available")

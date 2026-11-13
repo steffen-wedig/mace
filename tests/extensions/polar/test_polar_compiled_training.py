@@ -16,7 +16,7 @@ from mace import data, modules
 from mace.data.real_space_pairs import attach_real_space_pair_index
 from mace.tools import compile as mace_compile
 from mace.tools import torch_geometric, utils
-from mace.tools.compiled_training import (
+from mace.tools.compiled.training import (
     CompiledForceTrainingLoss,
     configure_dynamo_for_training,
 )

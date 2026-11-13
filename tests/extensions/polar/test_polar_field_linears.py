@@ -122,7 +122,7 @@ def test_e3nn_shaped_weights_load_into_the_native_linear():
 def _as_built_before(model) -> None:
     """Rebuild the field blocks as models built before this change had them: e3nn
     linears with the same parameters, between layout transposes."""
-    from mace.modules.field_blocks import (  # noqa: PLC0415
+    from mace.modules.polar.field_blocks import (  # noqa: PLC0415
         AgnosticChargeBiasedLinearPotentialEmbedding,
         OneBodyMLPFieldReadout,
     )
@@ -175,7 +175,7 @@ def _as_built_before(model) -> None:
 
 def test_upgrading_a_model_built_before_keeps_every_output():
     from mace.modules.wrapper_ops import LayoutNativeLinear  # noqa: PLC0415
-    from mace.tools.polar_conversion import convert_polar_model  # noqa: PLC0415
+    from mace.modules.polar.conversion import convert_polar_model  # noqa: PLC0415
 
     model = _polar_model(cueq_config=_cueq_config()).to(DEVICE)
     with torch.no_grad():

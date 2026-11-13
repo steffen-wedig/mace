@@ -22,26 +22,21 @@ import torch
 from ase.io.cube import write_cube
 
 from mace.calculators.foundations_models import mace_polar
+from mace.modules.polar.electrostatics.features import (
+    apply_coulomb_kernel_batch,
+    assemble_fourier_series_batch,
+    compute_coulomb_factor,
+)
+from mace.modules.polar.electrostatics.gto_utils import (
+    GTOBasis,
+    gto_basis_kspace_cutoff,
+)
+from mace.modules.polar.electrostatics.kspace import (
+    compute_k_vectors_flat,
+    evaluate_fourier_series_at_points_flat,
+)
+from mace.modules.polar.electrostatics.utils import FIELD_CONSTANT
 from mace.tools import deprecation
-
-try:
-    from graph_longrange.features import (
-        apply_coulomb_kernel_batch,
-        assemble_fourier_series_batch,
-        compute_coulomb_factor,
-    )
-    from graph_longrange.gto_utils import GTOBasis, gto_basis_kspace_cutoff
-    from graph_longrange.kspace import (
-        compute_k_vectors_flat,
-        evaluate_fourier_series_at_points_flat,
-    )
-    from graph_longrange.utils import FIELD_CONSTANT
-
-    GRAPH_LONGRANGE_AVAILABLE = True
-    GRAPH_LONGRANGE_IMPORT_ERROR = None
-except (ImportError, ModuleNotFoundError) as exc:
-    GRAPH_LONGRANGE_AVAILABLE = False
-    GRAPH_LONGRANGE_IMPORT_ERROR = exc
 
 
 @contextmanager
@@ -166,11 +161,6 @@ class PotentialInterpolator:
         device="cpu",
         subtract_total_charge=False,
     ):
-        if not GRAPH_LONGRANGE_AVAILABLE:
-            raise ImportError(
-                "graph_longrange is required for polar density cube export"
-            ) from GRAPH_LONGRANGE_IMPORT_ERROR
-
         warnings.warn(
             "PotentialInterpolator supports fully periodic cells and slab cells "
             "with pbc = [True, True, False]. Use RealSpaceDensityInterpolator "
