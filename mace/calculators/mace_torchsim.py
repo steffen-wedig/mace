@@ -8,7 +8,9 @@ from typing import Any, Callable, Dict, Optional, Union
 
 import torch
 
+from mace.calculators.batched_neighbors import BatchedNeighborList, wrap_positions
 from mace.modules.polar import PolarMACE
+from mace.modules.polar.conversion import load_model_file
 from mace.tools import atomic_numbers_to_indices, utils
 
 log = logging.getLogger(__name__)
@@ -19,6 +21,40 @@ _PAD_HEADROOM = 1.25
 
 def _round_up(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
+
+
+def _indexed_device(device: Union[str, torch.device]) -> torch.device:
+    """``cuda`` as ``cuda:<current>``: a state's device always carries its index, and
+    ``cuda != cuda:0`` made every forward copy the whole state to "its" device."""
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
+class _CheckedTensors:
+    """The tensors a check ran on, held by reference with their in-place versions: the
+    same objects at the same versions have unchanged content, so the check (host reads)
+    need not run again. Held, not just their ids, so an id cannot be reused."""
+
+    def __init__(self) -> None:
+        self._entries: tuple = ()
+
+    @staticmethod
+    def _entry(tensor: Optional[torch.Tensor]) -> tuple:
+        # pylint: disable=protected-access
+        return (tensor, None if tensor is None else tensor._version)
+
+    def unchanged(self, *tensors: Optional[torch.Tensor]) -> bool:
+        if len(tensors) != len(self._entries):
+            return False
+        return all(
+            tensor is held and self._entry(tensor)[1] == version
+            for tensor, (held, version) in zip(tensors, self._entries)
+        )
+
+    def record(self, *tensors: Optional[torch.Tensor]) -> None:
+        self._entries = tuple(self._entry(tensor) for tensor in tensors)
 
 
 try:
@@ -75,8 +111,8 @@ class MaceTorchSimModel(ModelInterface):
             ) from _TORCHSIM_IMPORT_ERROR
 
         super().__init__()
-        self._device = device or torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
+        self._device = _indexed_device(
+            device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
         self._dtype = dtype
         self._compute_forces = compute_forces
@@ -87,7 +123,18 @@ class MaceTorchSimModel(ModelInterface):
         self._use_compile = compile_mode is not None
         self._use_cudagraphs = compile_mode in ("reduce-overhead", "max-autotune")
         self._memory_scales_with = "n_atoms_x_density"
+        # Fully periodic batches (MD) use BatchedNeighborList (one host read per call)
+        # unless a neighbour list function is given; others use torch-sim's.
+        self._custom_neighbor_list = neighbor_list_fn is not None
         self.neighbor_list_fn = neighbor_list_fn or torchsim_nl
+        self._batched_neighbor_list: Optional[BatchedNeighborList] = None
+        # What the last call checked, by tensor identity and version: an MD run passes
+        # the same species, system index and periodicity tensors every step, so their
+        # checks (host reads) run once.
+        self._checked_species = _CheckedTensors()
+        self._checked_periodicity = _CheckedTensors()
+        self._fully_periodic = False
+        self._periodic = False
 
         self._atom_budget = 0
         self._edge_budget = 0
@@ -104,9 +151,9 @@ class MaceTorchSimModel(ModelInterface):
         self._buf_head = None
 
         if isinstance(model, (str, Path)):
-            self.model = torch.load(
-                str(model), map_location=self._device, weights_only=False
-            )
+            # Through the converter's loader: model files written before PolarMACE
+            # moved into mace.modules.polar load too.
+            self.model = load_model_file(str(model), map_location=self._device)
         elif isinstance(model, torch.nn.Module):
             self.model = model.to(self._device)
         else:
@@ -249,6 +296,8 @@ class MaceTorchSimModel(ModelInterface):
             ptr.append(ptr[-1] + n_atoms)
 
         self.ptr = torch.tensor(ptr, dtype=torch.long, device=self._device)
+        self._system_pointer = self.ptr.to(torch.int32)
+        self._maximum_atoms_per_system = max(self.n_atoms_per_system)
         self.total_atoms = int(self.atomic_numbers.shape[0])
 
         atomic_indices = torch.tensor(
@@ -274,18 +323,20 @@ class MaceTorchSimModel(ModelInterface):
     ) -> Dict[str, torch.Tensor]:
         """Compute PolarMACE-specific data_dict entries."""
         volume = torch.linalg.det(cell_3x3)
-        # Guard against zero-volume cells (non-periodic / molecular systems).
-        # AtomicData.from_config() falls back to zeros(3, 3) for rcell here.
-        has_volume = volume.abs() > 1e-10
-        if has_volume.all():
-            rcell = 2 * torch.pi * torch.linalg.inv(cell_3x3.transpose(-1, -2))
-        else:
-            rcell = torch.zeros_like(cell_3x3)
-            if has_volume.any():
-                mask = has_volume.nonzero(as_tuple=True)[0]
-                rcell[mask] = (
-                    2 * torch.pi * torch.linalg.inv(cell_3x3[mask].transpose(-1, -2))
-                )
+        # Zero-volume cells (non-periodic / molecular systems) get rcell zeros(3, 3), as
+        # AtomicData.from_config() gives them. Selected on the device: inv_ex of the
+        # identity in their place, no host check of the volumes.
+        has_volume = (volume.abs() > 1e-10).view(-1, 1, 1)
+        safe_cell = torch.where(
+            has_volume,
+            cell_3x3,
+            torch.eye(3, dtype=cell_3x3.dtype, device=cell_3x3.device),
+        )
+        rcell = torch.where(
+            has_volume,
+            2 * torch.pi * torch.linalg.inv_ex(safe_cell.transpose(-1, -2)).inverse,
+            torch.zeros_like(cell_3x3),
+        )
 
         external_field = getattr(sim_state, "external_E_field", None)
         if external_field is None:
@@ -499,7 +550,9 @@ class MaceTorchSimModel(ModelInterface):
             )
 
         if isinstance(state, ts.SimState):
-            sim_state = state.clone()
+            # Read only (the positions that get gradients are a new tensor below), so
+            # no copy: cloning a state validates it on the host.
+            sim_state = state
         else:
             state_dict = dict(state)
             if "masses" not in state_dict:
@@ -515,18 +568,59 @@ class MaceTorchSimModel(ModelInterface):
                 "atomic_numbers must be provided in the constructor or in forward."
             )
 
+        system_idx = sim_state.system_idx
+        if system_idx is None:
+            if not hasattr(self, "system_idx"):
+                raise ValueError(
+                    "system_idx must be provided if not set during initialization"
+                )
+            system_idx = self.system_idx
+
+        if not self._checked_species.unchanged(state_atomic_numbers, system_idx):
+            self._check_species(state_atomic_numbers, system_idx)
+            self._checked_species.record(state_atomic_numbers, system_idx)
+
+        if not self._checked_periodicity.unchanged(sim_state.pbc):
+            self._fully_periodic = bool(sim_state.pbc.all())
+            self._periodic = bool(sim_state.pbc.any())
+            self._checked_periodicity.record(sim_state.pbc)
+
+        if self._fully_periodic and not self._custom_neighbor_list:
+            if self._batched_neighbor_list is None:
+                self._batched_neighbor_list = BatchedNeighborList(self.r_max)
+            wrapped_positions = wrap_positions(
+                sim_state.positions.detach(), sim_state.row_vector_cell, system_idx
+            )
+            edge_index, unit_shifts = self._batched_neighbor_list(
+                wrapped_positions,
+                sim_state.row_vector_cell,
+                system_idx,
+                self._system_pointer,
+                self._maximum_atoms_per_system,
+            )
+            unit_shifts = unit_shifts.to(wrapped_positions.dtype)
+            mapping_system = system_idx[edge_index[0]]
+        else:
+            wrapped_positions, edge_index, mapping_system, unit_shifts = (
+                self._torchsim_neighbors(sim_state, system_idx)
+            )
+        shifts = ts.transforms.compute_cell_shifts(
+            sim_state.row_vector_cell, unit_shifts, mapping_system
+        )
+        return self._evaluate(
+            sim_state, system_idx, wrapped_positions, edge_index, unit_shifts, shifts
+        )
+
+    def _check_species(
+        self, state_atomic_numbers: Optional[torch.Tensor], system_idx: torch.Tensor
+    ) -> None:
+        """The species and system index against the constructor's, or the cached
+        one-hot encoding rebuilt for new ones (host reads; once per new tensor)."""
         if state_atomic_numbers is not None and self.atomic_numbers_in_init:
             if not torch.equal(state_atomic_numbers, self.atomic_numbers):
                 raise ValueError(
                     "atomic_numbers in state do not match constructor values."
                 )
-
-        if sim_state.system_idx is None:
-            if not hasattr(self, "system_idx"):
-                raise ValueError(
-                    "system_idx must be provided if not set during initialization"
-                )
-            sim_state.system_idx = self.system_idx
 
         if not self.atomic_numbers_in_init:
             cached_atomic_numbers = getattr(self, "atomic_numbers", None)
@@ -535,20 +629,23 @@ class MaceTorchSimModel(ModelInterface):
                 cached_atomic_numbers is None
                 or cached_system_idx is None
                 or not torch.equal(state_atomic_numbers, cached_atomic_numbers)
-                or not torch.equal(sim_state.system_idx, cached_system_idx)
+                or not torch.equal(system_idx, cached_system_idx)
             )
             if needs_setup:
-                self.setup_from_system_idx(state_atomic_numbers, sim_state.system_idx)
+                self.setup_from_system_idx(state_atomic_numbers, system_idx)
 
+    def _torchsim_neighbors(self, sim_state: Any, system_idx: torch.Tensor) -> tuple:
+        """Positions wrapped by torch-sim and its neighbour list (partly periodic or
+        non-periodic batches, or a given ``neighbor_list_fn``)."""
         wrapped_positions = (
             ts.transforms.pbc_wrap_batched(  # pylint: disable=too-many-function-args
                 sim_state.positions,
                 sim_state.cell,
-                sim_state.system_idx,
+                system_idx,
                 sim_state.pbc,
             )
-            if sim_state.pbc.any()
-            else sim_state.positions
+            if self._periodic
+            else sim_state.positions.detach()
         )
 
         cutoff = self.r_max
@@ -564,12 +661,19 @@ class MaceTorchSimModel(ModelInterface):
             sim_state.row_vector_cell,
             sim_state.pbc,
             cutoff,
-            sim_state.system_idx,
+            system_idx,
         )
-        shifts = ts.transforms.compute_cell_shifts(
-            sim_state.row_vector_cell, unit_shifts, mapping_system
-        )
+        return wrapped_positions, edge_index, mapping_system, unit_shifts
 
+    def _evaluate(  # pylint: disable=too-many-positional-arguments
+        self,
+        sim_state: Any,
+        system_idx: torch.Tensor,
+        wrapped_positions: torch.Tensor,
+        edge_index: torch.Tensor,
+        unit_shifts: torch.Tensor,
+        shifts: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
         n_real_atoms = wrapped_positions.shape[0]
         n_real_edges = edge_index.shape[1]
         wrapped_positions = wrapped_positions.requires_grad_(True)
@@ -577,7 +681,7 @@ class MaceTorchSimModel(ModelInterface):
         data_dict: Dict[str, torch.Tensor] = {
             "ptr": self.ptr,
             "node_attrs": self.node_attrs,
-            "batch": sim_state.system_idx,
+            "batch": system_idx,
             "head": torch.full(
                 (self.n_systems,),
                 self._head_index,

@@ -145,3 +145,28 @@ def test_model_pickled_under_the_old_class_paths_loads(tmp_path):
     torch.testing.assert_close(
         _energy_and_forces(reloaded)[0], _energy_and_forces(model)[0], rtol=0, atol=0
     )
+
+
+def test_calculators_load_model_files_written_before_the_move(tmp_path):
+    """The ASE and TorchSim calculators load files through the remapping loader, so models
+    trained with earlier code (production fine-tunes of 2026-10) run without a conversion
+    step."""
+    from mace.calculators import MACECalculator  # noqa: PLC0415
+    from mace.calculators.mace_torchsim import MaceTorchSimModel  # noqa: PLC0415
+
+    model = _polar_model()
+    old_file = tmp_path / "old.model"
+    _save_under_old_paths(model, old_file)
+    calculator = MACECalculator(
+        model_paths=str(old_file),
+        device="cpu",
+        default_dtype="float64",
+        model_type="PolarMACE",
+    )
+    assert (
+        type(calculator.models[0]) is PolarMACE
+    )  # pylint: disable=unidiomatic-typecheck
+    wrapper = MaceTorchSimModel(str(old_file), device=torch.device("cpu"))
+    assert type(wrapper.model) is PolarMACE  # pylint: disable=unidiomatic-typecheck
+    for key, value in model.state_dict().items():
+        assert torch.equal(wrapper.model.state_dict()[key], value), key
