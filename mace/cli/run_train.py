@@ -1123,27 +1123,22 @@ def run(args) -> None:
     start_epoch = 0
     opt_start_epoch = None
     if args.restart_latest:
-        try:
+        # The latest stage-two checkpoint, else the latest stage-one one. A checkpoint that
+        # exists but cannot be loaded is an error: a resume never silently trains from the
+        # start (the weights of a partly applied checkpoint would already be loaded).
+        resume_state = tools.CheckpointState(model, optimizer, lr_scheduler, ema)
+        opt_start_epoch = checkpoint_handler.load_latest(
+            state=resume_state, swa=True, device=device
+        )
+        if opt_start_epoch is None:
             opt_start_epoch = checkpoint_handler.load_latest(
-                state=tools.CheckpointState(model, optimizer, lr_scheduler, ema),
-                swa=True,
-                device=device,
+                state=resume_state, swa=False, device=device
             )
-        except Exception:  # pylint: disable=W0703
-            try:
-                opt_start_epoch = checkpoint_handler.load_latest(
-                    state=tools.CheckpointState(model, optimizer, lr_scheduler, ema),
-                    swa=False,
-                    device=device,
-                )
-            except Exception:  # pylint: disable=W0703
-                # Both attempts raising used to set a flag for the reload below,
-                # so a run that asked to resume and could not started from
-                # scratch without saying so.
-                logging.warning(
-                    "--restart_latest was requested but no checkpoint could be "
-                    "loaded; training starts from scratch"
-                )
+        if opt_start_epoch is None:
+            logging.warning(
+                "--restart_latest was requested but there is no checkpoint; training "
+                "starts from scratch"
+            )
         if opt_start_epoch is not None:
             # The checkpoint was written after training its epoch: continue with the next.
             start_epoch = opt_start_epoch + 1

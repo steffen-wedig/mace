@@ -130,7 +130,6 @@ class CheckpointBuilder:
                 optimizer_state_for(state.optimizer, checkpoint["optimizer"])
             )
             reshape_state_to_parameters(state.optimizer)
-            state.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
         except ValueError as exc:
             logging.warning(
                 "Restored model weights but could not restore optimizer/scheduler "
@@ -138,6 +137,26 @@ class CheckpointBuilder:
                 "with a freshly initialized optimizer. This is expected if the "
                 "optimizer parameter groups changed since the checkpoint was written."
             )
+        restore_scheduler_state(state.lr_scheduler, checkpoint["lr_scheduler"])
+
+
+def restore_scheduler_state(scheduler, scheduler_state: Dict[str, Any]) -> None:
+    """Restore the epoch scheduler's state unless the checkpoint's came from another kind.
+
+    A run may resume with another ``--scheduler`` than the one that wrote the checkpoint
+    (e.g. ``Piecewise``, whose placeholder ``LambdaLR`` holds no state that matters: the
+    per-step schedule is a function of the epoch). Another kind's state cannot be loaded
+    (``LambdaLR`` needs ``lr_lambdas``, ``ReduceLROnPlateau`` has none), so it is dropped,
+    recognised by its keys.
+    """
+    expected_keys = set(scheduler.state_dict())
+    if expected_keys != set(scheduler_state):
+        logging.warning(
+            "Checkpoint scheduler state does not match the scheduler of this run "
+            "(--scheduler changed since it was written): not restored"
+        )
+        return
+    scheduler.load_state_dict(scheduler_state)
 
 
 @dataclasses.dataclass
@@ -226,27 +245,15 @@ class CheckpointIO:
             )
             return None
 
-        selected_checkpoint_info_list_swa = []
-        selected_checkpoint_info_list_no_swa = []
-
-        for ckp in selected_checkpoint_info_list:
-            if ckp.swa:
-                selected_checkpoint_info_list_swa.append(ckp)
-            else:
-                selected_checkpoint_info_list_no_swa.append(ckp)
-        if swa:
-            try:
-                latest_checkpoint_info = max(
-                    selected_checkpoint_info_list_swa, key=lambda info: info.epochs
-                )
-            except ValueError:
-                logging.warning(
-                    "No SWA checkpoint found, while SWA is enabled. Compare the swa_start parameter and the latest checkpoint."
-                )
-        else:
-            latest_checkpoint_info = max(
-                selected_checkpoint_info_list_no_swa, key=lambda info: info.epochs
+        candidates = [info for info in selected_checkpoint_info_list if info.swa == bool(swa)]
+        if not candidates:
+            # Asked for a stage-two checkpoint where there is none (or the reverse): the
+            # caller falls back to the other kind.
+            logging.info(
+                f"No {'stage-two' if swa else 'stage-one'} checkpoint with tag '{self.tag}'"
             )
+            return None
+        latest_checkpoint_info = max(candidates, key=lambda info: info.epochs)
         return latest_checkpoint_info.path
 
     def save(

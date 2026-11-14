@@ -208,3 +208,27 @@ def test_restored_moments_take_their_parameter_shape():
     torch.testing.assert_close(state["exp_avg"].flatten(), saved.state[flat]["exp_avg"])
     row.grad = torch.ones(1, 6)
     restored.step()
+
+
+def test_scheduler_state_of_another_kind_is_dropped(caplog):
+    from mace.tools.checkpoint import restore_scheduler_state
+
+    parameter = torch.nn.Parameter(torch.zeros(2))
+    optimizer = torch.optim.Adam([parameter], lr=1e-3)
+    plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3)
+    placeholder = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+    with caplog.at_level("WARNING"):
+        restore_scheduler_state(placeholder, plateau.state_dict())
+    assert "does not match" in caplog.text
+    other_plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=7)
+    restore_scheduler_state(other_plateau, plateau.state_dict())
+    assert other_plateau.patience == 3
+
+
+def test_latest_checkpoint_of_a_missing_kind_is_none(tmp_path):
+    from mace.tools.checkpoint import CheckpointIO
+
+    (tmp_path / "run_epoch-4.pt").write_bytes(b"")
+    io = CheckpointIO(str(tmp_path), tag="run", swa_start=10)
+    assert io._get_latest_checkpoint_path(swa=True) is None  # pylint: disable=W0212
+    assert io._get_latest_checkpoint_path(swa=False).endswith("run_epoch-4.pt")  # pylint: disable=W0212

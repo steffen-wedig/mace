@@ -85,3 +85,19 @@ def test_a_resumed_two_stage_run_continues_after_its_checkpoint(
     # already has it in its checkpoint.
     assert ("Stage two: optimizer state reset" in log) is expect_reset
     assert "raw weights" not in log  # no fallback to an EMA-only checkpoint
+
+
+def test_a_resume_with_another_scheduler_continues_after_its_checkpoint(tmp_path):
+    """A run resumed with `--scheduler Piecewise` from a ReduceLROnPlateau checkpoint.
+
+    The scheduler state of the other kind cannot be loaded; it used to raise after the model
+    weights were loaded, and the fallback trained from epoch 0 with those weights."""
+    full_run_then_truncate(tmp_path, keep_until=2)
+
+    run_mace_train(params(tmp_path, restart_latest=None, scheduler="Piecewise"))
+
+    log = log_text(tmp_path)
+    epochs = [int(epoch) for epoch in re.findall(r"INFO: Epoch (\d+): head", log)]
+    assert epochs[0] == 3, epochs
+    assert "scheduler state does not match" in log
+    assert "starts from scratch" not in log
