@@ -9,6 +9,7 @@ import torch
 from ase import units
 from ase.calculators.mixing import SumCalculator
 
+from mace.modules.polar.conversion import load_model_file
 from mace.tools.deprecation import warn
 from mace.tools.utils import get_cache_dir
 
@@ -384,7 +385,8 @@ def mace_polar(
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     if return_raw_model:
-        return torch.load(model_path, map_location=device)
+        # The published MACE-Polar files predate the polar package: remapped on load.
+        return load_model_file(model_path, map_location=device)
     return MACECalculator(
         model_paths=str(model_path),
         device=device,

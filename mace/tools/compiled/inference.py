@@ -99,15 +99,20 @@ class InferenceBudgets(NamedTuple):
     kspace_rows: int
 
 
-# The padding structure: atoms of the first atom's element on a cubic grid (nonzero
-# separations) in a cubic cell of their own, enough of them that the padding edges give
-# each a few dozen neighbours (thousands of edges on a handful of atoms could overflow
-# their features in float32, and the dense k-space products would carry inf * 0 = NaN
-# into real rows).
+# The padding structure: atoms of the first atom's element on a cubic grid whose spacing
+# (``padding_spacing``, callers pass twice the model's r_max) puts every padding edge beyond
+# the cutoff, and enough of them that each carries a bounded number of padding edges.
+# - With ``apply_cutoff=False`` (POLAR-M) the cutoff multiplies the edge harmonics and the
+#   density: beyond r_max it is exactly zero, so padding edges carry nothing and the padding
+#   atoms are isolated atoms (inert).
+# - With ``apply_cutoff=True`` the cutoff enters only the radial network's input; an edge
+#   beyond r_max still carries the network's bias and element terms, so the padding atoms
+#   are not inert, but stay finite with a bounded number of edges each.
+# (Padding atoms 1.5 A apart with ~47 edges each reached node energies of 1e17 in POLAR-M and
+# overflowed in float32; the dense k-space products then carried inf * 0 = NaN into the real
+# structures.)
 PADDING_ATOMS = 4
-PADDING_EDGES_PER_ATOM = 48
-PADDING_SPACING = 1.5
-PADDING_CELL_LENGTH = 12.0
+PADDING_EDGES_PER_ATOM = 32
 
 _PER_GRAPH_ZEROS = ("total_charge", "external_field", "fermi_level")
 
@@ -131,8 +136,9 @@ def inference_budgets(
     rows = int(data["kspace_miller"].shape[0]) if "kspace_miller" in data else 0
     edges = int(data["edge_index"].shape[1])
     edge_budget = round_up(edges * (1 + edge_headroom), edge_multiple)
+    # Room for twice the padding edges of this batch (counts drift below it too).
     padding_atoms = max(
-        PADDING_ATOMS, math.ceil((edge_budget - edges) / PADDING_EDGES_PER_ATOM)
+        PADDING_ATOMS, math.ceil(2 * (edge_budget - edges) / PADDING_EDGES_PER_ATOM)
     )
     return InferenceBudgets(
         atoms=int(data["positions"].shape[0]) + padding_atoms,
@@ -155,11 +161,12 @@ def fits_budgets(data: Dict[str, torch.Tensor], budgets: InferenceBudgets) -> bo
 
 
 def pad_inference_batch(
-    data: Dict[str, torch.Tensor], budgets: InferenceBudgets
+    data: Dict[str, torch.Tensor], budgets: InferenceBudgets, padding_spacing: float
 ) -> Dict[str, torch.Tensor]:
     """``data`` padded to ``budgets`` with one padding structure appended (index
-    ``num_graphs``): its atoms, the padding edges (a ring between its atoms, no
-    periodic shift) and the padding k-vector rows (always excluded). No edge, pair or
+    ``num_graphs``): its atoms ``padding_spacing`` apart (more than the model's cutoff),
+    the padding edges (a ring between its atoms, no periodic shift, all beyond the
+    cutoff, so they carry nothing) and the padding k-vector rows (always excluded). No edge, pair or
     k-vector couples it to a real structure and every per-structure sum keeps it apart,
     so the real structures' outputs are those of the unpadded batch: take
     ``energy[:num_graphs]``, ``forces[:num_atoms]``, ``stress[:num_graphs]``.
@@ -176,7 +183,10 @@ def pad_inference_batch(
     index = torch.arange(padding_atoms, device=device)
     grid = torch.stack([index % side, (index // side) % side, index // side**2], dim=1)
     padded: Dict[str, torch.Tensor] = dict(data)
-    padded["positions"] = torch.cat([positions, grid.to(dtype) * PADDING_SPACING + 1.0])
+    padded["positions"] = torch.cat(
+        [positions, (grid.to(dtype) + 0.5) * padding_spacing]
+    )
+    padding_cell_length = (side + 1) * padding_spacing
     padded["node_attrs"] = torch.cat(
         [data["node_attrs"], data["node_attrs"][:1].expand(padding_atoms, -1)]
     )
@@ -197,16 +207,16 @@ def pad_inference_batch(
     eye = torch.eye(3, device=device, dtype=dtype)
     cell = data["cell"]
     padded["cell"] = torch.cat(
-        [cell.reshape(-1, 3, 3), (eye * PADDING_CELL_LENGTH).unsqueeze(0)]
+        [cell.reshape(-1, 3, 3), (eye * padding_cell_length).unsqueeze(0)]
     ).reshape(-1, *cell.shape[1:])
     if "rcell" in data:
         rcell = data["rcell"]
         padded["rcell"] = torch.cat(
-            [rcell.reshape(-1, 3, 3), (eye * 2 * math.pi / PADDING_CELL_LENGTH)[None]]
+            [rcell.reshape(-1, 3, 3), (eye * 2 * math.pi / padding_cell_length)[None]]
         ).reshape(-1, *rcell.shape[1:])
     if "volume" in data:
         padded["volume"] = torch.cat(
-            [data["volume"], data["volume"].new_full((1,), PADDING_CELL_LENGTH**3)]
+            [data["volume"], data["volume"].new_full((1,), padding_cell_length**3)]
         )
     if "head" in data:
         padded["head"] = torch.cat([data["head"], data["head"][:1]])

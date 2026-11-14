@@ -22,7 +22,7 @@ from ase.stress import full_3x3_to_voigt_6_stress
 from e3nn import o3
 
 from mace import data as mace_data
-from mace.modules.polar.conversion import validate_pbc_handling
+from mace.modules.polar.conversion import load_model_file, validate_pbc_handling
 from mace.modules.utils import extract_invariant
 from mace.tools import torch_geometric, torch_tools, utils
 from mace.tools.compile import (
@@ -271,7 +271,7 @@ class MACECalculator(Calculator):
                 raise ValueError("No mace file names supplied")
             self.num_models = len(model_paths)
             self.models = [
-                torch.load(f=model_path, map_location=device)
+                load_model_file(model_path, map_location=device)
                 for model_path in model_paths
             ]
         elif models is not None:
@@ -1234,7 +1234,7 @@ class MagneticMACECalculator(Calculator):
             # dtype change and for the `models=` branch too. Doing it twice
             # fed a converted model to a converter expecting e3nn layout.
             self.models = [
-                torch.load(f=model_path, map_location=device)
+                load_model_file(model_path, map_location=device)
                 for model_path in model_paths
             ]
 

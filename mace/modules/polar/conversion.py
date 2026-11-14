@@ -90,14 +90,24 @@ remapping_pickle_module = types.SimpleNamespace(
 )
 
 
-def load_polar_model(path, map_location: Optional[str] = None) -> torch.nn.Module:
-    """A PolarMACE whole-model file, from before or after the move into the package."""
+def load_model_file(path, map_location=None) -> torch.nn.Module:
+    """A whole-model file of any MACE model. PolarMACE files from before the move into
+    ``mace.modules.polar`` (class paths under ``mace.modules.extensions``,
+    ``graph_longrange``, ...) load too: their class paths are remapped and the submodules
+    of removed classes dropped; every other pickle loads as with ``torch.load``. The
+    calculators load files through this, so models trained with earlier code keep working
+    without a conversion step."""
     return torch.load(
         path,
         map_location=map_location,
         weights_only=False,
         pickle_module=remapping_pickle_module,
     )
+
+
+def load_polar_model(path, map_location: Optional[str] = None) -> torch.nn.Module:
+    """A PolarMACE whole-model file, from before or after the move into the package."""
+    return load_model_file(path, map_location=map_location)
 
 
 def main(arguments: Optional[Sequence[str]] = None) -> None:
