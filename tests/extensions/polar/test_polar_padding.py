@@ -311,7 +311,7 @@ def test_static_compiled_loss_on_padded_batches_matches_eager_unpadded():
         model.set_electrostatic_pbcs("realspace")
         loss_fn = _huber()
         compiled_loss = CompiledForceTrainingLoss(
-            model, FORWARD_KWARGS, static_shapes=True
+            model, FORWARD_KWARGS, shape_mode="padded_per_budget"
         )
         batches = [_water_clusters(sizes, seed) for sizes, seed in (([4, 6, 3], 0), ([5, 7], 1))]
         envelope = BatchShape(
@@ -349,6 +349,62 @@ def test_static_compiled_loss_on_padded_batches_matches_eager_unpadded():
         assert counters["stats"]["unique_graphs"] - graphs_before == 1
     finally:
         torch.set_default_dtype(previous_dtype)
+
+
+@requires_graph_longrange
+@pytest.mark.polar
+@pytest.mark.slow
+def test_shared_compiled_loss_serves_every_budget_with_one_graph():
+    """Batches padded to three different budgets: padded_shared compiles ONE graph with
+    symbolic sizes for all of them (padded_per_budget would compile three), with eager
+    parity."""
+    from torch._dynamo.utils import counters  # noqa: PLC0415
+
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    try:
+        configure_dynamo_for_training()
+        torch._dynamo.reset()
+        with mace_compile.disable_e3nn_codegen():
+            model = _polar_model()
+        model.set_electrostatic_pbcs("realspace")
+        loss_fn = _huber()
+        compiled_loss = CompiledForceTrainingLoss(
+            model, FORWARD_KWARGS, shape_mode="padded_shared"
+        )
+        batches = [
+            _water_clusters(sizes, seed)
+            for sizes, seed in (([4, 6, 3], 0), ([5, 7], 1), ([8, 9, 6], 2))
+        ]
+        graphs_before = counters["stats"]["unique_graphs"]
+        budgets = set()
+        for extra_graphs, structures in zip((1, 2, 3), batches, strict=True):
+            budget = _roomy_budget(structures, extra_graphs)
+            budgets.add(budget)
+            reference = _loss_and_gradients(model, loss_fn, _unpadded(structures))
+            model.zero_grad(set_to_none=True)
+            loss = compiled_loss(model, loss_fn, _padded(structures, budget))
+            loss.backward()
+            compiled = (
+                None,
+                loss.detach(),
+                {
+                    name: parameter.grad.detach().clone()
+                    for name, parameter in model.named_parameters()
+                    if parameter.grad is not None
+                },
+            )
+            _assert_same_loss_and_gradients(reference, compiled, tolerance=1e-11)
+        assert len(budgets) == 3
+        assert counters["stats"]["unique_graphs"] - graphs_before == 1
+        assert compiled_loss.eager_batches == 0
+    finally:
+        torch.set_default_dtype(previous_dtype)
+
+
+def test_compiled_loss_refuses_an_unknown_shape_mode():
+    with pytest.raises(ValueError, match="shape_mode"):
+        CompiledForceTrainingLoss(torch.nn.Linear(1, 1), FORWARD_KWARGS, shape_mode="static")
 
 
 @requires_graph_longrange

@@ -431,6 +431,18 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=0,
     )
     parser.add_argument(
+        "--padding_graphs",
+        help=(
+            "with --padding_buckets: 'shared' compiles one graph with symbolic sizes for "
+            "all budgets (compiled once, one CUDA graph recorded per budget); "
+            "'per_budget' compiles one static-shape graph per budget (each budget pays "
+            "the full compile)"
+        ),
+        type=str,
+        choices=["shared", "per_budget"],
+        default="per_budget",
+    )
+    parser.add_argument(
         "--padding_cost_weights",
         help=(
             "relative step cost per node, per edge and per real-space pair, used to choose "

@@ -1221,10 +1221,15 @@ def run(args) -> None:
             training_forward_kwargs,
         )
 
+        shape_mode = "dynamic"
+        if args.padding_buckets > 0:
+            shape_mode = (
+                "padded_shared" if args.padding_graphs == "shared" else "padded_per_budget"
+            )
         compiled_loss = CompiledForceTrainingLoss(
             model,
             training_forward_kwargs(output_args),
-            static_shapes=args.padding_buckets > 0,
+            shape_mode=shape_mode,
         )
 
     learning_rate_schedule = get_learning_rate_schedule(

@@ -11,20 +11,29 @@ What stays outside the compiled region: the position leaf (``requires_grad_`` on
 created inside the region breaks the graph), ``loss.backward()`` itself (it runs the
 compiled backward), gradient clipping, the optimizer and the EMA.
 
-Two shape modes:
+Three shape modes (``ShapeMode``):
 
-- dynamic (default): cluster batches nearly always have a new number of atoms, edges and
-  pairs, and one graph with symbolic sizes serves them all without recompiling;
-- static (``static_shapes=True``): batches padded to a few fixed budgets
-  (``mace.data.padding``), one graph per budget, replayed as CUDA graphs
-  (``mode="reduce-overhead"``). CUDA graphs with dynamic shapes are unsupported (reforge
-  experiment 06: segfaults). The rare batch larger than every budget arrives unpadded
-  and runs eagerly.
+- ``dynamic``: unpadded cluster batches nearly always have a new number of atoms, edges
+  and pairs, and one graph with symbolic sizes serves them all without recompiling; no
+  CUDA graphs;
+- ``padded_per_budget``: batches padded to a few fixed budgets (``mace.data.padding``),
+  one static-shape graph per budget, each replayed as a CUDA graph
+  (``mode="reduce-overhead"``). Every budget pays the full compile (Dynamo, AOTAutograd,
+  Inductor): ~2 min per budget for POLAR-M in float64;
+- ``padded_shared``: the same padded batches, but one graph with symbolic sizes for all
+  budgets, compiled once. Inductor's CUDA-graph trees record one CUDA graph per distinct
+  budget (``cudagraph_skip_dynamic_graphs`` off), so the replay is the same as
+  ``padded_per_budget`` while the compile is paid once. (Reforge experiment 06 saw
+  segfaults with CUDA graphs on unpadded dynamic shapes, where every batch is a new
+  shape; padded budgets bound the recordings.)
+
+In both padded modes the rare batch larger than every budget arrives unpadded and runs
+eagerly.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Literal, get_args
 
 import torch
 import torch._dynamo
@@ -35,6 +44,13 @@ from mace.tools.compiled import small_matmuls
 
 # Recompiles beyond this many are an error, not a silent fall-back to eager (reforge F6).
 RECOMPILE_LIMIT = 8
+
+ShapeMode = Literal["dynamic", "padded_per_budget", "padded_shared"]
+SHAPE_MODES: tuple[str, ...] = get_args(ShapeMode)
+
+# Batch tensors whose varying size is the last dimension (COO index pairs, [2, n]);
+# every other batch tensor varies along dimension 0.
+TRAILING_SIZE_KEYS = frozenset({"edge_index", "real_space_pair_index"})
 
 
 def configure_dynamo_for_training(recompile_limit: int = RECOMPILE_LIMIT) -> None:
@@ -54,16 +70,19 @@ def configure_dynamo_for_training(recompile_limit: int = RECOMPILE_LIMIT) -> Non
     torch._dynamo.config.specialize_float = True
     torch._dynamo.config.recompile_limit = recompile_limit
     torch._dynamo.config.fail_on_recompile_limit_hit = True
+    # padded_shared: one CUDA graph per padding budget is expected, not a sign of an
+    # unbounded stream of shapes; the budget count is bounded by --padding_buckets.
+    torch._inductor.config.triton.cudagraph_dynamic_shape_warn_limit = None
 
 
-def training_inductor_options(static_shapes: bool) -> Dict[str, Any]:
+def training_inductor_options(shape_mode: ShapeMode) -> Dict[str, Any]:
     """Inductor options of the compiled training loss, passed to its ``torch.compile``:
 
     - small matrix products as fused reductions (``mace.tools.compiled.small_matmuls``);
-    - with static shapes (padded batches), CUDA graphs (``mode="reduce-overhead"``).
+    - with padded batches (both padded modes), CUDA graphs (``mode="reduce-overhead"``).
     """
     options = small_matmuls.inductor_options()
-    if static_shapes:
+    if shape_mode != "dynamic":
         options.update(torch._inductor.list_mode_options("reduce-overhead"))
     return options
 
@@ -83,8 +102,12 @@ class CompiledForceTrainingLoss:
         self,
         model: torch.nn.Module,
         forward_kwargs: Dict[str, bool],
-        static_shapes: bool = False,
+        shape_mode: ShapeMode = "dynamic",
     ):
+        if shape_mode not in SHAPE_MODES:
+            raise ValueError(
+                f"shape_mode must be one of {SHAPE_MODES}, got {shape_mode!r}"
+            )
         if not forward_kwargs.get("compute_force", False):
             raise ValueError("compiled force training needs compute_force")
         for unsupported in ("compute_stress", "compute_virials"):
@@ -96,15 +119,37 @@ class CompiledForceTrainingLoss:
         self.forward_kwargs = dict(forward_kwargs)
         self.model = model
         self.view = mace_compile.simplified_view(model)
-        self.static_shapes = static_shapes
-        # Unpadded batches run eagerly under static shapes (counted for the logs).
+        self.shape_mode = shape_mode
+        # Unpadded batches run eagerly in the padded modes (counted for the logs).
         self.eager_batches = 0
         self._compiled = torch.compile(
             self._loss,
             fullgraph=True,
-            dynamic=not static_shapes,
-            options=training_inductor_options(static_shapes),
+            # padded_shared marks the padded sizes dynamic per call (_mark_sizes_dynamic);
+            # dynamic=None leaves everything else static instead of guessing.
+            dynamic={
+                "dynamic": True,
+                "padded_per_budget": False,
+                "padded_shared": None,
+            }[shape_mode],
+            options=training_inductor_options(shape_mode),
         )
+
+    @staticmethod
+    def _mark_sizes_dynamic(
+        batch_dict: Dict[str, torch.Tensor], positions: torch.Tensor
+    ):
+        """Symbolic leading sizes: every per-graph, per-node, per-edge and per-pair size.
+
+        The tensors also reach the graph through the Batch object (the loss reference),
+        where Dynamo would otherwise specialise them on the first batch.
+        """
+        for key, value in batch_dict.items():
+            if torch.is_tensor(value) and value.dim() > 0:
+                torch._dynamo.maybe_mark_dynamic(value, 0)
+                if key in TRAILING_SIZE_KEYS:
+                    torch._dynamo.maybe_mark_dynamic(value, value.dim() - 1)
+        torch._dynamo.maybe_mark_dynamic(positions, 0)
 
     def _loss(
         self,
@@ -123,7 +168,7 @@ class CompiledForceTrainingLoss:
         if model is not self.model:
             raise ValueError("compiled loss called with a model other than its own")
         batch_dict = batch.to_dict()
-        if self.static_shapes:
+        if self.shape_mode != "dynamic":
             if batch_dict.get("real_graph_mask") is None:
                 # A batch larger than every padding budget (mace.data.padding): eager,
                 # rather than a new graph for a shape that may never come back.
@@ -134,22 +179,21 @@ class CompiledForceTrainingLoss:
                 )
                 return loss_fn(pred=output, ref=batch)
             positions = batch_dict["positions"].detach().requires_grad_(True)
+            if self.shape_mode == "padded_shared":
+                self._mark_sizes_dynamic(batch_dict, positions)
             # A new training step: outputs of the previous replay may be overwritten.
             torch.compiler.cudagraph_mark_step_begin()
             return self._compiled(self.view, loss_fn, batch, batch_dict, positions)
         # Every per-graph, per-node, per-edge and per-pair size varies between batches.
-        # The tensors also reach the graph through the Batch object (the loss
-        # reference), where Dynamo would otherwise specialise them on the first batch.
-        for value in batch_dict.values():
-            if torch.is_tensor(value) and value.dim() > 0:
-                torch._dynamo.maybe_mark_dynamic(value, 0)
         positions = batch_dict["positions"].detach().requires_grad_(True)
-        torch._dynamo.maybe_mark_dynamic(positions, 0)
+        self._mark_sizes_dynamic(batch_dict, positions)
         return self._compiled(self.view, loss_fn, batch, batch_dict, positions)
 
 
 __all__ = [
     "CompiledForceTrainingLoss",
     "RECOMPILE_LIMIT",
+    "SHAPE_MODES",
+    "ShapeMode",
     "configure_dynamo_for_training",
 ]
