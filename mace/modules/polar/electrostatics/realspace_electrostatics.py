@@ -38,25 +38,88 @@ SERIES_CROSSOVER = 0.5
 SERIES_NUM_TERMS = 13
 
 
+def _series_coefficient_values(highest_order: int) -> list[list[float]]:
+    """Taylor coefficients c[k][n] = (-1)^k / (k! (2n + 2k + 1)) of the kernels.
+
+    Rows are the SERIES_NUM_TERMS powers k of scaled_distance_squared, columns
+    the kernel orders n = 0..highest_order. Each entry is an exact rational
+    rounded once to float64 (Python int / int true division).
+    """
+    return [
+        [
+            (-1) ** power / (math.factorial(power) * (2 * order + 2 * power + 1))
+            for order in range(highest_order + 1)
+        ]
+        for power in range(SERIES_NUM_TERMS)
+    ]
+
+
+# Eager-mode copies of the coefficient table per (highest_order, dtype, device):
+# building it from Python values on every call would be a host-to-device copy
+# that synchronises the stream.
+_SERIES_COEFFICIENT_TABLES: dict[
+    tuple[int, torch.dtype, torch.device], torch.Tensor
+] = {}
+
+
+def _series_coefficients(highest_order: int, reference: torch.Tensor) -> torch.Tensor:
+    """[SERIES_NUM_TERMS, highest_order + 1] coefficient table in reference's dtype/device.
+
+    Under torch.compile the table is traced as a graph constant; eager calls
+    reuse a cached copy. Converting the float64 Python values to a narrower
+    dtype rounds once, exactly as casting a float64 table would.
+    """
+    if torch.compiler.is_compiling():
+        return torch.tensor(
+            _series_coefficient_values(highest_order),
+            dtype=reference.dtype,
+            device=reference.device,
+        )
+    key = (highest_order, reference.dtype, reference.device)
+    table = _SERIES_COEFFICIENT_TABLES.get(key)
+    if table is None:
+        table = torch.tensor(
+            _series_coefficient_values(highest_order),
+            dtype=reference.dtype,
+            device=reference.device,
+        )
+        _SERIES_COEFFICIENT_TABLES[key] = table
+    return table
+
+
 def _smeared_coulomb_kernels_series(
     scaled_distance_squared: torch.Tensor,
     combined_smearing_width,
     highest_order: int,
 ) -> list[torch.Tensor]:
-    """Taylor-series branch of the smeared-Coulomb kernels (small distances)."""
-    accumulators = [
-        torch.zeros_like(scaled_distance_squared) for _ in range(highest_order + 1)
-    ]
-    term = torch.ones_like(scaled_distance_squared)
-    for k in range(SERIES_NUM_TERMS):
-        for order in range(highest_order + 1):
-            accumulators[order] = accumulators[order] + term / (2 * order + 2 * k + 1)
-        term = term * (-scaled_distance_squared) / (k + 1)
+    """Taylor-series branch of the smeared-Coulomb kernels (small distances).
+
+    With x = scaled_distance_squared the kernel of order n is
+
+        B_n = sqrt(2/pi) / width^(2n+1) * sum_k c[k, n] x^k,
+        c[k, n] = (-1)^k / (k! (2n + 2k + 1)),  k = 0..SERIES_NUM_TERMS-1,
+
+    evaluated for all orders at once as one contraction of the stacked powers
+    with the coefficient table. The powers are plain successive products
+    (no torch.pow or cumprod), so every derivative, including the double
+    backward of force training, stays finite at x = 0.
+    """
+    powers = [torch.ones_like(scaled_distance_squared), scaled_distance_squared]
+    for _ in range(SERIES_NUM_TERMS - 2):
+        powers.append(powers[-1] * scaled_distance_squared)
+    stacked_powers = torch.stack(powers, dim=-1)  # [..., SERIES_NUM_TERMS]
+    coefficients = _series_coefficients(highest_order, scaled_distance_squared)
+    # Elementwise product and sum over the power axis rather than a matmul:
+    # identical arithmetic, fuses with the powers under torch.compile, and is
+    # immune to reduced-precision (TF32) matmul settings.
+    accumulators = torch.sum(
+        stacked_powers.unsqueeze(-1) * coefficients, dim=-2
+    )  # [..., highest_order + 1]
 
     kernels = []
     width_power = 1.0 / combined_smearing_width
     for order in range(highest_order + 1):
-        kernels.append(SQRT_TWO_OVER_PI * width_power * accumulators[order])
+        kernels.append(SQRT_TWO_OVER_PI * width_power * accumulators[..., order])
         width_power = width_power / combined_smearing_width**2
     return kernels
 
@@ -148,13 +211,13 @@ def smeared_coulomb_kernels(
         raise ValueError(
             f"highest_order must be 0, 1 or 2 (l <= 1), got {highest_order}"
         )
-    # Further work (performance): both branches are evaluated for every edge,
-    # and the unrolled series alone emits ~40 small elementwise kernels, so
-    # batches of many tiny graphs are launch-overhead bound (0.6-0.8x vs the
-    # finite-difference modules on B200; every larger regime wins). The whole
-    # chain is straight-line elementwise math and should fuse into a few
-    # kernels under torch.compile. TODO: verify compilation and double
-    # backward before relying on it.
+    # Further work (performance): both branches are evaluated for every edge.
+    # The series is a single contraction of SERIES_NUM_TERMS stacked powers
+    # with a coefficient table (a handful of ops instead of an unrolled
+    # terms x orders loop), but eager batches of many tiny graphs can still
+    # be launch-overhead bound (measured 0.6-0.8x vs the finite-difference
+    # modules on B200 before the contraction; every larger regime wins).
+    # The chain is straight-line elementwise math that torch.compile fuses.
     scaled_distance_squared = distance_squared / (2.0 * combined_smearing_width**2)
     in_series_branch = scaled_distance_squared < SERIES_CROSSOVER
     # Clamp each branch's argument into its safe domain before torch.where:
