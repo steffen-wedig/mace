@@ -10,11 +10,6 @@ FIELD_CONSTANT = 1 / (5.526349406 * 1e-3)
 CUBIC_MADELUNG = 2.837297
 
 
-def permute_to_e3nn_convention(x):
-    """see the note on real harmonics values in https://docs.e3nn.org/en/latest/api/o3/o3_sh.html"""
-    return x[..., torch.LongTensor([1, 2, 0])]
-
-
 def to_dense_batch(
     x: torch.Tensor,
     batch: Optional[torch.Tensor] = None,

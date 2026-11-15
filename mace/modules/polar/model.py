@@ -64,7 +64,11 @@ from .linear_folds import (
 
 
 def _permute_to_e3nn_convention(x: torch.Tensor) -> torch.Tensor:
-    return x[..., torch.LongTensor([1, 2, 0]).to(x.device)]
+    """(x, y, z) -> (y, z, x), the order of e3nn's real l=1 harmonics.
+
+    A plain index list, not ``torch.LongTensor``: the legacy constructor allocates on the
+    host every call and makes AOTAutograd bypass its cache in compiled training."""
+    return x[..., [1, 2, 0]]
 
 
 @compile_mode("script")
