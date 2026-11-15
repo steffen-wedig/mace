@@ -440,7 +440,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         ),
         type=str,
         choices=["shared", "per_budget"],
-        default="per_budget",
+        default="shared",
     )
     parser.add_argument(
         "--padding_cost_weights",
