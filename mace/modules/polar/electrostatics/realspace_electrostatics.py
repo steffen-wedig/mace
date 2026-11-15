@@ -959,7 +959,7 @@ class RealSpaceAnalyticalEnergy(torch.nn.Module):
 
         if self.include_self_interaction:
             self_fields = self.self_interaction(source_feats)
-            self_node_energies = torch.einsum("nb,nb->n", source_feats, self_fields)
+            self_node_energies = (source_feats * self_fields).sum(dim=-1)
             energy = energy + 0.5 * scatter_sum(
                 src=self_node_energies, index=batch, dim=-1, dim_size=num_graphs
             )

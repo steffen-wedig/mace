@@ -58,7 +58,6 @@ def run(
         layout="ir_mul",
         group="O3_e3nn",
         optimize_all=False,
-        optimize_linear=True,
         optimize_symmetric=True,
         optimize_fctp=True,
         optimize_channelwise=False,
@@ -73,7 +72,7 @@ def run(
     )
 
     logging.info(
-        "Creating hybrid model: cueq for symmetric/linear/fctp, "
+        "Creating hybrid model: cueq for symmetric/fctp, "
         "oeq TensorProductConv for channelwise TP"
     )
     target_model = source_model.__class__(**config).to(device)

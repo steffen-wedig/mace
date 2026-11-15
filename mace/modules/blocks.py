@@ -15,11 +15,11 @@ import torch.nn.functional
 from e3nn import nn, o3
 from e3nn.util.jit import compile_mode
 
+from mace.modules.equivariant_linear import EquivariantLinear, NarrowEquivariantLinear
 from mace.modules.gate import GatedEquivariantBlock
 from mace.modules.wrapper_ops import (
     CuEquivarianceConfig,
     FullyConnectedTensorProduct,
-    Linear,
     OEQConfig,
     SymmetricContractionWrapper,
     TensorProduct,
@@ -50,8 +50,10 @@ class LinearNodeEmbeddingBlock(torch.nn.Module):
         cueq_config: Optional[CuEquivarianceConfig] = None,
     ):
         super().__init__()
-        self.linear = Linear(
-            irreps_in=irreps_in, irreps_out=irreps_out, cueq_config=cueq_config
+        self.linear = EquivariantLinear(
+            irreps_in=irreps_in,
+            irreps_out=irreps_out,
+            layout=get_layout(cueq_config),
         )
 
     def forward(
@@ -71,8 +73,11 @@ class LinearReadoutBlock(torch.nn.Module):
         oeq_config: Optional[OEQConfig] = None,  # pylint: disable=unused-argument
     ):
         super().__init__()
-        self.linear = Linear(
-            irreps_in=irreps_in, irreps_out=irrep_out, cueq_config=cueq_config
+        # One scalar per head: a narrow readout.
+        self.linear = NarrowEquivariantLinear(
+            irreps_in=irreps_in,
+            irreps_out=irrep_out,
+            layout=get_layout(cueq_config),
         )
 
     def forward(
@@ -98,14 +103,18 @@ class NonLinearReadoutBlock(torch.nn.Module):
         super().__init__()
         self.hidden_irreps = MLP_irreps
         self.num_heads = num_heads
-        self.linear_1 = Linear(
-            irreps_in=irreps_in, irreps_out=self.hidden_irreps, cueq_config=cueq_config
+        self.linear_1 = EquivariantLinear(
+            irreps_in=irreps_in,
+            irreps_out=self.hidden_irreps,
+            layout=get_layout(cueq_config),
         )
         self.non_linearity = simplify_if_compile(nn.Activation)(
             irreps_in=self.hidden_irreps, acts=[gate]
         )
-        self.linear_2 = Linear(
-            irreps_in=self.hidden_irreps, irreps_out=irrep_out, cueq_config=cueq_config
+        self.linear_2 = NarrowEquivariantLinear(
+            irreps_in=self.hidden_irreps,
+            irreps_out=irrep_out,
+            layout=get_layout(cueq_config),
         )
 
     def forward(
@@ -140,15 +149,23 @@ class NonLinearBiasReadoutBlock(torch.nn.Module):
         super().__init__()
         self.hidden_irreps = MLP_irreps
         self.num_heads = num_heads
-        self.linear_1 = Linear(
-            irreps_in=irreps_in, irreps_out=self.hidden_irreps, cueq_config=cueq_config
+        self.linear_1 = EquivariantLinear(
+            irreps_in=irreps_in,
+            irreps_out=self.hidden_irreps,
+            layout=get_layout(cueq_config),
         )
         self.non_linearity = nn.Activation(irreps_in=self.hidden_irreps, acts=[gate])
-        self.linear_mid = o3.Linear(
-            irreps_in=self.hidden_irreps, irreps_out=self.hidden_irreps, biases=True
+        self.linear_mid = EquivariantLinear(
+            irreps_in=self.hidden_irreps,
+            irreps_out=self.hidden_irreps,
+            layout=get_layout(cueq_config),
+            biases=True,
         )
-        self.linear_2 = o3.Linear(
-            irreps_in=self.hidden_irreps, irreps_out=irrep_out, biases=True
+        self.linear_2 = NarrowEquivariantLinear(
+            irreps_in=self.hidden_irreps,
+            irreps_out=irrep_out,
+            layout=get_layout(cueq_config),
+            biases=True,
         )
 
     def forward(
@@ -179,8 +196,10 @@ class LinearDipoleReadoutBlock(torch.nn.Module):
             self.irreps_out = o3.Irreps("1x1o")
         else:
             self.irreps_out = o3.Irreps("1x0e + 1x1o")
-        self.linear = Linear(
-            irreps_in=irreps_in, irreps_out=self.irreps_out, cueq_config=cueq_config
+        self.linear = EquivariantLinear(
+            irreps_in=irreps_in,
+            irreps_out=self.irreps_out,
+            layout=get_layout(cueq_config),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # [n_nodes, irreps]  # [..., ]
@@ -220,13 +239,15 @@ class NonLinearDipoleReadoutBlock(torch.nn.Module):
             layout=get_layout(cueq_config),
         )
         self.irreps_nonlin = self.equivariant_nonlin.irreps_in.simplify()
-        self.linear_1 = Linear(
-            irreps_in=irreps_in, irreps_out=self.irreps_nonlin, cueq_config=cueq_config
+        self.linear_1 = EquivariantLinear(
+            irreps_in=irreps_in,
+            irreps_out=self.irreps_nonlin,
+            layout=get_layout(cueq_config),
         )
-        self.linear_2 = Linear(
+        self.linear_2 = EquivariantLinear(
             irreps_in=self.hidden_irreps,
             irreps_out=self.irreps_out,
-            cueq_config=cueq_config,
+            layout=get_layout(cueq_config),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # [n_nodes, irreps]  # [..., ]
@@ -255,8 +276,10 @@ class LinearDipolePolarReadoutBlock(torch.nn.Module):
                 "If you want to calculate only the dipole, use AtomicDipolesMACE."
             )
 
-        self.linear = Linear(
-            irreps_in=irreps_in, irreps_out=self.irreps_out, cueq_config=cueq_config
+        self.linear = EquivariantLinear(
+            irreps_in=irreps_in,
+            irreps_out=self.irreps_out,
+            layout=get_layout(cueq_config),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # [n_nodes, irreps]  # [..., ]
@@ -302,13 +325,15 @@ class NonLinearDipolePolarReadoutBlock(torch.nn.Module):
             layout=get_layout(cueq_config),
         )
         self.irreps_nonlin = self.equivariant_nonlin.irreps_in.simplify()
-        self.linear_1 = Linear(
-            irreps_in=irreps_in, irreps_out=self.irreps_nonlin, cueq_config=cueq_config
+        self.linear_1 = EquivariantLinear(
+            irreps_in=irreps_in,
+            irreps_out=self.irreps_nonlin,
+            layout=get_layout(cueq_config),
         )
-        self.linear_2 = Linear(
+        self.linear_2 = EquivariantLinear(
             irreps_in=self.hidden_irreps,
             irreps_out=self.irreps_out,
-            cueq_config=cueq_config,
+            layout=get_layout(cueq_config),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # [n_nodes, irreps]  # [..., ]
@@ -350,14 +375,23 @@ class GeneralNonLinearBiasReadoutBlock(torch.nn.Module):
             layout=get_layout(cueq_config),
         )
         self.irreps_nonlin = self.equivariant_nonlin.irreps_in.simplify()
-        self.linear_1 = Linear(
-            irreps_in=irreps_in, irreps_out=self.irreps_nonlin, cueq_config=cueq_config
+        self.linear_1 = EquivariantLinear(
+            irreps_in=irreps_in,
+            irreps_out=self.irreps_nonlin,
+            layout=get_layout(cueq_config),
         )
-        self.linear_mid = o3.Linear(
-            irreps_in=self.hidden_irreps, irreps_out=self.irreps_nonlin, biases=True
+        self.linear_mid = EquivariantLinear(
+            irreps_in=self.hidden_irreps,
+            irreps_out=self.irreps_nonlin,
+            layout=get_layout(cueq_config),
+            biases=True,
         )
-        self.linear_2 = o3.Linear(
-            irreps_in=self.hidden_irreps, irreps_out=self.irreps_out, biases=True
+        # A few multipoles per spin and scalars: a narrow readout.
+        self.linear_2 = NarrowEquivariantLinear(
+            irreps_in=self.hidden_irreps,
+            irreps_out=self.irreps_out,
+            layout=get_layout(cueq_config),
+            biases=True,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -385,7 +419,8 @@ class AtomicEnergiesBlock(torch.nn.Module):
         energies = torch.atleast_2d(self.atomic_energies).T.to(
             dtype=x.dtype, device=x.device
         )
-        return torch.matmul(x, energies)
+        # A sum over the few elements: fused with its neighbours, not a cuBLAS call.
+        return (x[..., :, None] * energies).sum(dim=-2)
 
     def __repr__(self):
         formatted_energies = ", ".join(
@@ -472,12 +507,10 @@ class EquivariantProductBasisBlock(torch.nn.Module):
             oeq_config=oeq_config,
         )
         # Update linear
-        self.linear = Linear(
-            target_irreps,
-            target_irreps,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=cueq_config,
+        self.linear = EquivariantLinear(
+            irreps_in=target_irreps,
+            irreps_out=target_irreps,
+            layout=get_layout(cueq_config),
         )
         self.cueq_config = cueq_config
 
@@ -578,19 +611,15 @@ class EquivariantProductBasisWithSelfMagmomBlock(torch.nn.Module):
         )
 
         # Update linear
-        self.linear = Linear(
-            self.conv_tp.irreps_out,
-            o3.Irreps(str(target_irreps)),
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=cueq_config,
+        self.linear = EquivariantLinear(
+            irreps_in=self.conv_tp.irreps_out,
+            irreps_out=o3.Irreps(str(target_irreps)),
+            layout=get_layout(cueq_config),
         )
-        self.linear_ori = Linear(
-            o3.Irreps(str(target_irreps)),
-            o3.Irreps(str(target_irreps)),
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=cueq_config,
+        self.linear_ori = EquivariantLinear(
+            irreps_in=o3.Irreps(str(target_irreps)),
+            irreps_out=o3.Irreps(str(target_irreps)),
+            layout=get_layout(cueq_config),
         )
 
     def forward(
@@ -846,12 +875,10 @@ class RealAgnosticInteractionBlock(InteractionBlock):
             self.oeq_config = None
 
         # First linear
-        self.linear_up = Linear(
-            self.node_feats_irreps,
-            self.edge_irreps,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.linear_up = EquivariantLinear(
+            irreps_in=self.node_feats_irreps,
+            irreps_out=self.edge_irreps,
+            layout=get_layout(self.cueq_config),
         )
         # TensorProduct
         irreps_mid, instructions = tp_out_irreps_with_instructions(
@@ -879,12 +906,10 @@ class RealAgnosticInteractionBlock(InteractionBlock):
 
         # Linear
         self.irreps_out = self.target_irreps
-        self.linear = Linear(
-            irreps_mid,
-            self.irreps_out,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.linear = EquivariantLinear(
+            irreps_in=irreps_mid,
+            irreps_out=self.irreps_out,
+            layout=get_layout(self.cueq_config),
         )
 
         # Selector TensorProduct
@@ -949,12 +974,10 @@ class RealAgnosticResidualInteractionBlock(InteractionBlock):
             self.oeq_config = None
 
         # First linear
-        self.linear_up = Linear(
-            self.node_feats_irreps,
-            self.edge_irreps,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.linear_up = EquivariantLinear(
+            irreps_in=self.node_feats_irreps,
+            irreps_out=self.edge_irreps,
+            layout=get_layout(self.cueq_config),
         )
         # TensorProduct
         irreps_mid, instructions = tp_out_irreps_with_instructions(
@@ -982,12 +1005,10 @@ class RealAgnosticResidualInteractionBlock(InteractionBlock):
 
         # Linear
         self.irreps_out = self.target_irreps
-        self.linear = Linear(
-            irreps_mid,
-            self.irreps_out,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.linear = EquivariantLinear(
+            irreps_in=irreps_mid,
+            irreps_out=self.irreps_out,
+            layout=get_layout(self.cueq_config),
         )
 
         # Selector TensorProduct
@@ -1052,12 +1073,10 @@ class RealAgnosticDensityInteractionBlock(InteractionBlock):
             self.oeq_config = None
 
         # First linear
-        self.linear_up = Linear(
-            self.node_feats_irreps,
-            self.edge_irreps,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.linear_up = EquivariantLinear(
+            irreps_in=self.node_feats_irreps,
+            irreps_out=self.edge_irreps,
+            layout=get_layout(self.cueq_config),
         )
         # TensorProduct
         irreps_mid, instructions = tp_out_irreps_with_instructions(
@@ -1085,12 +1104,10 @@ class RealAgnosticDensityInteractionBlock(InteractionBlock):
 
         # Linear
         self.irreps_out = self.target_irreps
-        self.linear = Linear(
-            irreps_mid,
-            self.irreps_out,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.linear = EquivariantLinear(
+            irreps_in=irreps_mid,
+            irreps_out=self.irreps_out,
+            layout=get_layout(self.cueq_config),
         )
 
         # Selector TensorProduct
@@ -1173,12 +1190,10 @@ class RealAgnosticDensityResidualInteractionBlock(InteractionBlock):
             self.oeq_config = None
 
         # First linear
-        self.linear_up = Linear(
-            self.node_feats_irreps,
-            self.edge_irreps,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.linear_up = EquivariantLinear(
+            irreps_in=self.node_feats_irreps,
+            irreps_out=self.edge_irreps,
+            layout=get_layout(self.cueq_config),
         )
         # TensorProduct
         irreps_mid, instructions = tp_out_irreps_with_instructions(
@@ -1206,12 +1221,10 @@ class RealAgnosticDensityResidualInteractionBlock(InteractionBlock):
 
         # Linear
         self.irreps_out = self.target_irreps
-        self.linear = Linear(
-            irreps_mid,
-            self.irreps_out,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.linear = EquivariantLinear(
+            irreps_in=irreps_mid,
+            irreps_out=self.irreps_out,
+            layout=get_layout(self.cueq_config),
         )
 
         # Selector TensorProduct
@@ -1298,12 +1311,10 @@ class RealAgnosticAttResidualInteractionBlock(InteractionBlock):
 
         self.node_feats_down_irreps = o3.Irreps("64x0e")
         # First linear
-        self.linear_up = Linear(
-            self.node_feats_irreps,
-            self.edge_irreps,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.linear_up = EquivariantLinear(
+            irreps_in=self.node_feats_irreps,
+            irreps_out=self.edge_irreps,
+            layout=get_layout(self.cueq_config),
         )
         # TensorProduct
         irreps_mid, instructions = tp_out_irreps_with_instructions(
@@ -1323,12 +1334,10 @@ class RealAgnosticAttResidualInteractionBlock(InteractionBlock):
         )
 
         # Convolution weights
-        self.linear_down = Linear(
-            self.node_feats_irreps,
-            self.node_feats_down_irreps,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.linear_down = EquivariantLinear(
+            irreps_in=self.node_feats_irreps,
+            irreps_out=self.node_feats_down_irreps,
+            layout=get_layout(self.cueq_config),
         )
         input_dim = (
             self.edge_feats_irreps.num_irreps
@@ -1341,19 +1350,19 @@ class RealAgnosticAttResidualInteractionBlock(InteractionBlock):
 
         # Linear
         self.irreps_out = self.target_irreps
-        self.linear = Linear(
-            irreps_mid,
-            self.irreps_out,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.linear = EquivariantLinear(
+            irreps_in=irreps_mid,
+            irreps_out=self.irreps_out,
+            layout=get_layout(self.cueq_config),
         )
 
         self.reshape = reshape_irreps(self.irreps_out, cueq_config=self.cueq_config)
 
         # Skip connection.
-        self.skip_linear = Linear(
-            self.node_feats_irreps, self.hidden_irreps, cueq_config=self.cueq_config
+        self.skip_linear = EquivariantLinear(
+            irreps_in=self.node_feats_irreps,
+            irreps_out=self.hidden_irreps,
+            layout=get_layout(self.cueq_config),
         )
 
     # pylint: disable=unused-argument
@@ -1438,26 +1447,20 @@ class RealAgnosticResidualNonLinearInteractionBlock(InteractionBlock):
         node_scalar_irreps = o3.Irreps(
             [(self.node_feats_irreps.count(o3.Irrep(0, 1)), (0, 1))]
         )
-        self.source_embedding = Linear(
-            self.node_attrs_irreps,
-            node_scalar_irreps,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.source_embedding = EquivariantLinear(
+            irreps_in=self.node_attrs_irreps,
+            irreps_out=node_scalar_irreps,
+            layout=get_layout(self.cueq_config),
         )
-        self.target_embedding = Linear(
-            self.node_attrs_irreps,
-            node_scalar_irreps,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.target_embedding = EquivariantLinear(
+            irreps_in=self.node_attrs_irreps,
+            irreps_out=node_scalar_irreps,
+            layout=get_layout(self.cueq_config),
         )
-        self.linear_up = Linear(
-            self.node_feats_irreps,
-            self.edge_irreps,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.linear_up = EquivariantLinear(
+            irreps_in=self.node_feats_irreps,
+            irreps_out=self.edge_irreps,
+            layout=get_layout(self.cueq_config),
         )
         torch.nn.init.uniform_(self.source_embedding.weight, a=-0.001, b=0.001)
         torch.nn.init.uniform_(self.target_embedding.weight, a=-0.001, b=0.001)
@@ -1489,10 +1492,10 @@ class RealAgnosticResidualNonLinearInteractionBlock(InteractionBlock):
         self.irreps_out = self.target_irreps
 
         # Selector TensorProduct
-        self.skip_tp = Linear(
-            self.node_feats_irreps,
-            self.hidden_irreps,
-            cueq_config=self.cueq_config,
+        self.skip_tp = EquivariantLinear(
+            irreps_in=self.node_feats_irreps,
+            irreps_out=self.hidden_irreps,
+            layout=get_layout(self.cueq_config),
         )
         self.reshape = reshape_irreps(self.irreps_out, cueq_config=self.cueq_config)
 
@@ -1515,33 +1518,27 @@ class RealAgnosticResidualNonLinearInteractionBlock(InteractionBlock):
         self.irreps_nonlin = self.equivariant_nonlin.irreps_in.simplify()
 
         # Linear residual
-        self.linear_res = Linear(
-            self.edge_irreps,
-            self.irreps_nonlin,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.linear_res = EquivariantLinear(
+            irreps_in=self.edge_irreps,
+            irreps_out=self.irreps_nonlin,
+            layout=get_layout(self.cueq_config),
         )
 
         # Linear
-        self.linear_1 = Linear(
-            irreps_mid,
-            self.irreps_nonlin,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.linear_1 = EquivariantLinear(
+            irreps_in=irreps_mid,
+            irreps_out=self.irreps_nonlin,
+            layout=get_layout(self.cueq_config),
         )
-        self.linear_2 = Linear(
+        self.linear_2 = EquivariantLinear(
             irreps_in=self.irreps_out,
             irreps_out=self.irreps_out,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+            layout=get_layout(self.cueq_config),
         )
 
         # Normalizations
         self.density_fn = RadialMLP(
-            [input_dim + 2 * node_scalar_irreps.dim] + [64] + [1],
+            [input_dim + 2 * node_scalar_irreps.dim] + [64] + [1], narrow_output=True
         )
         self.alpha = torch.nn.Parameter(torch.tensor(20.0), requires_grad=True)
         self.beta = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
@@ -1724,12 +1721,10 @@ class MagneticRealAgnosticSpinOrbitCoupledDensityInteractionBlock(
             self.cueq_config = None
 
         # First linear
-        self.linear_up = Linear(
-            self.node_feats_irreps,
-            self.node_feats_irreps,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.linear_up = EquivariantLinear(
+            irreps_in=self.node_feats_irreps,
+            irreps_out=self.node_feats_irreps,
+            layout=get_layout(self.cueq_config),
         )
 
         # TensorProduct for real space
@@ -1787,12 +1782,10 @@ class MagneticRealAgnosticSpinOrbitCoupledDensityInteractionBlock(
         # Linear
         self.irreps_out = self.target_irreps
 
-        self.magmom_linear = Linear(
-            self.magmom_conv_tp.irreps_out,
-            self.irreps_out,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.magmom_linear = EquivariantLinear(
+            irreps_in=self.magmom_conv_tp.irreps_out,
+            irreps_out=self.irreps_out,
+            layout=get_layout(self.cueq_config),
         )
         self.magmom_skip_tp = FullyConnectedTensorProduct(
             self.irreps_out,
@@ -1877,12 +1870,10 @@ class MagneticRealAgnosticResidueSpinOrbitCoupledDensityInteractionBlock(
             self.cueq_config = None
 
         # First linear
-        self.linear_up = Linear(
-            self.node_feats_irreps,
-            self.node_feats_irreps,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.linear_up = EquivariantLinear(
+            irreps_in=self.node_feats_irreps,
+            irreps_out=self.node_feats_irreps,
+            layout=get_layout(self.cueq_config),
         )
 
         # TensorProduct for real space
@@ -1940,12 +1931,10 @@ class MagneticRealAgnosticResidueSpinOrbitCoupledDensityInteractionBlock(
         # Linear
         self.irreps_out = self.target_irreps
 
-        self.magmom_linear = Linear(
-            self.magmom_conv_tp.irreps_out,
-            self.irreps_out,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.magmom_linear = EquivariantLinear(
+            irreps_in=self.magmom_conv_tp.irreps_out,
+            irreps_out=self.irreps_out,
+            layout=get_layout(self.cueq_config),
         )
 
         # Selector TensorProduct
@@ -2077,10 +2066,10 @@ class LinearLesReadoutBlock(torch.nn.Module):
         # cueq uses ir_mul layout, which interleaves vector components differently.
         self.ir_mul = get_layout(cueq_config) == "ir_mul"
 
-        self.linear = Linear(
+        self.linear = EquivariantLinear(
             irreps_in=self.irreps_in,
             irreps_out=self.irreps_in,
-            cueq_config=cueq_config,
+            layout=get_layout(cueq_config),
         )
 
         self.scalar_slices: List[Tuple[int, int]] = []
@@ -2182,10 +2171,10 @@ class NonLinearLesReadoutBlock(torch.nn.Module):
         # cueq uses ir_mul layout, which interleaves vector components differently.
         self.ir_mul = get_layout(cueq_config) == "ir_mul"
 
-        self.linear = Linear(
+        self.linear = EquivariantLinear(
             irreps_in=self.irreps_in,
             irreps_out=self.irreps_in,
-            cueq_config=cueq_config,
+            layout=get_layout(cueq_config),
         )
 
         self._build_slices()

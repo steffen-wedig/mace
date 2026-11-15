@@ -2,7 +2,7 @@
 
 PolarMACE evaluates the linears of each layer's output (feature mixer, the next layer's
 ``skip_tp`` and ``linear_up``, a nonlinear readout's first linear) as one matmul per input
-irrep over the concatenated weights (``prepare_linear_folds``,
+irrep over the concatenated weights (``prepare_shared_input_plan``,
 ``evaluate_linears_sharing_input``).
 Values and every gradient (through the force, as in training) must not change.
 """
@@ -13,11 +13,9 @@ import pytest
 import torch
 from e3nn import o3
 
-from mace.modules.polar.linear_folds import (
-    evaluate_linears_sharing_input,
-    linear_fold_of,
-)
-from mace.modules.wrapper_ops import CUET_AVAILABLE, CuEquivarianceConfig, Linear
+from mace.modules.equivariant_linear import EquivariantLinear
+from mace.modules.polar.linear_folds import evaluate_linears_sharing_input
+from mace.modules.wrapper_ops import CUET_AVAILABLE, CuEquivarianceConfig
 from tests.extensions.polar.test_polar_field_linear_fold import (
     separate_linears,
 )
@@ -62,41 +60,28 @@ def _compare_shared_input_linears(linears, layout, device) -> None:
     dtype = torch.float64
     x = torch.randn(7, INPUT_IRREPS.dim, dtype=dtype, device=device, requires_grad=True)
     leaves = [x] + [linear.weight for linear in linears]
-    folds = [linear_fold_of(linear) for linear in linears]
     separately = _through_force_gradient([linear(x) for linear in linears], x, leaves)
     together = _through_force_gradient(
-        evaluate_linears_sharing_input(x, linears, folds, layout), x, leaves
+        evaluate_linears_sharing_input(x, linears, layout), x, leaves
     )
     for expected, actual in zip(separately, together):
         torch.testing.assert_close(actual, expected, rtol=1e-11, atol=1e-12)
 
 
-def test_e3nn_linears_sharing_input_match_separate_linears():
+@pytest.mark.parametrize("layout", ["mul_ir", "ir_mul"])
+def test_linears_sharing_input_match_separate_linears(layout):
     torch.manual_seed(0)
     linears = [
-        o3.Linear(INPUT_IRREPS, irreps_out).to(torch.float64)
+        EquivariantLinear(INPUT_IRREPS, irreps_out, layout=layout).to(torch.float64)
         for irreps_out in OUTPUT_IRREPS
     ]
-    _compare_shared_input_linears(linears, "mul_ir", torch.device("cpu"))
-
-
-@needs_cueq_gpu
-def test_cueq_linears_sharing_input_match_separate_linears():
-    torch.manual_seed(0)
-    linears = [
-        Linear(INPUT_IRREPS, irreps_out, cueq_config=CUEQ_CONFIG).to(
-            device="cuda", dtype=torch.float64
-        )
-        for irreps_out in OUTPUT_IRREPS
-    ]
-    _compare_shared_input_linears(linears, "ir_mul", torch.device("cuda"))
+    _compare_shared_input_linears(linears, layout, torch.device("cpu"))
 
 
 # --------------------------------------------------------------------------- model level
 def _compare_with_and_without_plan(cueq_config, device) -> None:
     model = _polar_model(cueq_config=cueq_config).to(device)
     plan = model.shared_input_plan
-    assert plan.layout is not None
     assert plan.layers[0].with_next and plan.layers[-1].with_readout
     batch = {
         key: value.to(device) if torch.is_tensor(value) else value

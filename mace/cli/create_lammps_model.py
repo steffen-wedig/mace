@@ -110,7 +110,16 @@ def main():
         torch.save(lammps_model, model_path + "-mliap_lammps.pt")
     else:
         deprecation.warn("lammps.torchscript_wrapper")
-        lammps_model_compiled = jit.compile(lammps_model)
+        try:
+            lammps_model_compiled = jit.compile(lammps_model)
+        except RuntimeError as error:
+            # Models built by this fork are not scriptable
+            # (mace.modules.equivariant_linear; PolarMACE's nonlinear first interaction
+            # block never was); e3nn models saved before still are.
+            raise SystemExit(
+                "the libtorch format needs TorchScript, which this model does not "
+                f"support: use --format mliap ({str(error).splitlines()[0]})"
+            ) from error
         lammps_model_compiled.save(model_path + "-lammps.pt")
 
 

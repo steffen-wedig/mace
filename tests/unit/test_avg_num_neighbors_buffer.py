@@ -101,13 +101,6 @@ def test_a_legacy_pickle_comes_back_with_the_buffer():
         assert isinstance(block.avg_num_neighbors, torch.Tensor)
 
 
-def test_a_legacy_pickle_can_be_torchscripted():
-    """The failure this fixes, at its narrowest: the declared type is checked
-    only when the module is scripted, which is what the LAMMPS export does."""
-    loaded = _round_trip(_make_legacy(_build_model()))
-    assert torch.jit.script(loaded.interactions[0]) is not None
-
-
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_the_promoted_buffer_keeps_the_value_at_the_models_precision(dtype):
     loaded = _round_trip(_make_legacy(_build_model().to(dtype)))

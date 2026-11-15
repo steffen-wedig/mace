@@ -40,7 +40,6 @@ import torch._dynamo
 import torch._inductor
 
 from mace.tools import compile as mace_compile
-from mace.tools.compiled import small_matmuls
 
 # Recompiles beyond this many are an error, not a silent fall-back to eager (reforge F6).
 RECOMPILE_LIMIT = 8
@@ -77,11 +76,9 @@ def configure_dynamo_for_training(recompile_limit: int = RECOMPILE_LIMIT) -> Non
 
 def training_inductor_options(shape_mode: ShapeMode) -> Dict[str, Any]:
     """Inductor options of the compiled training loss, passed to its ``torch.compile``:
-
-    - small matrix products as fused reductions (``mace.tools.compiled.small_matmuls``);
-    - with padded batches (both padded modes), CUDA graphs (``mode="reduce-overhead"``).
+    with padded batches (both padded modes), CUDA graphs (``mode="reduce-overhead"``).
     """
-    options = small_matmuls.inductor_options()
+    options: Dict[str, Any] = {}
     if shape_mode != "dynamic":
         options.update(torch._inductor.list_mode_options("reduce-overhead"))
     return options

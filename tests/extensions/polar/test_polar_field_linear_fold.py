@@ -10,18 +10,21 @@ gradients through the force, as in force training).
 from __future__ import annotations
 
 import types
+from unittest import mock
 
 import pytest
 import torch
 from e3nn import o3
 
+from mace.modules.equivariant_linear import EquivariantLinear
+from mace.modules.polar import model as polar_model_module
 from mace.modules.polar.field_blocks import (
     AgnosticEmbeddedOneBodyVariableUpdate,
     OneBodyMLPFieldReadout,
     SparseUvuTensorProduct,
     instructions_for_sparse_tp,
 )
-from mace.modules.polar.linear_folds import folded_linear_input, linear_fold
+from mace.modules.polar.linear_folds import folded_linear_input
 from mace.modules.wrapper_ops import CUET_AVAILABLE, CuEquivarianceConfig
 from tests.extensions.polar.test_polar_shared_geometry import (
     _batch,
@@ -33,12 +36,20 @@ from tests.helpers import GRAPH_LONGRANGE_AVAILABLE
 
 
 def separate_linears(model) -> None:
-    """Every linear that reads a layer's output evaluated on its own: the plan without a
-    layout (as for e3nn linears on cueq-layout features)."""
-    plan = model.shared_input_plan
-    model.shared_input_plan = plan._replace(
-        layout=None, layers=[layer._replace(folds=None) for layer in plan.layers]
-    )
+    """Every linear that reads a layer's output evaluated on its own (the reference for
+    the shared-input products)."""
+    together = model._layer_output_linears
+
+    def evaluate_separately(features, linears, layout):
+        return [linear(features) for linear in linears]
+
+    def layer_output_linears(self, layer, node_feats):
+        with mock.patch.object(
+            polar_model_module, "evaluate_linears_sharing_input", evaluate_separately
+        ):
+            return together(layer, node_feats)
+
+    model._layer_output_linears = types.MethodType(layer_output_linears, model)
 
 
 pytestmark = pytest.mark.polar
@@ -72,17 +83,15 @@ def test_folded_dot_matches_dot_of_linear_sum(layout, biases):
     ).to(dtype)
     small_irreps = o3.Irreps("2x0e + 2x1o")
     linears = [
-        o3.Linear(small_irreps, NODE_IRREPS, biases=biases).to(dtype),
-        o3.Linear(NODE_IRREPS, NODE_IRREPS).to(dtype),
+        EquivariantLinear(small_irreps, NODE_IRREPS, layout=layout, biases=biases).to(
+            dtype
+        ),
+        EquivariantLinear(NODE_IRREPS, NODE_IRREPS, layout=layout).to(dtype),
     ]
     with torch.no_grad():
         for linear in linears:
-            if linear.bias.numel():
+            if linear.bias is not None:
                 linear.bias.normal_()
-    folds = [
-        linear_fold(small_irreps, NODE_IRREPS, biases=biases),
-        linear_fold(NODE_IRREPS, NODE_IRREPS, biases=False),
-    ]
     nodes = 5
     x1 = torch.randn(nodes, NODE_IRREPS.dim, dtype=dtype, requires_grad=True)
     inputs = [
@@ -103,16 +112,15 @@ def test_folded_dot_matches_dot_of_linear_sum(layout, biases):
         return [output.detach(), *gradients]
 
     x1_layout = _to_layout(x1, NODE_IRREPS, layout)
-    summed = sum(linear(y) for linear, y in zip(linears, inputs))
-    unfolded = dot(x1_layout, _to_layout(summed, NODE_IRREPS, layout))
+    inputs_layout = [
+        _to_layout(y, irreps, layout)
+        for y, irreps in zip(inputs, [small_irreps, NODE_IRREPS])
+    ]
+    summed = sum(linear(y) for linear, y in zip(linears, inputs_layout))
+    unfolded = dot(x1_layout, summed)
     folded = dot.forward_folded(
         x1_layout,
-        [
-            folded_linear_input(_to_layout(y, irreps, layout), linear, fold)
-            for y, irreps, linear, fold in zip(
-                inputs, [small_irreps, NODE_IRREPS], linears, folds
-            )
-        ],
+        [folded_linear_input(y, linear) for y, linear in zip(inputs_layout, linears)],
     )
     for expected, actual in zip(
         through_force_gradient(unfolded), through_force_gradient(folded)
@@ -121,13 +129,6 @@ def test_folded_dot_matches_dot_of_linear_sum(layout, biases):
             assert actual is None
             continue
         torch.testing.assert_close(actual, expected, rtol=1e-11, atol=1e-12)
-
-
-def test_linear_fold_covers_the_parameters():
-    fold = linear_fold(o3.Irreps("2x0e + 2x1o"), o3.Irreps("8x0e + 8x1o"), biases=True)
-    assert [path.input_multiplicity for path in fold.paths] == [2, 2]
-    assert fold.paths[-1].weight_stop == 2 * 8 + 2 * 8
-    assert [(bias.bias_start, bias.bias_stop) for bias in fold.biases] == [(0, 8)]
 
 
 # --------------------------------------------------------------------------- model level
@@ -148,14 +149,7 @@ def _unfolded_update(
     invariants = self.dot_products(node_feats, mixed)
     embedded = torch.cat([invariants, self.source_embedding(node_attrs)], dim=-1)
     new_feats = self.tp_out(node_feats, self.nonlinearity(embedded))
-    readout_to_mul_ir = getattr(self, "_readout_to_mul_ir", None)
-    readout_from_mul_ir = getattr(self, "_readout_from_mul_ir", None)
-    if readout_to_mul_ir is not None:
-        new_feats = readout_to_mul_ir(new_feats)
-    multipoles = self.readout(new_feats)
-    if readout_from_mul_ir is not None:
-        multipoles = readout_from_mul_ir(multipoles)
-    return multipoles
+    return self.readout(new_feats)
 
 
 def _unfolded_readout(
@@ -169,7 +163,7 @@ def _unfolded_readout(
     charges_0,
     charges_induced,
 ):
-    # The linears follow the model layout here (mul_ir model, or cueq-layout linears).
+    # The linears follow the model layout.
     charges_up = self.linear_up_q(charges_induced + charges_0)
     potential_up = self.linear_up_v(field_feats)
     invariants = torch.cat(

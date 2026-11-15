@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from e3nn.util.jit import compile_mode
 
+from mace.modules.equivariant_linear import NARROW_CHANNEL_LIMIT
 from mace.tools.scatter import scatter_sum
 
 
@@ -358,20 +359,47 @@ class SoftTransform(torch.nn.Module):
         return f"{self.__class__.__name__}(alpha={self.alpha.item():.4f})"
 
 
+class NarrowDense(torch.nn.Linear):
+    """A dense layer with few output channels, as a broadcast multiply and a sum.
+
+    Parameters and initialisation of ``torch.nn.Linear``. Compiled, the product is one
+    reduction fused with the producer of the input and the consumer of the output instead
+    of a cuBLAS call (the dense counterpart of
+    ``mace.modules.equivariant_linear.NarrowEquivariantLinear``, experiment 18).
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        if out_features > NARROW_CHANNEL_LIMIT:
+            raise ValueError(
+                f"{out_features} output channels are more than {NARROW_CHANNEL_LIMIT}: "
+                "use torch.nn.Linear"
+            )
+        super().__init__(in_features, out_features, bias=bias)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        output = (inputs[..., :, None] * self.weight.T).sum(dim=-2)
+        return output if self.bias is None else output + self.bias
+
+
 class RadialMLP(torch.nn.Module):
     """
     Construct a radial MLP (Linear → LayerNorm → SiLU) stack
     given a list of channel sizes, following ESEN / FairChem.
+
+    ``narrow_output``: the last layer is a :class:`NarrowDense` (for an output of a few
+    channels, such as a per-edge density or a per-atom energy).
     """
 
-    def __init__(self, channels_list) -> None:
+    def __init__(self, channels_list, narrow_output: bool = False) -> None:
         super().__init__()
 
         modules = []
         in_channels = channels_list[0]
+        last = len(channels_list) - 1
 
         for idx, out_channels in enumerate(channels_list[1:], start=1):
-            modules.append(torch.nn.Linear(in_channels, out_channels, bias=True))
+            layer = NarrowDense if (narrow_output and idx == last) else torch.nn.Linear
+            modules.append(layer(in_channels, out_channels, bias=True))
             in_channels = out_channels
             if idx < len(channels_list) - 1:
                 modules.append(torch.nn.LayerNorm(out_channels))

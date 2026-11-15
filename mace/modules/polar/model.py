@@ -40,7 +40,7 @@ from mace.modules.wrapper_ops import (
     CuEquivarianceConfig,
     OEQConfig,
     TransposeIrrepsLayoutWrapper,
-    cueq_handles_linears,
+    get_layout,
 )
 from mace.tools.scatter import scatter_mean, scatter_sum
 
@@ -58,8 +58,8 @@ from .field_blocks import (
 from .linear_folds import (
     LayerOutputLinears,
     SharedInputPlan,
+    check_linears_sharing_input,
     evaluate_linears_sharing_input,
-    linear_fold_of,
 )
 
 
@@ -249,24 +249,14 @@ class PolarMACE(ScaleShiftMACE):
             cueq_config=cueq_config,
         )
 
+        # In the model layout (its linears follow the layout): no transpose.
         self.fukui_source_map = NonLinearBiasReadoutBlock(
             hidden_irreps,
             MLP_irreps.simplify(),
             gate,
             o3.Irreps("2x0e"),
-            cueq_config=None,
-            oeq_config=oeq_config,
-        )
-        fukui_layout = (
-            cueq_config.layout_str
-            if (cueq_config is not None and cueq_config.enabled)
-            else "mul_ir"
-        )
-        self._fukui_to_mul_ir = TransposeIrrepsLayoutWrapper(
-            irreps=hidden_irreps,
-            source=fukui_layout,
-            target="mul_ir",
             cueq_config=cueq_config,
+            oeq_config=oeq_config,
         )
         if fixedpoint_update_config is None:
             fixedpoint_update_config = {}
@@ -364,12 +354,12 @@ class PolarMACE(ScaleShiftMACE):
             num_interactions=num_interactions,
             cueq_config=cueq_config,
         )
-        self.prepare_linear_folds()
+        self.prepare_shared_input_plan()
 
     def _readout_index(self, layer: int) -> int:
         return -1 if len(self.readouts) == 1 else min(layer, len(self.readouts) - 1)
 
-    def prepare_linear_folds(self) -> None:
+    def prepare_shared_input_plan(self) -> None:
         """Plan the linears that read each layer's output (``shared_input_plan``).
 
         A layer's output is read by the feature mixer's linear of that layer, by the next
@@ -377,16 +367,10 @@ class PolarMACE(ScaleShiftMACE):
         linear. ``forward`` evaluates them together (``evaluate_linears_sharing_input``):
         their weights concatenated per input irrep, one GEMM per irrep instead of one per
         linear in the forward and in each backward. Exact up to the order of summation.
-        Built from the module structure (integers only, no e3nn object in the forward);
-        rebuilt on construction and on unpickling (``ensure_polar_compatibility``).
+        Built from the module structure; rebuilt on construction and on unpickling
+        (``ensure_polar_compatibility``).
         """
-        cueq_config = getattr(self, "cueq_config", None)
-        layout: Optional[str] = None
-        if cueq_handles_linears(cueq_config):
-            layout = cueq_config.layout_str
-        elif cueq_config is None or not cueq_config.enabled:
-            layout = "mul_ir"
-        # else e3nn linears on cueq-layout features: evaluated one by one.
+        layout = get_layout(getattr(self, "cueq_config", None))
         num_layers = len(self.interactions)
         layers: List[LayerOutputLinears] = []
         for layer in range(num_layers):
@@ -404,12 +388,8 @@ class PolarMACE(ScaleShiftMACE):
             with_readout = isinstance(readout, NonLinearReadoutBlock)
             if with_readout:
                 linears.append(readout.linear_1)
-            folds = (
-                [linear_fold_of(linear) for linear in linears]
-                if layout is not None
-                else None
-            )
-            layers.append(LayerOutputLinears(with_next, with_readout, folds))
+            check_linears_sharing_input(linears, layout)
+            layers.append(LayerOutputLinears(with_next, with_readout))
         self.shared_input_plan = SharedInputPlan(layout, layers)
 
     def _layer_output_linears(self, layer: int, node_feats: torch.Tensor) -> Tuple[
@@ -429,9 +409,7 @@ class PolarMACE(ScaleShiftMACE):
         readout = self.readouts[self._readout_index(layer)]
         if layer_linears.with_readout:
             linears.append(readout.linear_1)
-        outputs = evaluate_linears_sharing_input(
-            node_feats, linears, layer_linears.folds, plan.layout
-        )
+        outputs = evaluate_linears_sharing_input(node_feats, linears, plan.layout)
         next_first_linears: Optional[
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         ] = None
@@ -757,11 +735,7 @@ class PolarMACE(ScaleShiftMACE):
         spin_charge_density = spin_charge_density.view(
             spin_charge_density.shape[0], 2, -1
         )
-        fukui_input = node_feats
-        fukui_to_mul_ir = getattr(self, "_fukui_to_mul_ir", None)
-        if fukui_to_mul_ir is not None:
-            fukui_input = fukui_to_mul_ir(fukui_input)
-        fukui_sources = self.fukui_source_map(fukui_input)
+        fukui_sources = self.fukui_source_map(node_feats)
         fukui_norm = scatter_sum(
             src=safe_double(fukui_sources),
             index=data["batch"],

@@ -28,7 +28,6 @@ import torch._dynamo
 import torch._inductor
 
 from mace.tools import compile as mace_compile
-from mace.tools.compiled import small_matmuls
 
 # Dynamo's and Inductor's settings live in torch's private modules (torch._dynamo.config,
 # torch._inductor.list_mode_options); configuring them is this module's purpose.
@@ -52,11 +51,10 @@ def configure_dynamo_for_inference(recompile_limit: int = RECOMPILE_LIMIT) -> No
 def inference_inductor_options(
     static_shapes: bool, autotune_gemms: bool = False, freeze_weights: bool = False
 ) -> Dict[str, Any]:
-    """Inductor options of the compiled evaluation: small matrix products as fused
-    reductions; with static shapes, CUDA graphs (``mode="reduce-overhead"``);
-    ``autotune_gemms``: matrix products benchmarked against Triton templates at compile
-    time (``max_autotune_gemm``; slower compile)."""
-    options = small_matmuls.inductor_options()
+    """Inductor options of the compiled evaluation: with static shapes, CUDA graphs
+    (``mode="reduce-overhead"``); ``autotune_gemms``: matrix products benchmarked against
+    Triton templates at compile time (``max_autotune_gemm``; slower compile)."""
+    options: Dict[str, Any] = {}
     if static_shapes:
         options.update(torch._inductor.list_mode_options("reduce-overhead"))
     if autotune_gemms:

@@ -18,49 +18,15 @@ from mace.modules.blocks import (
     GeneralNonLinearBiasReadoutBlock,
     rows_from_element_table,
 )
+from mace.modules.equivariant_linear import (
+    EquivariantLinear,
+    NarrowEquivariantLinear,
+    block_matrix,
+)
 from mace.modules.irreps_tools import tp_out_irreps_with_instructions
-from mace.modules.polar.linear_folds import (
-    FoldedLinearInput,
-    folded_linear_input,
-    linear_fold,
-    path_matrix,
-)
+from mace.modules.polar.linear_folds import FoldedLinearInput, folded_linear_input
 from mace.modules.radial import RadialMLP
-from mace.modules.wrapper_ops import (
-    CuEquivarianceConfig,
-    Linear,
-    OEQConfig,
-    TransposeIrrepsLayoutWrapper,
-    cueq_handles_linears,
-    field_linear,
-)
-
-
-def _use_layout_native_linears(
-    block: torch.nn.Module,
-    linear_names: Tuple[str, ...],
-    transpose_names: Tuple[str, ...],
-) -> None:
-    """Replace a block's e3nn linears by linears in the cueq layout, with the same
-    parameters (transplanted), and drop the layout transposes that surrounded them.
-
-    For blocks built (or unpickled) with o3.Linear under a cueq config. A no-op when cueq
-    does not handle linears or the linears are already in the cueq layout.
-    """
-    from mace.modules.wrapper_ops import (  # noqa: PLC0415  # needs cuequivariance
-        LayoutNativeLinear,
-    )
-
-    if not cueq_handles_linears(block.cueq_config):
-        return
-    for name in linear_names:
-        linear = getattr(block, name)
-        if isinstance(linear, o3.Linear):
-            setattr(
-                block, name, LayoutNativeLinear.from_e3nn(linear, block.cueq_config)
-            )
-    for name in transpose_names:
-        setattr(block, name, None)
+from mace.modules.wrapper_ops import CuEquivarianceConfig, OEQConfig, get_layout
 
 
 @compile_mode("script")
@@ -74,7 +40,11 @@ class MultiLayerFeatureMixer(torch.nn.Module):
         super().__init__()
         self.linears = torch.nn.ModuleList(
             [
-                Linear(node_feats_irreps, node_feats_irreps, cueq_config=cueq_config)
+                EquivariantLinear(
+                    irreps_in=node_feats_irreps,
+                    irreps_out=node_feats_irreps,
+                    layout=get_layout(cueq_config),
+                )
                 for _ in range(num_interactions)
             ]
         )
@@ -99,7 +69,12 @@ class EnvironmentDependentSpinSourceBlock(torch.nn.Module):
         super().__init__()
         self.zero_charges = zero_charges
         self.irreps_out = 2 * o3.Irreps.spherical_harmonics(max_l)
-        self.linear = Linear(irreps_in, self.irreps_out, cueq_config=cueq_config)
+        # One channel per spin and multipole: a narrow linear.
+        self.linear = NarrowEquivariantLinear(
+            irreps_in=irreps_in,
+            irreps_out=self.irreps_out,
+            layout=get_layout(cueq_config),
+        )
 
     def forward(self, node_feats: torch.Tensor) -> torch.Tensor:
         mp = self.linear(node_feats)
@@ -158,53 +133,16 @@ class AgnosticChargeBiasedLinearPotentialEmbedding(
     def _setup(
         self, charges_irreps: o3.Irreps
     ) -> None:  # pylint: disable=arguments-differ
-        # In the cueq layout when cueq handles linears (no transposes around them),
-        # else e3nn linears in mul_ir between layout transposes.
-        self.potential_linear = field_linear(
-            self.potential_irreps, self.node_feats_irreps, self.cueq_config
+        layout = get_layout(self.cueq_config)
+        self.potential_linear = EquivariantLinear(
+            self.potential_irreps, self.node_feats_irreps, layout=layout
         )
-        self.node_feats_linear = field_linear(
-            self.node_feats_irreps, self.node_feats_irreps, self.cueq_config
+        self.node_feats_linear = EquivariantLinear(
+            self.node_feats_irreps, self.node_feats_irreps, layout=layout
         )
         self.charges_irreps = charges_irreps
-        self.charge_embedding = field_linear(
-            self.charges_irreps, self.node_feats_irreps, self.cueq_config
-        )
-        self.prepare_linear_folds()
-        if cueq_handles_linears(self.cueq_config):
-            self._potential_to_mul_ir = None
-            self._node_feats_to_mul_ir = None
-            self._charges_to_mul_ir = None
-            self._node_feats_from_mul_ir = None
-            return
-        layout_str = (
-            self.cueq_config.layout_str
-            if (self.cueq_config is not None and self.cueq_config.enabled)
-            else "mul_ir"
-        )
-        self._potential_to_mul_ir = TransposeIrrepsLayoutWrapper(
-            irreps=self.potential_irreps,
-            source=layout_str,
-            target="mul_ir",
-            cueq_config=self.cueq_config,
-        )
-        self._node_feats_to_mul_ir = TransposeIrrepsLayoutWrapper(
-            irreps=self.node_feats_irreps,
-            source=layout_str,
-            target="mul_ir",
-            cueq_config=self.cueq_config,
-        )
-        self._charges_to_mul_ir = TransposeIrrepsLayoutWrapper(
-            irreps=self.charges_irreps,
-            source=layout_str,
-            target="mul_ir",
-            cueq_config=self.cueq_config,
-        )
-        self._node_feats_from_mul_ir = TransposeIrrepsLayoutWrapper(
-            irreps=self.node_feats_irreps,
-            source="mul_ir",
-            target=layout_str,
-            cueq_config=self.cueq_config,
+        self.charge_embedding = EquivariantLinear(
+            self.charges_irreps, self.node_feats_irreps, layout=layout
         )
 
     def forward(
@@ -214,40 +152,10 @@ class AgnosticChargeBiasedLinearPotentialEmbedding(
         node_attrs: torch.Tensor,
         local_charges: torch.Tensor,
     ) -> torch.Tensor:  # pylint: disable=arguments-differ
-        potential_to_mul_ir = getattr(self, "_potential_to_mul_ir", None)
-        node_feats_to_mul_ir = getattr(self, "_node_feats_to_mul_ir", None)
-        charges_to_mul_ir = getattr(self, "_charges_to_mul_ir", None)
-        node_feats_from_mul_ir = getattr(self, "_node_feats_from_mul_ir", None)
-
-        potential_in = potential_feats
-        node_feats_in = node_feats
-        charges_in = local_charges
-        if potential_to_mul_ir is not None:
-            potential_in = potential_to_mul_ir(potential_in)
-        if node_feats_to_mul_ir is not None:
-            node_feats_in = node_feats_to_mul_ir(node_feats_in)
-        if charges_to_mul_ir is not None:
-            charges_in = charges_to_mul_ir(charges_in)
-
-        potential_emb = self.potential_linear(potential_in)
-        node_feats_emb = self.node_feats_linear(node_feats_in)
-        charges_emb = self.charge_embedding(charges_in)
-        if node_feats_from_mul_ir is not None:
-            potential_emb = node_feats_from_mul_ir(potential_emb)
-            node_feats_emb = node_feats_from_mul_ir(node_feats_emb)
-            charges_emb = node_feats_from_mul_ir(charges_emb)
-
-        return potential_emb + node_feats_emb + charges_emb
-
-    def prepare_linear_folds(self) -> None:
-        self.potential_linear_fold = linear_fold(
-            self.potential_irreps, self.node_feats_irreps, biases=False
-        )
-        self.node_feats_linear_fold = linear_fold(
-            self.node_feats_irreps, self.node_feats_irreps, biases=False
-        )
-        self.charge_embedding_fold = linear_fold(
-            self.charges_irreps, self.node_feats_irreps, biases=False
+        return (
+            self.potential_linear(potential_feats)
+            + self.node_feats_linear(node_feats)
+            + self.charge_embedding(local_charges)
         )
 
     def folded_inputs(
@@ -260,29 +168,10 @@ class AgnosticChargeBiasedLinearPotentialEmbedding(
         ``SparseUvuTensorProduct.forward_folded``: inputs in the model layout, no layout
         transposes, no linear evaluated."""
         return [
-            folded_linear_input(
-                potential_feats, self.potential_linear, self.potential_linear_fold
-            ),
-            folded_linear_input(
-                node_feats, self.node_feats_linear, self.node_feats_linear_fold
-            ),
-            folded_linear_input(
-                local_charges, self.charge_embedding, self.charge_embedding_fold
-            ),
+            folded_linear_input(potential_feats, self.potential_linear),
+            folded_linear_input(node_feats, self.node_feats_linear),
+            folded_linear_input(local_charges, self.charge_embedding),
         ]
-
-    def use_layout_native_linears(self) -> None:
-        """Upgrade a block built with e3nn linears under cueq (older models)."""
-        _use_layout_native_linears(
-            self,
-            ("potential_linear", "node_feats_linear", "charge_embedding"),
-            (
-                "_potential_to_mul_ir",
-                "_node_feats_to_mul_ir",
-                "_charges_to_mul_ir",
-                "_node_feats_from_mul_ir",
-            ),
-        )
 
 
 @compile_mode("script")
@@ -500,9 +389,9 @@ class SparseUvuTensorProduct(torch.nn.Module):
 
         Only for invariant contractions (l x l -> 0). Per path, with the product weight
         W [u, v] and a linear's block M [v, k] (y's k channels to the v channels of x2):
-        W (M y + b) = (W M) y + W b. The [u, k] matrices of all inputs are concatenated
-        and applied in one product; the [batch, v, 2l+1] outputs of the linears are never
-        formed. Exact up to the order of summation.
+        W (M y + b) = (W M) y + W b; the [batch, v, 2l+1] outputs of the linears are never
+        formed. The [u, k] matrices of all inputs are concatenated and applied in one
+        product. Exact up to the order of summation.
         """
         if x1.ndim != 2:
             raise ValueError(
@@ -532,31 +421,29 @@ class SparseUvuTensorProduct(torch.nn.Module):
             weight = self.weight[w_start:w_stop].view(mul1, mul2)
             matrices: List[torch.Tensor] = []
             inputs: List[torch.Tensor] = []
+            weighted: Optional[torch.Tensor] = None
             constant: Optional[torch.Tensor] = None
-            for y, linear_weight, linear_bias, fold in folded_inputs:
-                for path in fold.paths:
-                    if path.output_start != in2_start:
+            for folded in folded_inputs:
+                for block in folded.plan.blocks:
+                    if block.output_start != in2_start:
                         continue
-                    matrices.append(
-                        torch.matmul(weight, path_matrix(linear_weight, path).T)
+                    matrix = torch.matmul(weight, block_matrix(folded.weight, block).T)
+                    channels = self._as_mul_ir(
+                        folded.features[:, block.input_start : block.input_stop],
+                        block.input_multiplicity,
+                        d1,
                     )
-                    inputs.append(
-                        self._as_mul_ir(
-                            y[:, path.input_start : path.input_stop],
-                            path.input_multiplicity,
-                            d1,
-                        )
-                    )
-                if linear_bias is not None:
-                    for bias in fold.biases:
+                    matrices.append(matrix)
+                    inputs.append(channels)
+                if folded.bias is not None:
+                    for bias in folded.plan.biases:
                         if bias.output_start != in2_start:
                             continue
                         # Biases sit on scalar outputs only (d1 == 1).
                         term = torch.matmul(
-                            weight, linear_bias[bias.bias_start : bias.bias_stop]
+                            weight, folded.bias[bias.bias_start : bias.bias_stop]
                         )
                         constant = term if constant is None else constant + term
-            weighted: Optional[torch.Tensor] = None
             if matrices:
                 weighted = torch.einsum(
                     "uk,bkd->bud", torch.cat(matrices, dim=1), torch.cat(inputs, dim=1)
@@ -675,12 +562,10 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
             cueq_config=self.cueq_config,
         )
 
-        self.source_embedding = Linear(
-            self.node_attrs_irreps,
-            invar_irreps,
-            internal_weights=True,
-            shared_weights=True,
-            cueq_config=self.cueq_config,
+        self.source_embedding = EquivariantLinear(
+            irreps_in=self.node_attrs_irreps,
+            irreps_out=invar_irreps,
+            layout=get_layout(self.cueq_config),
         )
 
         new_instructions = instructions_for_sparse_tp(
@@ -691,11 +576,7 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
             irreps_in2=self.node_feats_irreps,
             irreps_out=invar_irreps,
             instructions=new_instructions,
-            layout=(
-                self.cueq_config.layout_str
-                if (self.cueq_config is not None and self.cueq_config.enabled)
-                else "mul_ir"
-            ),
+            layout=get_layout(self.cueq_config),
         )
         self.nonlinearity = RadialMLP(
             [2 * invar_irreps.dim] + [64, 64, 64] + [invar_irreps.dim]
@@ -710,11 +591,7 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
             irreps_in2=invar_irreps,
             irreps_out=self.node_feats_irreps,
             instructions=instructions,
-            layout=(
-                self.cueq_config.layout_str
-                if (self.cueq_config is not None and self.cueq_config.enabled)
-                else "mul_ir"
-            ),
+            layout=get_layout(self.cueq_config),
         )
 
         MLP_irreps = (
@@ -722,28 +599,12 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
             .sort()[0]
             .simplify()
         )
+        # In the model layout (its linears and gate follow the layout): no transposes.
         self.readout = GeneralNonLinearBiasReadoutBlock(
             irreps_in=self.node_feats_irreps,
             MLP_irreps=MLP_irreps,
             gate=torch.nn.functional.silu,
             irreps_out=(self.charges_irreps + o3.Irreps("2x0e")),
-            cueq_config=None,
-        )
-        layout_str = (
-            self.cueq_config.layout_str
-            if (self.cueq_config is not None and self.cueq_config.enabled)
-            else "mul_ir"
-        )
-        self._readout_to_mul_ir = TransposeIrrepsLayoutWrapper(
-            irreps=self.node_feats_irreps,
-            source=layout_str,
-            target="mul_ir",
-            cueq_config=self.cueq_config,
-        )
-        self._readout_from_mul_ir = TransposeIrrepsLayoutWrapper(
-            irreps=(self.charges_irreps + o3.Irreps("2x0e")),
-            source="mul_ir",
-            target=layout_str,
             cueq_config=self.cueq_config,
         )
 
@@ -790,14 +651,7 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
             self._nonlinearity_first_layer(invariant_descriptors, node_attrs)
         )
         new_feats = self.tp_out(node_feats, nonlin_feats)
-        readout_to_mul_ir = getattr(self, "_readout_to_mul_ir", None)
-        readout_from_mul_ir = getattr(self, "_readout_from_mul_ir", None)
-        if readout_to_mul_ir is not None:
-            new_feats = readout_to_mul_ir(new_feats)
-        multipoles = self.readout(new_feats)
-        if readout_from_mul_ir is not None:
-            multipoles = readout_from_mul_ir(multipoles)
-        return multipoles
+        return self.readout(new_feats)
 
 
 class PostScfReadout(torch.nn.Module):
@@ -859,14 +713,19 @@ class OneBodyMLPFieldReadout(PostScfReadout):
     def _setup(self, **kwargs) -> None:
         _ = kwargs
         invar_irreps = o3.Irreps(f"{self.node_feats_irreps.count(o3.Irrep(0, 1))}x0e")
-        self.linear_up_q = field_linear(
-            self.charges_irreps, self.node_feats_irreps, self.cueq_config, biases=True
+        # Folded into the dot products (forward).
+        self.linear_up_q = EquivariantLinear(
+            self.charges_irreps,
+            self.node_feats_irreps,
+            layout=get_layout(self.cueq_config),
+            biases=True,
         )
-        self.linear_up_v = field_linear(
-            self.potential_irreps, self.node_feats_irreps, self.cueq_config, biases=True
+        self.linear_up_v = EquivariantLinear(
+            self.potential_irreps,
+            self.node_feats_irreps,
+            layout=get_layout(self.cueq_config),
+            biases=True,
         )
-        # The linears are folded into the dot products (forward): no layout transposes.
-        self.prepare_linear_folds()
         new_instructions = instructions_for_sparse_tp(
             self.node_feats_irreps, self.node_feats_irreps, invar_irreps
         )
@@ -875,11 +734,7 @@ class OneBodyMLPFieldReadout(PostScfReadout):
             irreps_in2=self.node_feats_irreps,
             irreps_out=invar_irreps,
             instructions=new_instructions,
-            layout=(
-                self.cueq_config.layout_str
-                if (self.cueq_config is not None and self.cueq_config.enabled)
-                else "mul_ir"
-            ),
+            layout=get_layout(self.cueq_config),
         )
         new_instructions = instructions_for_sparse_tp(
             self.node_feats_irreps, self.node_feats_irreps, invar_irreps
@@ -889,15 +744,11 @@ class OneBodyMLPFieldReadout(PostScfReadout):
             irreps_in2=self.node_feats_irreps,
             irreps_out=invar_irreps,
             instructions=new_instructions,
-            layout=(
-                self.cueq_config.layout_str
-                if (self.cueq_config is not None and self.cueq_config.enabled)
-                else "mul_ir"
-            ),
+            layout=get_layout(self.cueq_config),
         )
 
         self.mlp = RadialMLP(
-            [2 * invar_irreps.dim] + [128, 128, 128] + [1],
+            [2 * invar_irreps.dim] + [128, 128, 128] + [1], narrow_output=True
         )
 
     def forward(
@@ -916,41 +767,15 @@ class OneBodyMLPFieldReadout(PostScfReadout):
         invar_feats = torch.cat(
             [
                 self.dot_products_q.forward_folded(
-                    node_feats,
-                    [
-                        folded_linear_input(
-                            charges, self.linear_up_q, self.linear_up_q_fold
-                        )
-                    ],
+                    node_feats, [folded_linear_input(charges, self.linear_up_q)]
                 ),
                 self.dot_products_v.forward_folded(
-                    node_feats,
-                    [
-                        folded_linear_input(
-                            field_feats, self.linear_up_v, self.linear_up_v_fold
-                        )
-                    ],
+                    node_feats, [folded_linear_input(field_feats, self.linear_up_v)]
                 ),
             ],
             dim=-1,
         )
         return self.mlp(invar_feats).squeeze(-1)
-
-    def prepare_linear_folds(self) -> None:
-        self.linear_up_q_fold = linear_fold(
-            self.charges_irreps, self.node_feats_irreps, biases=True
-        )
-        self.linear_up_v_fold = linear_fold(
-            self.potential_irreps, self.node_feats_irreps, biases=True
-        )
-
-    def use_layout_native_linears(self) -> None:
-        """Upgrade a block built with e3nn linears under cueq (older models)."""
-        _use_layout_native_linears(
-            self,
-            ("linear_up_q", "linear_up_v"),
-            ("_q_to_mul_ir", "_v_to_mul_ir", "_up_from_mul_ir"),
-        )
 
 
 # Registries used by config files that pass strings

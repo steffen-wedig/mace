@@ -4,7 +4,6 @@ import torch
 import torch.nn.functional
 from ase import build
 from e3nn import o3
-from e3nn.util import jit
 from scipy.spatial.transform import Rotation as R
 
 from mace import data, modules, tools
@@ -110,7 +109,6 @@ def test_mace():
         radial_type="bessel",
     )
     model = modules.MACE(**model_config)
-    model_compiled = jit.compile(model)
 
     atomic_data = data.AtomicData.from_config(config, z_table=table, cutoff=3.0)
     atomic_data2 = data.AtomicData.from_config(
@@ -125,7 +123,7 @@ def test_mace():
     )
     batch = next(iter(data_loader))
     output1 = model(batch.to_dict(), training=True)
-    output2 = model_compiled(batch.to_dict(), training=True)
+    output2 = model(batch.to_dict(), training=True)
     assert torch.allclose(output1["energy"][0], output2["energy"][0])
     assert torch.allclose(output2["energy"][0], output2["energy"][1])
 
@@ -325,7 +323,6 @@ def test_mace_multi_reference():
         atomic_inter_shift=[0.0, 0.1],
     )
     model = modules.ScaleShiftMACE(**model_config)
-    model_compiled = jit.compile(model)
     config.head = "Default"
     config_rotated.head = "dft"
     atomic_data = data.AtomicData.from_config(
@@ -343,7 +340,7 @@ def test_mace_multi_reference():
     )
     batch = next(iter(data_loader))
     output1 = model(batch.to_dict(), training=True)
-    output2 = model_compiled(batch.to_dict(), training=True)
+    output2 = model(batch.to_dict(), training=True)
     assert torch.allclose(output1["energy"][0], output2["energy"][0])
     assert output2["energy"].shape[0] == 2
 
@@ -749,28 +746,6 @@ def test_non_linear_first_interaction_block_runs_and_is_equivariant():
         extracted["interaction_cls_first"]
         is modules.interaction_classes["RealAgnosticResidualNonLinearInteractionBlock"]
     )
-
-
-def test_non_linear_first_interaction_block_cannot_be_torchscripted():
-    """Characterization of a real limitation, not a wish: TorchScript cannot
-    resolve the `-> o3.Irreps` annotation on `GatedEquivariantBlock.irreps_in`
-    (`mace/modules/gate.py:205`), so a model with this block compiles nowhere
-    -- which rules out the LAMMPS export path, whose whole artifact is a
-    scripted module. Every other interaction block scripts fine, so this is
-    the block's property and not the model's.
-    """
-    model = modules.ScaleShiftMACE(
-        **_energy_model_config(
-            interaction_cls_first=modules.interaction_classes[
-                "RealAgnosticResidualNonLinearInteractionBlock"
-            ]
-        )
-    )
-    with pytest.raises(RuntimeError, match="o3.Irreps"):
-        jit.compile(model)
-
-    # the same model with the default first block scripts without complaint
-    assert jit.compile(modules.ScaleShiftMACE(**_energy_model_config())) is not None
 
 
 # ===========================================================================

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn.functional as F
 from e3nn import o3
 from e3nn.nn._fc import _Layer as E3NNFCLayer
 from torch import nn
+
+from mace.modules.equivariant_linear import EquivariantLinear, NarrowEquivariantLinear
 
 
 def build_lora_irreps(
@@ -28,27 +28,26 @@ def build_lora_irreps(
 
 
 class LoRAO3Linear(nn.Module):
-    """LoRA for equivariant o3.Linear-like layers (preserves O(3) equivariance).
+    """LoRA for equivariant linears (preserves O(3) equivariance).
 
-    Uses fused weight computation: W_merged = W_base + scaling * (W_A @ W_B)
-    with automatic caching during inference (when grad is disabled).
+    Wraps an ``EquivariantLinear`` or ``NarrowEquivariantLinear``; the low-rank factors
+    A and B are EquivariantLinears in the base's layout. Uses fused weight computation:
+    W_merged = W_base + scaling * (W_A @ W_B) with automatic caching during inference
+    (when grad is disabled).
     """
 
-    def __init__(self, base_linear: o3.Linear, rank: int = 4, alpha: float = 1.0):
+    def __init__(self, base_linear: nn.Module, rank: int = 4, alpha: float = 1.0):
         super().__init__()
         self.base = base_linear
         self.irreps_in = self.base.irreps_in
         self.irreps_out = self.base.irreps_out
         self.scaling = float(alpha) / float(rank)
         self.lora_irreps = build_lora_irreps(self.irreps_in, self.irreps_out, rank)
-
-        # Use the same class as base to avoid layout mismatches if possible
-        layer_type = type(self.base)
-        self.lora_A = layer_type(
-            self.irreps_in, self.lora_irreps, internal_weights=True, biases=False
+        self.lora_A = EquivariantLinear(
+            self.irreps_in, self.lora_irreps, layout=self.base.layout
         )
-        self.lora_B = layer_type(
-            self.lora_irreps, self.irreps_out, internal_weights=True, biases=False
+        self.lora_B = EquivariantLinear(
+            self.lora_irreps, self.irreps_out, layout=self.base.layout
         )
 
         # Match dtype/device to base
@@ -59,81 +58,43 @@ class LoRAO3Linear(nn.Module):
         # Cache for merged weight (used during inference)
         self._cached_merged_weight: torch.Tensor | None = None
 
-        # Build instruction mapping for weight composition
-        self._build_instruction_mapping()
-
         with torch.no_grad():
-            for p in self.lora_B.parameters():
-                p.zero_()
-            for p in self.lora_A.parameters():
-                if p.dim() >= 2:
-                    p.normal_(mean=0.0, std=1e-3)
-
-    def _build_instruction_mapping(self) -> None:
-        """Build lookup tables for matching instructions between base, A, and B."""
-        # lora_A: maps i_in -> (instruction_idx, i_out, path_weight)
-        self._A_by_i_in = {}
-        for idx, instr in enumerate(self.lora_A.instructions):
-            self._A_by_i_in[instr.i_in] = (idx, instr.i_out, instr.path_weight)
-
-        # lora_B: maps (i_in, i_out) -> (instruction_idx, path_weight)
-        self._B_by_in_out = {}
-        for idx, instr in enumerate(self.lora_B.instructions):
-            self._B_by_in_out[(instr.i_in, instr.i_out)] = (idx, instr.path_weight)
+            self.lora_B.weight.zero_()
+            self.lora_A.weight.normal_(mean=0.0, std=1e-3)
 
     @staticmethod
-    def _extract_weight_blocks(linear: o3.Linear) -> dict[int, torch.Tensor]:
-        """Extract weight blocks indexed by instruction."""
-        blocks = {}
-        offset = 0
-        for idx, instr in enumerate(linear.instructions):
-            if instr.i_in == -1:
-                continue
-            size = math.prod(instr.path_shape)
-            block = linear.weight[offset : offset + size].reshape(instr.path_shape)
-            blocks[idx] = block
-            offset += size
-        return blocks
+    def _raw_block(linear: nn.Module, block) -> torch.Tensor:
+        """The block's [input multiplicity, output multiplicity] weights, unnormalised."""
+        return linear.weight[block.weight_start : block.weight_stop].view(
+            block.input_multiplicity, block.output_multiplicity
+        )
 
     def compute_merged_weight(self) -> torch.Tensor:
         """Compute W_base + scaling * composed(W_A, W_B) in weight space."""
-        base_blocks = self._extract_weight_blocks(self.base)
-        A_blocks = self._extract_weight_blocks(self.lora_A)
-        B_blocks = self._extract_weight_blocks(self.lora_B)
-
+        # Every input block of A writes the one lora block of its irrep.
+        a_by_input = {block.input_start: block for block in self.lora_A.plan.blocks}
+        b_by_input_output = {
+            (block.input_start, block.output_start): block
+            for block in self.lora_B.plan.blocks
+        }
         merged_blocks = []
-        for base_idx, base_instr in enumerate(self.base.instructions):
-            i_in_base = base_instr.i_in
-            i_out_base = base_instr.i_out
-            pw_base = base_instr.path_weight
-
-            # e3nn represents bias terms as instructions with no input. Their
-            # parameters live in ``linear.bias``, not ``linear.weight``, and
-            # LoRA must leave them unchanged.
-            if i_in_base == -1:
+        for block in self.base.plan.blocks:
+            base_weights = self._raw_block(self.base, block)
+            a_block = a_by_input.get(block.input_start)
+            b_block = (
+                None
+                if a_block is None
+                else b_by_input_output.get((a_block.output_start, block.output_start))
+            )
+            if b_block is None:
+                merged_blocks.append(base_weights)
                 continue
-
-            # Find corresponding lora_A instruction
-            if i_in_base not in self._A_by_i_in:
-                merged_blocks.append(base_blocks[base_idx])
-                continue
-
-            A_idx, i_mid, pw_A = self._A_by_i_in[i_in_base]
-
-            # Find corresponding lora_B instruction
-            B_key = (i_mid, i_out_base)
-            if B_key not in self._B_by_in_out:
-                merged_blocks.append(base_blocks[base_idx])
-                continue
-
-            B_idx, pw_B = self._B_by_in_out[B_key]
-
             # Compose: W_delta = (pw_A * pw_B / pw_base) * (W_A @ W_B)
-            ratio = (pw_A * pw_B) / pw_base
-            delta = A_blocks[A_idx] @ B_blocks[B_idx]
-            merged = base_blocks[base_idx] + self.scaling * ratio * delta
-            merged_blocks.append(merged)
-
+            ratio = (a_block.path_weight * b_block.path_weight) / block.path_weight
+            delta = self._raw_block(self.lora_A, a_block) @ self._raw_block(
+                self.lora_B, b_block
+            )
+            merged_blocks.append(base_weights + self.scaling * ratio * delta)
         return torch.cat([b.flatten() for b in merged_blocks])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -153,7 +114,7 @@ class LoRAO3Linear(nn.Module):
         finally:
             self.base.weight.data = original_weight
 
-    def merge_into_base(self) -> o3.Linear:
+    def merge_into_base(self) -> nn.Module:
         """Permanently merge LoRA weights into base and return the base layer."""
         with torch.no_grad():
             self.base.weight.copy_(self.compute_merged_weight())
@@ -297,8 +258,10 @@ def inject_lora(
         # Skip already wrapped
         if isinstance(child, (LoRAO3Linear, LoRADenseLinear, LoRAFCLayer)):
             continue
-        # Equivariant o3.Linear
-        if wrap_equivariant and isinstance(child, o3.Linear):
+        # Equivariant linear
+        if wrap_equivariant and isinstance(
+            child, (EquivariantLinear, NarrowEquivariantLinear)
+        ):
             try:
                 wrapped = LoRAO3Linear(child, rank=rank, alpha=alpha)
             except ValueError:  # If no shared irreps, skip
@@ -335,7 +298,7 @@ def merge_lora_weights(model: nn.Module, inplace: bool = True) -> nn.Module:
     adaptations directly into the original weight matrices. After merging:
     - LoRADenseLinear -> nn.Linear (with merged weights)
     - LoRAFCLayer -> e3nn _Layer (with merged weights)
-    - LoRAO3Linear -> o3.Linear (with merged weights)
+    - LoRAO3Linear -> its EquivariantLinear (with merged weights)
 
     Args:
         model: Model containing LoRA layers to merge.

@@ -1,5 +1,7 @@
 """
-Wrapper class for o3.Linear that optionally uses cuet.Linear
+Wrappers that build the cuequivariance or OpenEquivariance kernels of tensor products,
+symmetric contractions and layout transposes when configured, else e3nn's. Linears are
+``mace.modules.equivariant_linear`` (layout-aware, no backend).
 """
 
 import dataclasses
@@ -38,7 +40,6 @@ class CuEquivarianceConfig:
     layout_str: str = "mul_ir"
     group: str = "O3"
     optimize_all: bool = False  # Set to True to enable all optimizations
-    optimize_linear: bool = False
     optimize_channelwise: bool = False
     optimize_symmetric: bool = False
     optimize_fctp: bool = False
@@ -74,163 +75,6 @@ class OEQConfig:
     def __post_init__(self):
         if not OEQ_AVAILABLE:
             self.enabled = False
-
-
-class Linear:
-    """Returns either a cuet.Linear or o3.Linear based on config"""
-
-    def __new__(
-        cls,
-        irreps_in: o3.Irreps,
-        irreps_out: o3.Irreps,
-        shared_weights: bool = True,
-        internal_weights: bool = True,
-        cueq_config: Optional[CuEquivarianceConfig] = None,
-    ):
-        if (
-            CUET_AVAILABLE
-            and cueq_config is not None
-            and cueq_config.enabled
-            and (cueq_config.optimize_all or cueq_config.optimize_linear)
-        ):
-            return cuet.Linear(
-                cue.Irreps(cueq_config.group, irreps_in),
-                cue.Irreps(cueq_config.group, irreps_out),
-                layout=cueq_config.layout,
-                shared_weights=shared_weights,
-                method="naive",
-            )
-
-        return o3.Linear(
-            irreps_in,
-            irreps_out,
-            shared_weights=shared_weights,
-            internal_weights=internal_weights,
-        )
-
-
-def cueq_handles_linears(cueq_config: Optional[CuEquivarianceConfig]) -> bool:
-    """Whether Linear builds cuet.Linear (in the cueq layout) for this config."""
-    return (
-        CUET_AVAILABLE
-        and cueq_config is not None
-        and cueq_config.enabled
-        and (cueq_config.optimize_all or cueq_config.optimize_linear)
-    )
-
-
-if CUET_AVAILABLE:
-
-    class LayoutNativeLinear(cuet.Linear):
-        """cuet.Linear in the cueq layout, optionally with e3nn's scalar biases.
-
-        Same parameters as o3.Linear(irreps_in, irreps_out, biases=biases): "weight" in
-        e3nn's flat order (stored [1, n] instead of [n]; e3nn-shaped weights load by
-        reshaping) and "bias" over the scalar output channels, added with weight 1 as in
-        e3nn. Always cueq's naive method: for the few-channel field inputs, the fused_tp
-        kernel saves launches but is 4-8x slower in GPU time through the double backward
-        (measured under CUDA graphs: ~20 % of a POLAR-M training step on fused_tp).
-        """
-
-        def __init__(
-            self,
-            irreps_in: o3.Irreps,
-            irreps_out: o3.Irreps,
-            cueq_config: CuEquivarianceConfig,
-            biases: bool = False,
-        ):
-            irreps_in = o3.Irreps(irreps_in)
-            irreps_out = o3.Irreps(irreps_out)
-            super().__init__(
-                cue.Irreps(cueq_config.group, irreps_in),
-                cue.Irreps(cueq_config.group, irreps_out),
-                layout=cueq_config.layout,
-                shared_weights=True,
-                method="naive",
-            )
-            self.output_dimension = irreps_out.dim
-            bias_positions: List[int] = []
-            if biases:
-                start = 0
-                for mul, ir in irreps_out:
-                    # A scalar segment has the same channels in both layouts.
-                    if ir.l == 0 and ir.p == 1:
-                        bias_positions.extend(range(start, start + mul))
-                    start += mul * ir.dim
-            if bias_positions:
-                self.bias = torch.nn.Parameter(torch.zeros(len(bias_positions)))
-                self.register_buffer(
-                    "bias_positions",
-                    torch.tensor(bias_positions, dtype=torch.long),
-                    persistent=False,
-                )
-            else:
-                self.bias = None
-                self.bias_positions = None
-
-        def forward(  # pylint: disable=arguments-differ
-            self, x: torch.Tensor
-        ) -> torch.Tensor:
-            output = super().forward(x)
-            if self.bias is None:
-                return output
-            full_bias = output.new_zeros(self.output_dimension).index_copy(
-                0, self.bias_positions, self.bias.to(output.dtype)
-            )
-            return output + full_bias
-
-        def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-            # o3.Linear's mask of output channels without a path: not a parameter here.
-            state_dict.pop(prefix + "output_mask", None)
-            # The naive method's path coefficients ("f.…c0", …) are constants built from the
-            # irreps, not learnt state: an e3nn-shaped state dict has none, keep our own.
-            for name, value in self.f.state_dict(prefix=prefix + "f.").items():
-                state_dict.setdefault(name, value)
-            key = prefix + "weight"
-            weight = state_dict.get(key)
-            if (
-                weight is not None
-                and weight.shape != self.weight.shape
-                and weight.numel() == self.weight.numel()
-            ):
-                state_dict[key] = weight.reshape(self.weight.shape)
-            super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
-
-        @classmethod
-        def from_e3nn(
-            cls, linear: o3.Linear, cueq_config: CuEquivarianceConfig
-        ) -> "LayoutNativeLinear":
-            """The same linear map with the parameters of an o3.Linear (transplanted)."""
-            biases = bool(getattr(linear, "bias_numel", 0))
-            native = cls(linear.irreps_in, linear.irreps_out, cueq_config, biases=biases)
-            reference = linear.weight
-            native = native.to(device=reference.device, dtype=reference.dtype)
-            with torch.no_grad():
-                native.weight.copy_(reference.reshape(native.weight.shape))
-                if biases:
-                    native.bias.copy_(linear.bias)
-            return native
-
-
-def field_linear(
-    irreps_in: o3.Irreps,
-    irreps_out: o3.Irreps,
-    cueq_config: Optional[CuEquivarianceConfig] = None,
-    biases: bool = False,
-) -> torch.nn.Module:
-    """Linear in the cueq layout when cueq handles linears, else e3nn's o3.Linear (mul_ir).
-
-    The caller transposes layouts around it only in the second case.
-    """
-    if cueq_handles_linears(cueq_config):
-        return LayoutNativeLinear(irreps_in, irreps_out, cueq_config, biases=biases)
-    return o3.Linear(
-        irreps_in,
-        irreps_out,
-        internal_weights=True,
-        shared_weights=True,
-        biases=biases,
-    )
 
 
 def with_scatter_sum(conv_tp: torch.nn.Module) -> torch.nn.Module:

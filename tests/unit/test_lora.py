@@ -255,13 +255,13 @@ def test_lora_merge_preserves_outputs(build_lora_model, random_configs) -> None:
     ), f"Forces mismatch after merge: max diff = {(forces_before - forces_after).abs().max()}"
 
 
-def test_lora_merge_handles_o3_linear_bias_instructions() -> None:
-    """Bias paths have a one-dimensional path shape, unlike weight paths."""
+@pytest.mark.parametrize("layout", ["mul_ir", "ir_mul"])
+def test_lora_merge_keeps_biases_and_layout(layout) -> None:
+    """Biases are not adapted; the merged weights give the wrapped outputs."""
+    from mace.modules.equivariant_linear import EquivariantLinear
     from mace.modules.lora import LoRAO3Linear
 
-    base = o3.Linear("2x0e", "3x0e", biases=True)
-    assert any(len(instr.path_shape) == 1 for instr in base.instructions)
-
+    base = EquivariantLinear("2x0e + 3x1o", "3x0e + 2x1o", layout=layout, biases=True)
     wrapped = LoRAO3Linear(base, rank=2, alpha=0.5)
     with torch.no_grad():
         for param in wrapped.lora_A.parameters():

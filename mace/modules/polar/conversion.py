@@ -5,8 +5,8 @@
   ``mace.modules.polar`` (class paths remapped by ``MOVED_MODULES``). Parameters and
   buffers are kept as they are.
 - ``convert_polar_model``: repairs derived state of a restored model in place (integer
-  sizes, field linears in the cueq layout, the plans of evaluation); PolarMACE runs it on
-  every unpickling.
+  sizes, e3nn linears replaced by ``EquivariantLinear``, the plans of evaluation);
+  PolarMACE runs it on every unpickling.
 
 Command line: ``python -m mace.modules.polar.conversion old.model new.model`` writes the
 model again under the new class paths. Load trusted files only (``weights_only=False``).
@@ -136,6 +136,45 @@ def validate_pbc_handling(mode: str) -> None:
         )
 
 
+def replace_e3nn_linears(model: torch.nn.Module) -> None:
+    """Models built before ``mace.modules.equivariant_linear``: every e3nn ``o3.Linear``
+    becomes an ``EquivariantLinear`` with the same parameters (the same map).
+
+    Saved models are e3nn models (training converts cueq models back before saving), so
+    the replacements read the mul_ir layout. A model in the cueq layout with e3nn linears
+    is refused: convert its e3nn file instead (``mace.cli.convert_e3nn_cueq``).
+    """
+    from e3nn import o3  # noqa: PLC0415
+
+    from mace.modules.equivariant_linear import EquivariantLinear  # noqa: PLC0415
+    from mace.modules.wrapper_ops import get_layout  # noqa: PLC0415
+
+    linears = [
+        (parent, name, child)
+        for parent in model.modules()
+        for name, child in parent.named_children()
+        if isinstance(child, o3.Linear)
+    ]
+    if not linears:
+        return
+    if get_layout(getattr(model, "cueq_config", None)) != "mul_ir":
+        raise ValueError(
+            "e3nn linears in a model in the cueq layout: load the e3nn model and convert "
+            "it (mace.cli.convert_e3nn_cueq)"
+        )
+    for parent, name, linear in linears:
+        if not (linear.internal_weights and linear.shared_weights):
+            raise ValueError(f"{name}: only linears with their own shared weights")
+        replacement = EquivariantLinear(
+            linear.irreps_in,
+            linear.irreps_out,
+            layout="mul_ir",
+            biases=linear.bias_numel > 0,
+        ).to(device=linear.weight.device, dtype=linear.weight.dtype)
+        replacement.load_state_dict(linear.state_dict())
+        setattr(parent, name, replacement)
+
+
 def ensure_polar_compatibility(model):
     """Repair restored state without overriding an existing evaluator choice."""
     pbc_handling = getattr(model, "pbc_handling", "auto")
@@ -222,16 +261,8 @@ def convert_polar_model(model, pbc_handling: str = "auto"):
     for module in model.modules():
         if isinstance(module, SparseUvuTensorProduct):
             module.output_dimension = module.irreps_out.dim
-    # Field blocks of models built before their linears followed the cueq layout: same
-    # parameters, transplanted into cueq-layout linears; the layout transposes go.
-    for module in model.modules():
-        upgrade = getattr(module, "use_layout_native_linears", None)
-        if upgrade is not None:
-            upgrade()
-        # Fold metadata of the field linears (models built before the folds).
-        prepare = getattr(module, "prepare_linear_folds", None)
-        if prepare is not None:
-            prepare()
+    replace_e3nn_linears(model)
+    model.prepare_shared_input_plan()
     model.set_electrostatic_pbcs(pbc_handling)
     return model
 

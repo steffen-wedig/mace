@@ -365,12 +365,15 @@ class DisplacedGTOExternalFieldBlock(torch.nn.Module):
         node_fields = torch.index_select(field, 0, batch)  # [n_nodes, 4]
         potential = node_fields[:, 0].clone()
 
-        potential_from_displacement = torch.einsum(
-            "bi,bi->b", positions, node_fields[:, 1:].clone()
+        # Row-wise dot products as a multiply and a sum (an einsum lowers to a batched
+        # matrix product of 1 x 3 by 3 x 1 per node).
+        potential_from_displacement = (positions * node_fields[:, 1:].clone()).sum(
+            dim=-1
         )
         node_fields[:, 0] += potential_from_displacement
 
         node_fields = node_fields[:, [0, 3, 1, 2]]
-        projections = torch.einsum("pf,nf->np", self.matrix, node_fields)
+        # A sum over the 4 field components: fused, not a cuBLAS call.
+        projections = (node_fields[:, None, :] * self.matrix).sum(dim=-1)
 
         return projections  # [n_node, n_feat]
