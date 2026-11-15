@@ -66,6 +66,46 @@ REMOVED_CLASSES = {
 }
 
 
+# Derived data of the linear folds of earlier code (removed with the equivariant linears):
+# each linear's integer plan, cached on the field blocks and in PolarMACE's shared-input
+# plan. Their pickled instances load as plain tuples and are dropped or rebuilt by
+# ``convert_polar_model``; without this, models trained before the change do not load.
+LEGACY_FOLD_CLASSES = {
+    ("mace.modules.polar.linear_folds", "LinearFold"),
+    ("mace.modules.polar.linear_folds", "LinearFoldPath"),
+    ("mace.modules.polar.linear_folds", "LinearFoldBias"),
+}
+# Field-block attributes that held such folds.
+LEGACY_FOLD_ATTRIBUTES = (
+    "potential_linear_fold",
+    "node_feats_linear_fold",
+    "charge_embedding_fold",
+    "linear_up_q_fold",
+    "linear_up_v_fold",
+)
+
+
+class LegacyFold(tuple):
+    """A pickled fold of earlier code, as a plain tuple (pickle calls
+    ``cls.__new__(cls, *fields)`` for a NamedTuple)."""
+
+    def __new__(cls, *fields):
+        return tuple.__new__(cls, fields)
+
+
+class LegacyLayerOutputLinears:  # pylint: disable=too-few-public-methods
+    """``LayerOutputLinears`` pickled with or without the folds of earlier code
+    (``with_next, with_readout[, folds]``): the current two-field tuple; PolarMACE
+    rebuilds its whole plan on unpickling anyway."""
+
+    def __new__(cls, with_next, with_readout, folds=None):  # pylint: disable=unused-argument
+        from mace.modules.polar.linear_folds import (  # noqa: PLC0415
+            LayerOutputLinears,
+        )
+
+        return LayerOutputLinears(with_next, with_readout)
+
+
 class RemovedModule(torch.nn.Module):
     """Placeholder for a module of a removed class in an old pickle (dropped by
     ``convert_polar_model``)."""
@@ -79,6 +119,10 @@ class _RemappingUnpickler(pickle.Unpickler):
         module = moved_module(module, name)
         if module in REMOVED_MODULES or (module, name) in REMOVED_CLASSES:
             return RemovedModule
+        if (module, name) in LEGACY_FOLD_CLASSES:
+            return LegacyFold
+        if (module, name) == ("mace.modules.polar.linear_folds", "LayerOutputLinears"):
+            return LegacyLayerOutputLinears
         return super().find_class(module, name)
 
 
@@ -261,6 +305,9 @@ def convert_polar_model(model, pbc_handling: str = "auto"):
     for module in model.modules():
         if isinstance(module, SparseUvuTensorProduct):
             module.output_dimension = module.irreps_out.dim
+        # Linear folds of earlier code: nothing reads them, the linears plan themselves.
+        for name in LEGACY_FOLD_ATTRIBUTES:
+            module.__dict__.pop(name, None)
     replace_e3nn_linears(model)
     model.prepare_shared_input_plan()
     model.set_electrostatic_pbcs(pbc_handling)

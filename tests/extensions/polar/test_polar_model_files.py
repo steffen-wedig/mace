@@ -170,3 +170,72 @@ def test_calculators_load_model_files_written_before_the_move(tmp_path):
     assert type(wrapper.model) is PolarMACE  # pylint: disable=unidiomatic-typecheck
     for key, value in model.state_dict().items():
         assert torch.equal(wrapper.model.state_dict()[key], value), key
+
+
+def test_model_pickled_with_the_linear_folds_of_earlier_code_loads(tmp_path):
+    """Models trained before the equivariant linears (B3 cluster models of 2026-11-14)
+    carry ``LinearFold`` tuples, a class that no longer exists, on their field blocks and
+    in a three-field ``LayerOutputLinears`` of the shared-input plan. They load: the folds
+    are dropped, the plan is rebuilt, the outputs are unchanged."""
+    from typing import List, NamedTuple, Optional  # noqa: PLC0415
+
+    import mace.modules.polar.linear_folds as linear_folds  # noqa: PLC0415
+
+    class LinearFoldPath(NamedTuple):
+        weight_start: int
+        weight_stop: int
+        input_multiplicity: int
+        output_multiplicity: int
+        path_weight: float
+        input_start: int
+        input_stop: int
+        output_start: int
+
+    class LinearFold(NamedTuple):
+        paths: List[LinearFoldPath]
+        biases: list
+        output_dimension: int
+
+    class LayerOutputLinears(NamedTuple):
+        with_next: bool
+        with_readout: bool
+        folds: Optional[List[LinearFold]]
+
+    model = _polar_model()
+    fold = LinearFold([LinearFoldPath(0, 4, 2, 2, 0.5, 0, 2, 0)], [], 2)
+    current_plan = model.shared_input_plan
+    model.shared_input_plan = linear_folds.SharedInputPlan(
+        current_plan.layout,
+        [
+            LayerOutputLinears(layer.with_next, layer.with_readout, [fold])
+            for layer in current_plan.layers
+        ],
+    )
+    block = model.electric_potential_descriptor
+    block.potential_linear_fold = fold
+    current_layer_class = linear_folds.LayerOutputLinears
+    old_classes = (LinearFoldPath, LinearFold, LayerOutputLinears)
+    path = tmp_path / "folds.model"
+    try:
+        for cls in old_classes:
+            cls.__module__ = linear_folds.__name__
+            cls.__qualname__ = cls.__name__
+            setattr(linear_folds, cls.__name__, cls)
+        torch.save(model, path)
+    finally:
+        for cls in (LinearFoldPath, LinearFold):
+            delattr(linear_folds, cls.__name__)
+        linear_folds.LayerOutputLinears = current_layer_class
+        del block.potential_linear_fold
+        model.shared_input_plan = current_plan
+    assert b"LinearFold" in path.read_bytes()
+
+    loaded = load_polar_model(path)
+    assert "potential_linear_fold" not in loaded.electric_potential_descriptor.__dict__
+    assert loaded.shared_input_plan == current_plan
+    assert all(
+        type(layer) is current_layer_class  # pylint: disable=unidiomatic-typecheck
+        for layer in loaded.shared_input_plan.layers
+    )
+    for expected, actual in zip(_energy_and_forces(model), _energy_and_forces(loaded)):
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
