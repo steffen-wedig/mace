@@ -27,6 +27,10 @@ import torch
 import torch._dynamo
 import torch._inductor
 
+from mace.modules.polar.electrostatics.kspace import (
+    ReciprocalLatticeIndices,
+    pad_reciprocal_lattice_indices,
+)
 from mace.tools import compile as mace_compile
 
 # Dynamo's and Inductor's settings live in torch's private modules (torch._dynamo.config,
@@ -233,21 +237,16 @@ def pad_inference_batch(
         padding_rows = budgets.kspace_rows - int(data["kspace_miller"].shape[0])
         if padding_rows < 0:
             raise ValueError(f"batch does not fit the budgets {budgets}")
-        miller = data["kspace_miller"].new_zeros(padding_rows, 3)
-        miller[:, 0] = 1.0
-        padded["kspace_miller"] = torch.cat([data["kspace_miller"], miller])
-        padded["kspace_structure"] = torch.cat(
-            [
-                data["kspace_structure"],
-                data["kspace_structure"].new_full((padding_rows,), num_graphs),
-            ]
+        lattice = pad_reciprocal_lattice_indices(
+            ReciprocalLatticeIndices(
+                data["kspace_miller"], data["kspace_structure"], data["kspace_padding"]
+            ),
+            budgets.kspace_rows,
+            owner=num_graphs,
         )
-        padded["kspace_padding"] = torch.cat(
-            [
-                data["kspace_padding"],
-                data["kspace_padding"].new_ones(padding_rows),
-            ]
-        )
+        padded["kspace_miller"] = lattice.miller
+        padded["kspace_structure"] = lattice.structure
+        padded["kspace_padding"] = lattice.padding
     return padded
 
 

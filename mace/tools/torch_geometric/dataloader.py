@@ -11,13 +11,23 @@ from .dataset import Dataset
 
 class Collater:
     def __init__(
-        self, follow_batch, exclude_keys, real_space_pairs: bool = False, padding=None
+        self,
+        follow_batch,
+        exclude_keys,
+        real_space_pairs: bool = False,
+        padding=None,
+        kspace_cutoff: Optional[float] = None,
     ):
+        if real_space_pairs and kspace_cutoff is not None:
+            raise ValueError("a batch has real-space pairs or k-vectors, not both")
         self.follow_batch = follow_batch
         self.exclude_keys = exclude_keys
         # Add the directed pairs of every (open) structure for PolarMACE's real-space
         # electrostatics (mace.data.real_space_pairs), built here on the host.
         self.real_space_pairs = real_space_pairs
+        # Add the reciprocal-lattice indices of every (fully periodic) structure for
+        # PolarMACE's reciprocal-space electrostatics (mace.data.reciprocal_lattice).
+        self.kspace_cutoff = kspace_cutoff
         # mace.data.padding.PaddingPlan: pad every batch to one of fixed sizes.
         self.padding = padding
 
@@ -30,6 +40,7 @@ class Collater:
                 batch,
                 self.padding,
                 real_space_pairs=self.real_space_pairs,
+                kspace_cutoff=self.kspace_cutoff,
                 follow_batch=self.follow_batch,
                 exclude_keys=self.exclude_keys,
             )
@@ -45,6 +56,12 @@ class Collater:
                 )
 
                 attach_real_space_pair_index(collated)
+            if self.kspace_cutoff is not None:
+                from mace.data.reciprocal_lattice import (  # noqa: PLC0415
+                    attach_reciprocal_lattice_indices,
+                )
+
+                attach_reciprocal_lattice_indices(collated, self.kspace_cutoff)
             return collated
         elif isinstance(elem, torch.Tensor):
             return default_collate(batch)
@@ -89,6 +106,11 @@ class DataLoader(torch.utils.data.DataLoader):
         padding (mace.data.padding.PaddingPlan, optional): Pad every batch to the
             first budget of the plan it fits (fixed shapes for CUDA graphs).
             (default: :obj:`None`)
+        kspace_cutoff (float, optional): Add the reciprocal-lattice indices of every
+            k-vector within this cutoff (``kspace_miller``, ``kspace_structure``,
+            ``kspace_padding``) to every batch (PolarMACE trained with
+            ``pbc_handling: pbc``; structures not fully periodic are refused).
+            (default: :obj:`None`)
         **kwargs (optional): Additional arguments of
             :class:`torch.utils.data.DataLoader`.
     """
@@ -102,6 +124,7 @@ class DataLoader(torch.utils.data.DataLoader):
         exclude_keys: Optional[List[str]] = [None],
         real_space_pairs: bool = False,
         padding=None,
+        kspace_cutoff: Optional[float] = None,
         **kwargs,
     ):
         if "collate_fn" in kwargs:
@@ -115,6 +138,8 @@ class DataLoader(torch.utils.data.DataLoader):
             dataset,
             batch_size,
             shuffle,
-            collate_fn=Collater(follow_batch, exclude_keys, real_space_pairs, padding),
+            collate_fn=Collater(
+                follow_batch, exclude_keys, real_space_pairs, padding, kspace_cutoff
+            ),
             **kwargs,
         )

@@ -29,6 +29,16 @@ Three shape modes (``ShapeMode``):
 
 In both padded modes the rare batch larger than every budget arrives unpadded and runs
 eagerly.
+
+Electrostatics (PolarMACE): open structures in real space, with the directed atom pairs
+listed at collation (``pbc_handling`` 'realspace', ``mace.data.real_space_pairs``), or
+fully periodic structures in reciprocal space, with the integer lattice indices of the
+k-vectors within the model's cutoff listed at collation (``pbc_handling`` 'pbc',
+``mace.data.reciprocal_lattice``): the forward forms the k-vectors from the reciprocal
+cell and applies the cutoff in the graph, so the k-vector count is a batch size like the
+others (padded to a per-budget row count, excluded padding rows contributing exactly
+zero) and the Ewald sums, their force gradient and the backward through it are all in
+the graph.
 """
 
 from __future__ import annotations
@@ -90,7 +100,8 @@ class CompiledForceTrainingLoss:
     ``loss = compiled_loss(model, loss_fn, batch)``, then ``loss.backward()`` as usual.
     The model must have been built without e3nn's code generation
     (``mace.tools.compile.disable_e3nn_codegen``) and read no host values in its forward
-    (PolarMACE: pbc_handling 'realspace' with the pair list from the batch). The graph
+    (PolarMACE: pbc_handling 'realspace' with the pair list from the batch, or 'pbc' with
+    the reciprocal-lattice indices from the batch). The graph
     runs on a simplified view of the model (``mace.tools.compile.simplified_view``) that
     shares its parameters; the model itself is not modified.
     """
@@ -165,6 +176,15 @@ class CompiledForceTrainingLoss:
         if model is not self.model:
             raise ValueError("compiled loss called with a model other than its own")
         batch_dict = batch.to_dict()
+        if (
+            getattr(model, "pbc_handling", None) == "pbc"
+            and "kspace_miller" not in batch_dict
+        ):
+            raise ValueError(
+                "compiled training with pbc_handling 'pbc' needs the reciprocal-lattice "
+                "indices in the batch (a loader with kspace_cutoff, "
+                "mace.data.reciprocal_lattice)"
+            )
         if self.shape_mode != "dynamic":
             if batch_dict.get("real_graph_mask") is None:
                 # A batch larger than every padding budget (mace.data.padding): eager,

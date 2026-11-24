@@ -1,15 +1,18 @@
 """Batches padded to fixed sizes, for compiled training with CUDA graphs.
 
 A CUDA graph replays fixed shapes, so every batch is padded up to one of a few budgets
-(numbers of nodes, edges, real-space pairs and structures), chosen once from the training
-set (``plan_padding_budgets``). The padding is appended as extra structures behind the
-real ones:
+(numbers of nodes, edges, real-space pairs, reciprocal-space k-vector rows and structures),
+chosen once from the training set (``plan_padding_budgets``). The padding is appended as
+extra structures behind the real ones:
 
 - the first padding structure holds the padding atoms (at least two), the padding edges
   and the padding pairs; any further padding structure (a batch with fewer structures
   than the budget) is empty;
 - padding atoms sit on a cubic grid, edges and pairs run between consecutive padding
   atoms, so every separation is nonzero and every term of the model stays finite;
+- periodic batches (``kspace_cutoff``): the padding structures take the cell of a real
+  structure, and the k-vector rows are padded with excluded rows owned by the first padding
+  structure (``mace.data.reciprocal_lattice``), so they contribute exactly zero;
 - no edge or pair connects a padding atom to a real one, and every per-structure sum of
   the model (E0, charge constraint, Fukui normalisation, energies) keeps the padding
   structures apart: the real structures' outputs are those of the unpadded batch;
@@ -34,6 +37,10 @@ import torch
 from mace.data.real_space_pairs import (
     attach_real_space_pair_index,
     real_space_pair_index,
+)
+from mace.data.reciprocal_lattice import (
+    attach_reciprocal_lattice_indices,
+    batch_kspace_rows,
 )
 from mace.tools.torch_geometric.batch import Batch
 from mace.tools.torch_geometric.data import Data
@@ -93,12 +100,17 @@ MINIMUM_PADDING_ATOMS = 2
 
 @dataclass(frozen=True)
 class BatchShape:
-    """Sizes of a collated batch, or the budget it is padded to."""
+    """Sizes of a collated batch, or the budget it is padded to.
+
+    kspace_rows: k-vector rows of the reciprocal-space electrostatics (periodic batches;
+    0 otherwise).
+    """
 
     nodes: int
     edges: int
     pairs: int
     graphs: int
+    kspace_rows: int = 0
 
     def fits_within(self, budget: "BatchShape") -> bool:
         """Whether a batch of these sizes can be padded to ``budget``.
@@ -110,6 +122,7 @@ class BatchShape:
             and budget.nodes - self.nodes >= MINIMUM_PADDING_ATOMS
             and budget.edges >= self.edges
             and budget.pairs >= self.pairs
+            and budget.kspace_rows >= self.kspace_rows
         )
 
 
@@ -141,8 +154,13 @@ def structure_pair_count(num_nodes: int) -> int:
     return num_nodes * (num_nodes - 1)
 
 
-def batch_shape(data_list: Sequence[Data], real_space_pairs: bool) -> BatchShape:
-    """Sizes of the batch ``data_list`` collates to."""
+def batch_shape(
+    data_list: Sequence[Data],
+    real_space_pairs: bool,
+    kspace_cutoff: Optional[float] = None,
+) -> BatchShape:
+    """Sizes of the batch ``data_list`` collates to (k-vector rows with a
+    ``kspace_cutoff``)."""
     nodes = [int(data.num_nodes) for data in data_list]
     return BatchShape(
         nodes=sum(nodes),
@@ -153,6 +171,11 @@ def batch_shape(data_list: Sequence[Data], real_space_pairs: bool) -> BatchShape
             else 0
         ),
         graphs=len(data_list),
+        kspace_rows=(
+            batch_kspace_rows(data_list, kspace_cutoff)
+            if kspace_cutoff is not None
+            else 0
+        ),
     )
 
 
@@ -230,6 +253,7 @@ def collate_padded(
     data_list: Sequence[Data],
     plan: PaddingPlan,
     real_space_pairs: bool,
+    kspace_cutoff: Optional[float] = None,
     follow_batch=None,
     exclude_keys=None,
 ) -> Batch:
@@ -237,9 +261,13 @@ def collate_padded(
 
     The batch carries ``real_node_mask`` / ``real_graph_mask`` (1 for real entries) and,
     with ``real_space_pairs``, ``real_space_pair_index``: the pairs of the real
-    structures followed by padding pairs within the first padding structure.
+    structures followed by padding pairs within the first padding structure; with a
+    ``kspace_cutoff`` (fully periodic structures), the reciprocal-lattice indices of the
+    real structures followed by excluded rows of the first padding structure.
     """
-    shape = batch_shape(data_list, real_space_pairs)
+    if real_space_pairs and kspace_cutoff is not None:
+        raise ValueError("a batch has real-space pairs or k-vectors, not both")
+    shape = batch_shape(data_list, real_space_pairs, kspace_cutoff)
     budget = plan.budget_for(shape)
     if budget is None:
         # Larger than every budget: unpadded, without masks (trained eagerly).
@@ -250,6 +278,8 @@ def collate_padded(
         )
         if real_space_pairs:
             attach_real_space_pair_index(batch)
+        if kspace_cutoff is not None:
+            attach_reciprocal_lattice_indices(batch, kspace_cutoff)
         return batch
     padding = padding_structures(
         data_list[0], shape, budget, plan.padding_atom_spacing
@@ -270,6 +300,10 @@ def collate_padded(
             budget.pairs - shape.pairs, budget.nodes - shape.nodes
         )
         batch.real_space_pair_index = torch.cat([real_pairs, padding_pairs], dim=1)
+    if kspace_cutoff is not None:
+        attach_reciprocal_lattice_indices(
+            batch, kspace_cutoff, rows=budget.kspace_rows, real_graphs=shape.graphs
+        )
     return batch
 
 
@@ -289,27 +323,40 @@ def _with_padding_room(shape: BatchShape, multiple: int) -> BatchShape:
         edges=_round_up(max(shape.edges, 1), multiple),
         pairs=_round_up(max(shape.pairs, 1), multiple),
         graphs=shape.graphs + 1,
+        kspace_rows=(
+            _round_up(shape.kspace_rows, multiple) if shape.kspace_rows > 0 else 0
+        ),
     )
 
 
 @dataclass(frozen=True)
 class StepCostModel:
-    """Relative cost of a padded step per node, edge and pair (fitted or assumed)."""
+    """Relative cost of a padded step per node, edge, pair and k-vector row (fitted or
+    assumed)."""
 
     per_node: float
     per_edge: float
     per_pair: float
+    per_kspace_row: float = 0.0
+
+    @property
+    def weights(self) -> np.ndarray:
+        """Weights of the size columns (nodes, edges, pairs, k-vector rows)."""
+        return np.array(
+            [self.per_node, self.per_edge, self.per_pair, self.per_kspace_row]
+        )
 
     def cost(self, shape: BatchShape) -> float:
         return (
             self.per_node * shape.nodes
             + self.per_edge * shape.edges
             + self.per_pair * shape.pairs
+            + self.per_kspace_row * shape.kspace_rows
         )
 
     def costs(self, sizes: np.ndarray) -> np.ndarray:
-        """Costs of rows (nodes, edges, pairs)."""
-        return sizes @ np.array([self.per_node, self.per_edge, self.per_pair])
+        """Costs of rows (nodes, edges, pairs[, k-vector rows])."""
+        return sizes @ self.weights[: sizes.shape[-1]]
 
 
 def sample_batch_shapes(
@@ -319,15 +366,24 @@ def sample_batch_shapes(
     epochs: int,
     real_space_pairs: bool,
     seed: int = 0,
+    structure_kspace_rows: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Sizes [n_batches, 3] (nodes, edges, pairs) of shuffled, drop-last batches."""
+    """Sizes [n_batches, 4] (nodes, edges, pairs, k-vector rows) of shuffled, drop-last
+    batches."""
     generator = np.random.default_rng(seed)
     pairs = (
         structure_nodes * (structure_nodes - 1)
         if real_space_pairs
         else np.zeros_like(structure_nodes)
     )
-    per_structure = np.stack([structure_nodes, structure_edges, pairs], axis=1)
+    kspace_rows = (
+        np.asarray(structure_kspace_rows, dtype=np.int64)
+        if structure_kspace_rows is not None
+        else np.zeros_like(structure_nodes)
+    )
+    per_structure = np.stack(
+        [structure_nodes, structure_edges, pairs, kspace_rows], axis=1
+    )
     shapes = []
     batches_per_epoch = len(structure_nodes) // batch_size
     for _ in range(epochs):
@@ -344,6 +400,7 @@ def plan_padding_budgets(
     bucket_count: int,
     cost_model: StepCostModel,
     real_space_pairs: bool,
+    structure_kspace_rows: Optional[Sequence[int]] = None,
     sampled_epochs: int = 20,
     coverage_epochs: int = 500,
     multiple: int = 32,
@@ -351,6 +408,9 @@ def plan_padding_budgets(
     padding_atom_spacing: float = 3.0,
 ) -> PaddingPlan:
     """``bucket_count`` budgets for random batches of the training set.
+
+    ``structure_kspace_rows``: k-vector rows of each structure (periodic training sets,
+    ``mace.data.reciprocal_lattice.structure_kspace_rows``); None for none.
 
     Samples the batch sizes of ``sampled_epochs`` shuffled epochs, sorts them by step
     cost and splits them into ``bucket_count`` groups whose boundaries minimise the
@@ -365,22 +425,40 @@ def plan_padding_budgets(
     edges = np.asarray(structure_edges, dtype=np.int64)
     if len(nodes) < batch_size:
         raise ValueError("fewer structures than one batch")
-    sampled = sample_batch_shapes(
-        nodes, edges, batch_size, sampled_epochs, real_space_pairs, seed
+    kspace_rows = (
+        np.asarray(structure_kspace_rows, dtype=np.int64)
+        if structure_kspace_rows is not None
+        else None
     )
+    if kspace_rows is not None and len(kspace_rows) != len(nodes):
+        raise ValueError("one k-vector row count per structure")
+    sampled = sample_batch_shapes(
+        nodes, edges, batch_size, sampled_epochs, real_space_pairs, seed, kspace_rows
+    )
+
+    def shape_of(row: np.ndarray) -> BatchShape:
+        return BatchShape(
+            int(row[0]), int(row[1]), int(row[2]), batch_size, kspace_rows=int(row[3])
+        )
+
     envelopes = [
-        BatchShape(int(row[0]), int(row[1]), int(row[2]), batch_size)
+        shape_of(row)
         for row in _cost_optimal_envelopes(sampled, bucket_count, cost_model)
     ]
     coverage = sample_batch_shapes(
-        nodes, edges, batch_size, coverage_epochs, real_space_pairs, seed + 1
+        nodes,
+        edges,
+        batch_size,
+        coverage_epochs,
+        real_space_pairs,
+        seed + 1,
+        kspace_rows,
     ).max(axis=0)
     largest = envelopes[-1]
-    envelopes[-1] = BatchShape(
-        max(largest.nodes, int(coverage[0])),
-        max(largest.edges, int(coverage[1])),
-        max(largest.pairs, int(coverage[2])),
-        batch_size,
+    envelopes[-1] = shape_of(
+        np.maximum(
+            [largest.nodes, largest.edges, largest.pairs, largest.kspace_rows], coverage
+        )
     )
     budgets = sorted(
         {_with_padding_room(envelope, multiple) for envelope in envelopes},
@@ -392,11 +470,12 @@ def plan_padding_budgets(
 def _cost_optimal_envelopes(
     sizes: np.ndarray, group_count: int, cost_model: StepCostModel
 ) -> np.ndarray:
-    """Envelopes [groups, 3] of contiguous groups of cost-sorted ``sizes`` [n, 3].
+    """Envelopes [groups, 4] of contiguous groups of cost-sorted ``sizes`` [n, 4]
+    (nodes, edges, pairs, k-vector rows; three columns: no k-vector rows).
 
     Every row is padded to its group's envelope (elementwise maximum); the groups
     minimise the summed padded cost. Groups are contiguous in cost order, which is exact
-    for one size dimension and a heuristic for three. Dynamic programming over distinct
+    for one size dimension and a heuristic for several. Dynamic programming over distinct
     rows (with multiplicities): O(n^2) envelope costs, O(groups n^2) for the splits.
     """
     unique, multiplicity = np.unique(sizes, axis=0, return_counts=True)
@@ -404,14 +483,13 @@ def _cost_optimal_envelopes(
     unique, multiplicity = unique[order], multiplicity[order]
     count = len(unique)
     group_count = min(group_count, count)
-    weights = np.array([cost_model.per_node, cost_model.per_edge, cost_model.per_pair])
     # envelope_cost[start, end - 1]: padded cost of rows start..end-1 together.
     envelope_cost = np.full((count, count), np.inf)
     cumulative_multiplicity = np.concatenate([[0], np.cumsum(multiplicity)])
     for start in range(count):
         running_maximum = np.maximum.accumulate(unique[start:], axis=0)
         members = cumulative_multiplicity[start + 1 :] - cumulative_multiplicity[start]
-        envelope_cost[start, start:] = (running_maximum @ weights) * members
+        envelope_cost[start, start:] = cost_model.costs(running_maximum) * members
     best = np.full((group_count + 1, count + 1), np.inf)
     split = np.zeros((group_count + 1, count + 1), dtype=np.int64)
     best[0, 0] = 0.0

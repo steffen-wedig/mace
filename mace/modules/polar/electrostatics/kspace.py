@@ -82,20 +82,35 @@ def reciprocal_lattice_indices(
         owner_blocks.append(np.full(len(selected), index))
     miller = np.concatenate(miller_blocks).astype(np.float64)
     owner = np.concatenate(owner_blocks)
-    padding = np.zeros(len(miller), dtype=bool)
-    if rows is not None:
-        if rows < len(miller):
-            raise ValueError(f"{len(miller)} k-vectors do not fit in {rows} rows")
-        extra = rows - len(miller)
-        # Padding rows: m = (1, 0, 0) (finite k), always excluded.
-        miller = np.concatenate([miller, np.tile([[1.0, 0.0, 0.0]], (extra, 1))])
-        owner = np.concatenate([owner, np.full(extra, len(cells) - 1)])
-        padding = np.concatenate([padding, np.ones(extra, dtype=bool)])
     device = cell.device
-    return ReciprocalLatticeIndices(
+    indices = ReciprocalLatticeIndices(
         miller=torch.as_tensor(miller, dtype=cell.dtype, device=device),
         structure=torch.as_tensor(owner, dtype=torch.long, device=device),
-        padding=torch.as_tensor(padding, device=device),
+        padding=torch.zeros(len(miller), dtype=torch.bool, device=device),
+    )
+    if rows is None:
+        return indices
+    return pad_reciprocal_lattice_indices(indices, rows, owner=len(cells) - 1)
+
+
+def pad_reciprocal_lattice_indices(
+    indices: ReciprocalLatticeIndices, rows: int, owner: int
+) -> ReciprocalLatticeIndices:
+    """``indices`` padded to ``rows`` rows owned by structure ``owner``: lattice index
+    ``m = (1, 0, 0)`` (a finite k-vector of that structure's cell), always excluded, so
+    they contribute exactly zero. Fewer rows than listed is an error."""
+    listed = int(indices.miller.shape[0])
+    if rows < listed:
+        raise ValueError(f"{listed} k-vectors do not fit in {rows} rows")
+    extra = rows - listed
+    padding_miller = indices.miller.new_zeros(extra, 3)
+    padding_miller[:, 0] = 1.0
+    return ReciprocalLatticeIndices(
+        miller=torch.cat([indices.miller, padding_miller]),
+        structure=torch.cat(
+            [indices.structure, indices.structure.new_full((extra,), owner)]
+        ),
+        padding=torch.cat([indices.padding, indices.padding.new_ones(extra)]),
     )
 
 

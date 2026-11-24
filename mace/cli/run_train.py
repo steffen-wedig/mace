@@ -12,7 +12,7 @@ import os
 from copy import deepcopy
 from glob import glob
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch.distributed
 from e3nn.util import jit
@@ -107,15 +107,52 @@ def _warn_about_v1_removals(parser, args) -> None:
             deprecation.warn_choice("reg", getattr(args, dest, None))
 
 
-def padded_training_loader(args, train_set, real_space_pairs: bool):
-    """The training loader padding every batch to one of --padding_buckets budgets.
+def require_fully_periodic(datasets: Dict[str, Any]) -> None:
+    """--pbc_handling pbc: every training and validation structure fully periodic (the
+    reciprocal-space electrostatics give an open structure images it does not have)."""
+    for name, dataset in datasets.items():
+        open_structures = sum(
+            1 for structure in dataset if not bool(structure.pbc.all())
+        )
+        if open_structures:
+            raise ValueError(
+                f"--pbc_handling pbc trains fully periodic structures only: {name} has "
+                f"{open_structures} structure(s) without periodic boundaries in all three "
+                "directions (open structures: --pbc_handling realspace; both: auto, eager)"
+            )
 
-    Budgets from the training set's structure sizes (mace.data.padding); Dynamo may
-    compile one graph per budget and loss (the SWA loss is a second one).
+
+def compiled_training_loader(
+    args, train_set, real_space_pairs: bool, kspace_cutoff: Optional[float]
+):
+    """The training loader of --compile_training.
+
+    With --padding_buckets, every batch is padded to one of that many budgets from the
+    training set's structure sizes (mace.data.padding); Dynamo may compile one graph per
+    budget and loss (the SWA loss is a second one). Periodic structures
+    (``kspace_cutoff``, the model's reciprocal-space cutoff) carry their reciprocal-lattice
+    indices (mace.data.reciprocal_lattice), padded or not.
     """
+    if args.padding_buckets == 0:
+        return torch_geometric.dataloader.DataLoader(
+            dataset=train_set,
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=True,
+            pin_memory=args.pin_memory,
+            real_space_pairs=real_space_pairs,
+            kspace_cutoff=kspace_cutoff,
+            num_workers=args.num_workers,
+            persistent_workers=args.num_workers > 0,
+            multiprocessing_context=tools.worker_start_method(args.num_workers),
+            generator=torch.Generator().manual_seed(args.seed),
+        )
     from mace.data.padding import (  # pylint: disable=import-outside-toplevel
         StepCostModel,
         plan_padding_budgets,
+    )
+    from mace.data.reciprocal_lattice import (  # pylint: disable=import-outside-toplevel
+        structure_kspace_rows,
     )
     from mace.tools.compiled.training import (  # pylint: disable=import-outside-toplevel
         RECOMPILE_LIMIT,
@@ -124,17 +161,23 @@ def padded_training_loader(args, train_set, real_space_pairs: bool):
 
     structure_nodes = []
     structure_edges = []
+    structure_rows = []
     for structure in train_set:
         structure_nodes.append(int(structure.num_nodes))
         structure_edges.append(int(structure.edge_index.shape[1]))
+        if kspace_cutoff is not None:
+            structure_rows.append(structure_kspace_rows(structure, kspace_cutoff))
     per_node, per_edge, per_pair = args.padding_cost_weights
     plan = plan_padding_budgets(
         structure_nodes,
         structure_edges,
         batch_size=args.batch_size,
         bucket_count=args.padding_buckets,
-        cost_model=StepCostModel(per_node, per_edge, per_pair),
+        cost_model=StepCostModel(
+            per_node, per_edge, per_pair, args.padding_kspace_row_weight
+        ),
         real_space_pairs=real_space_pairs,
+        structure_kspace_rows=structure_rows if kspace_cutoff is not None else None,
         # A fixed sampling seed, not --seed: the budgets are a property of the training set,
         # and runs that differ only in their data order then share the compiled graphs of
         # the Inductor cache instead of compiling every budget again.
@@ -151,6 +194,7 @@ def padded_training_loader(args, train_set, real_space_pairs: bool):
         drop_last=True,
         pin_memory=args.pin_memory,
         real_space_pairs=real_space_pairs,
+        kspace_cutoff=kspace_cutoff,
         padding=plan,
         num_workers=args.num_workers,
         persistent_workers=args.num_workers > 0,
@@ -735,26 +779,29 @@ def run(args) -> None:
         TrainingDataLoader = torch_geometric.dataloader.DataLoader  # pylint: disable=invalid-name
 
     # PolarMACE trained with open-boundary electrostatics only: every batch carries its
-    # atom pairs, built on the host at collation (mace.data.real_space_pairs).
+    # atom pairs, built on the host at collation (mace.data.real_space_pairs). With
+    # periodic electrostatics only, the compiled step's batches carry their
+    # reciprocal-lattice indices (mace.data.reciprocal_lattice; the cutoff is the model's).
     real_space_pairs = args.pbc_handling == "realspace"
+    reciprocal_space = args.pbc_handling == "pbc"
     # Options of the training and validation loaders. Loader workers persist across
     # epochs (re-creating them cost 0.5-0.8 s per epoch on cluster data); the pair option
     # only when set: the cluster-record loader passes its keywords on to torch's DataLoader.
     loader_options = {"persistent_workers": args.num_workers > 0}
     if real_space_pairs:
         loader_options["real_space_pairs"] = True
-    if real_space_pairs:
+    if real_space_pairs or reciprocal_space:
         if args.model != "PolarMACE":
             raise ValueError("--pbc_handling applies to PolarMACE only")
         if args.cluster_records:
             raise NotImplementedError(
-                "--pbc_handling realspace does not support --cluster_records yet"
+                f"--pbc_handling {args.pbc_handling} does not support --cluster_records yet"
             )
     if args.compile_training:
-        if args.model != "PolarMACE" or not real_space_pairs:
+        if args.model != "PolarMACE" or not (real_space_pairs or reciprocal_space):
             raise NotImplementedError(
                 "--compile_training is supported for PolarMACE with --pbc_handling "
-                "realspace only (its forward then reads no host values)"
+                "realspace or pbc only (its forward then reads no host values)"
             )
         if args.distributed or args.lbfgs:
             raise NotImplementedError(
@@ -895,6 +942,11 @@ def run(args) -> None:
 
     # concatenate all the trainsets
     train_set = ConcatDataset([train_sets[head] for head in heads])
+    if reciprocal_space:
+        require_fully_periodic(
+            {"the training set": train_set}
+            | {f"validation set {head}": valid_sets[head] for head in heads}
+        )
     train_sampler, valid_sampler = None, None
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -990,8 +1042,8 @@ def run(args) -> None:
     else:
         model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
     model.to(device)
-    if real_space_pairs:
-        model.set_electrostatic_pbcs("realspace")
+    if real_space_pairs or reciprocal_space:
+        model.set_electrostatic_pbcs(args.pbc_handling)
     loss_fn.to(device)  # the term weights are buffers
     # The fixed criterion for the best model of the whole run (the loss at the stage-two
     # weights; frame energy and forces only for interaction_huber), a separate module so stage two's reweighting
@@ -1202,11 +1254,17 @@ def run(args) -> None:
     loss_term_instrumentation = create_loss_term_instrumentation(
         args, loss_fn, tag, rank, device
     )
-    # Padded batches (CUDA graphs): only the batches of training steps; statistics,
-    # evaluation and the final error tables use the unpadded loaders.
+    # Padded batches (CUDA graphs) and k-space lattice indices: only the batches of
+    # compiled training steps; statistics, evaluation and the final error tables use the
+    # unpadded loaders (eager; periodic structures list their k-vectors in the forward).
     training_loader = train_loader
-    if args.padding_buckets > 0:
-        training_loader = padded_training_loader(args, train_set, real_space_pairs)
+    if args.compile_training and (args.padding_buckets > 0 or reciprocal_space):
+        training_loader = compiled_training_loader(
+            args,
+            train_set,
+            real_space_pairs,
+            kspace_cutoff=model.kspace_cutoff_value() if reciprocal_space else None,
+        )
     compiled_loss = None
     if args.compile_training:
         if loss_term_instrumentation is not None:
@@ -1430,7 +1488,7 @@ def run(args) -> None:
                 model_to_save = run_oeq_to_e3nn(deepcopy(model), device=device)
             if args.save_cpu:
                 model_to_save = model_to_save.to("cpu")
-            if real_space_pairs:
+            if real_space_pairs or reciprocal_space:
                 # The training-time evaluator is not a property of the model: the saved
                 # model picks its electrostatics from the structures again.
                 model_to_save.set_electrostatic_pbcs("auto")

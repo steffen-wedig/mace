@@ -414,7 +414,8 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         help=(
             "compile forward, forces and loss of every training step as one torch.compile "
             "graph (dynamic shapes); the loss backward through the forces runs compiled. "
-            "PolarMACE with --pbc_handling realspace only, for now"
+            "PolarMACE with --pbc_handling realspace (open structures) or pbc (fully "
+            "periodic structures) only; no stress or virials"
         ),
         type=str2bool,
         default=False,
@@ -453,16 +454,27 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=[1.0, 0.03, 0.002],
     )
     parser.add_argument(
+        "--padding_kspace_row_weight",
+        help=(
+            "relative step cost per reciprocal-space k-vector row (--pbc_handling pbc), on "
+            "the scale of --padding_cost_weights, used to choose the padding budgets"
+        ),
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument(
         "--pbc_handling",
         help=(
             "PolarMACE electrostatics during training: 'auto' picks reciprocal space as soon "
             "as a batch holds a periodic structure (reads pbc on the host every forward); "
             "'realspace' trains open structures only, with the atom pairs built when batches "
-            "are collated (no host reads; needed for torch.compile). The saved model is "
-            "always set back to 'auto'."
+            "are collated (no host reads; needed for torch.compile); 'pbc' trains fully "
+            "periodic structures only, in reciprocal space, with the compiled step's "
+            "reciprocal-lattice indices listed when batches are collated. The saved model "
+            "is always set back to 'auto'."
         ),
         type=str,
-        choices=["auto", "realspace"],
+        choices=["auto", "realspace", "pbc"],
         default="auto",
     )
     parser.add_argument(
